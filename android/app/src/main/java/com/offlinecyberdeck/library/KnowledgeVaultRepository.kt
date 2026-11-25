@@ -3,6 +3,7 @@ package com.offlinecyberdeck.library
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Environment
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
@@ -24,7 +25,8 @@ import java.util.zip.ZipInputStream
 data class AutoImportSummary(
     val importedCount: Int,
     val skippedCount: Int,
-    val scannedLocations: Int
+    val scannedLocations: Int,
+    val removedCount: Int = 0
 )
 
 class KnowledgeVaultRepository(
@@ -35,6 +37,10 @@ class KnowledgeVaultRepository(
     private val supportedAutoImportExts = setOf(
         "pdf", "epub", "zim", "html", "htm", "txt", "md", "csv", "json",
         "zip", "mbtiles", "obf", "map", "gpx", "png", "jpg", "jpeg", "webp"
+    )
+    private val externalKnowledgeExts = setOf(
+        "pdf", "epub", "zim", "html", "htm", "txt", "md", "csv", "json",
+        "zip", "mbtiles", "obf", "map", "gpx"
     )
 
     val itemsFlow: Flow<List<LibraryItemEntity>> = libraryDao.observeAll()
@@ -109,6 +115,14 @@ class KnowledgeVaultRepository(
     suspend fun autoImportFromConfiguredSources(deckDriveTreeUri: String?): Result<AutoImportSummary> =
         withContext(Dispatchers.IO) {
             runCatching {
+                var removed = 0
+                for (item in libraryDao.getAllSnapshot()) {
+                    if (!isItemAvailable(item)) {
+                        libraryDao.delete(item)
+                        removed++
+                    }
+                }
+
                 val existing = libraryDao.getAllSnapshot()
                 val seenUris = existing.map { it.fileUri }.toHashSet()
                 val seenNameSizes = existing.map { "${it.fileName.lowercase()}|${it.sizeBytes}" }.toHashSet()
@@ -145,6 +159,60 @@ class KnowledgeVaultRepository(
                     }
                 }
 
+                // Scan device Download/Documents + mounted removable SD/USB paths for docs & ZIMs
+                val externalDirs = linkedMapOf<File, Pair<StorageTarget, String>>()
+                runCatching { Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS) }.getOrNull()?.let {
+                    if (it.exists() && it.canRead()) externalDirs[it] = StorageTarget.INTERNAL to "Auto Import (Downloads)"
+                }
+                runCatching { Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS) }.getOrNull()?.let {
+                    if (it.exists() && it.canRead()) externalDirs[it] = StorageTarget.INTERNAL to "Auto Import (Documents)"
+                }
+                driveManager.detectRemovableExternalVolumes().forEach { vol ->
+                    val mp = vol.mountPath?.let { File(it) }
+                    if (mp != null && mp.exists() && mp.canRead()) {
+                        externalDirs[mp] = StorageTarget.DECK_DRIVE to "Auto Import (${vol.label})"
+                    }
+                }
+                for ((dir, meta) in externalDirs) {
+                    locations++
+                    val queue = ArrayDeque<Pair<File, Int>>()
+                    queue.add(dir to 0)
+                    var visited = 0
+                    while (queue.isNotEmpty() && visited < 180) {
+                        val (cur, depth) = queue.removeFirst()
+                        visited++
+                        val children = runCatching { cur.listFiles() }.getOrNull() ?: continue
+                        for (child in children) {
+                            val name = child.name
+                            if (name.startsWith(".")) continue
+                            if (child.isDirectory) {
+                                if (depth < 4 && name != "Android" && name != "cache") {
+                                    queue.add(child to depth + 1)
+                                }
+                            } else if (child.isFile && isExternalKnowledgeFile(name)) {
+                                val key = "${name.lowercase()}|${child.length()}"
+                                if (seenUris.contains(child.absolutePath) || seenNameSizes.contains(key)) {
+                                    skipped++
+                                } else {
+                                    val fileType = detectFileType(name)
+                                    val item = buildAutoVaultItem(
+                                        rawName = name,
+                                        uriOrPath = child.absolutePath,
+                                        sizeBytes = child.length(),
+                                        storageTarget = meta.first,
+                                        source = meta.second,
+                                        fileType = fileType
+                                    )
+                                    libraryDao.upsert(item)
+                                    seenUris += child.absolutePath
+                                    seenNameSizes += key
+                                    imported++
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (!deckDriveTreeUri.isNullOrBlank()) {
                     val root = runCatching { DocumentFile.fromTreeUri(context, Uri.parse(deckDriveTreeUri)) }.getOrNull()
                     if (root != null && root.exists() && root.canRead()) {
@@ -163,7 +231,12 @@ class KnowledgeVaultRepository(
                     }
                 }
 
-                AutoImportSummary(importedCount = imported, skippedCount = skipped, scannedLocations = locations)
+                AutoImportSummary(
+                    importedCount = imported,
+                    skippedCount = skipped,
+                    scannedLocations = locations,
+                    removedCount = removed
+                )
             }
         }
 
@@ -265,6 +338,11 @@ class KnowledgeVaultRepository(
     private fun isSupportedAutoImportFile(fileName: String): Boolean {
         val ext = fileName.substringAfterLast('.', "").lowercase()
         return ext in supportedAutoImportExts
+    }
+
+    private fun isExternalKnowledgeFile(fileName: String): Boolean {
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        return ext in externalKnowledgeExts
     }
 
     private fun buildAutoVaultItem(

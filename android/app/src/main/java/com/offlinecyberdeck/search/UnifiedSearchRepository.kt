@@ -53,6 +53,7 @@ class UnifiedSearchRepository(
 
         if (SearchResultType.LIBRARY in enabledTypes) {
             db.libraryDao().search(trimmed).forEach { item ->
+                if (!driveManager.isUriOrFileAccessible(item.fileUri)) return@forEach
                 val score = scoreMatch(lower, item.title, item.fileName, item.tags, item.description)
                 results += UnifiedSearchResult(
                     id = item.id,
@@ -61,7 +62,7 @@ class UnifiedSearchRepository(
                     subtitle = "${item.category.label} • ${item.fileType.label}",
                     tags = item.tags,
                     score = score + 10,
-                    isAvailableOffline = driveManager.isUriOrFileAccessible(item.fileUri),
+                    isAvailableOffline = true,
                     targetRef = item.id
                 )
             }
@@ -69,6 +70,9 @@ class UnifiedSearchRepository(
 
         if (SearchResultType.MEDIA in enabledTypes) {
             db.mediaDao().search(trimmed).forEach { media ->
+                val hasLocal = !media.localFileUri.isNullOrBlank() &&
+                    driveManager.isUriOrFileAccessible(media.localFileUri)
+                if (!hasLocal) return@forEach
                 val score = scoreMatch(
                     lower,
                     media.title,
@@ -76,19 +80,17 @@ class UnifiedSearchRepository(
                     media.tags,
                     media.localFileName.orEmpty()
                 )
-                val hasLocal = !media.localFileUri.isNullOrBlank() &&
-                    driveManager.isUriOrFileAccessible(media.localFileUri)
                 results += UnifiedSearchResult(
                     id = media.id,
                     type = SearchResultType.MEDIA,
                     title = media.title,
                     subtitle = buildString {
-                        append(if (hasLocal) "Available Offline" else "Metadata Only (No Local File)")
+                        append("Available Offline")
                         if (media.channel.isNotBlank()) append(" • ${media.channel}")
                     },
                     tags = media.tags,
-                    score = score + if (hasLocal) 8 else 3,
-                    isAvailableOffline = hasLocal,
+                    score = score + 8,
+                    isAvailableOffline = true,
                     targetRef = media.id
                 )
             }
@@ -219,8 +221,10 @@ class UnifiedSearchRepository(
                     val vol = if (volIdx >= 0) cursor.getString(volIdx).orEmpty() else ""
 
                     val usableFile = dataPath?.let { File(it) }?.takeIf { it.exists() && it.canRead() && !it.isDirectory }
-                    val targetRef = usableFile?.absolutePath
-                        ?: ContentUris.withAppendedId(filesUri, id).toString()
+                    val targetRef = usableFile?.absolutePath ?: run {
+                        val uriStr = ContentUris.withAppendedId(filesUri, id).toString()
+                        if (driveManager.isUriOrFileAccessible(uriStr)) uriStr else null
+                    } ?: continue
 
                     val label = when {
                         dataPath?.contains("/storage/emulated") == true || vol.equals("external_primary", true) -> "Internal Storage"

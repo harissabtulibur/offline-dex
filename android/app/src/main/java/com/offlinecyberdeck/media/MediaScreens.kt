@@ -117,8 +117,10 @@ import com.offlinecyberdeck.core.model.MediaAvailability
 import com.offlinecyberdeck.ui.theme.DeckAmber
 import com.offlinecyberdeck.ui.theme.DeckGreen
 import com.offlinecyberdeck.ui.theme.DeckRed
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -168,6 +170,18 @@ fun MediaVaultScreen(
     var addToPlaylistItem by remember { mutableStateOf<MediaItemEntity?>(null) }
     var activePlaylist by remember { mutableStateOf<PlaylistEntity?>(null) }
 
+    val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
+    var accessibleIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(items, driveStatus) {
+        accessibleIds = withContext(Dispatchers.IO) {
+            items.filter { app.mediaRepository.computeAvailability(it) == MediaAvailability.AVAILABLE_OFFLINE }
+                .mapTo(HashSet()) { it.id }
+        }
+    }
+    val visibleItems = remember(items, accessibleIds) {
+        items.filter { it.id in accessibleIds }
+    }
+
     fun runRefreshImportVideos(manual: Boolean) {
         if (isRefreshingVideos) return
         scope.launch {
@@ -176,9 +190,14 @@ fun MediaVaultScreen(
             app.mediaRepository.autoImportAndRefreshVideos(settings.deckDriveTreeUri, extraSaf)
                 .onSuccess { s ->
                     if (manual) {
-                        onShowMessage("Refresh OfflineTube: ${s.importedCount} video baru diimpor (${s.skippedCount} lama dilewati).")
-                    } else if (s.importedCount > 0) {
-                        onShowMessage("Auto-Import OfflineTube: ${s.importedCount} video baru ditemukan.")
+                        val removedPart = if (s.removedCount > 0) ", ${s.removedCount} file nonaktif dibersihkan" else ""
+                        onShowMessage("Refresh OfflineTube: ${s.importedCount} video baru diimpor$removedPart (${s.skippedCount} lama dilewati).")
+                    } else if (s.importedCount > 0 || s.removedCount > 0) {
+                        val parts = buildList {
+                            if (s.importedCount > 0) add("${s.importedCount} video baru")
+                            if (s.removedCount > 0) add("${s.removedCount} file terputus dibersihkan")
+                        }
+                        onShowMessage("Auto-Import OfflineTube: ${parts.joinToString(", ")}.")
                     }
                 }
                 .onFailure {
@@ -262,8 +281,8 @@ fun MediaVaultScreen(
         }
     }
 
-    val filteredItems = remember(items, selectedTab, selectedChannel, query) {
-        items.filter { item ->
+    val filteredItems = remember(visibleItems, selectedTab, selectedChannel, query) {
+        visibleItems.filter { item ->
             val qOk = query.isBlank() ||
                 item.title.contains(query, true) ||
                 item.channel.contains(query, true) ||
@@ -273,7 +292,7 @@ fun MediaVaultScreen(
                 MediaFilterTab.ALL -> true
                 MediaFilterTab.VIDEOS -> !isAudioMedia(item)
                 MediaFilterTab.AUDIO -> isAudioMedia(item)
-                MediaFilterTab.AVAILABLE -> app.mediaRepository.computeAvailability(item) == MediaAvailability.AVAILABLE_OFFLINE
+                MediaFilterTab.AVAILABLE -> true
                 MediaFilterTab.WATCH_LATER -> item.watchLater
                 MediaFilterTab.CONTINUE -> item.watchedPositionMs > 5000L
                 MediaFilterTab.CHANNELS -> selectedChannel == null ||
@@ -305,7 +324,7 @@ fun MediaVaultScreen(
                 }
                 Text("OfflineTube", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Text(
-                    "${items.size}",
+                    "${visibleItems.size}",
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -465,8 +484,8 @@ fun MediaVaultScreen(
                 )
             }
             selectedTab == MediaFilterTab.CHANNELS && selectedChannel == null -> {
-                val grouped = remember(items) {
-                    items.groupBy { it.channel.ifBlank { "Local Library" } }.toSortedMap()
+                val grouped = remember(visibleItems) {
+                    visibleItems.groupBy { it.channel.ifBlank { "Local Library" } }.toSortedMap()
                 }
                 if (grouped.isEmpty()) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -504,8 +523,8 @@ fun MediaVaultScreen(
             filteredItems.isEmpty() -> {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
-                        text = if (items.isEmpty()) {
-                            "No local media yet. Tap Scan Folder to index your USB-C Deck Drive or tablet Movies folder, or Add Media to pick files. Video details, thumbnails, duration, and resolution are generated automatically from your local files."
+                        text = if (visibleItems.isEmpty()) {
+                            "No local media yet. Tap Scan Folder to index your USB-C Deck Drive or tablet Movies folder, or Add to pick files. Video details, thumbnails, duration, and resolution are generated automatically from your local files."
                         } else {
                             "No media items match this filter."
                         },
@@ -534,17 +553,9 @@ fun MediaVaultScreen(
                         modifier = Modifier.fillMaxSize()
                     ) {
                         items(filteredItems, key = { it.id }) { item ->
-                            val availability = app.mediaRepository.computeAvailability(item)
                             YouTubeFeedVideoCard(
                                 item = item,
-                                availability = availability,
-                                onPlay = {
-                                    if (availability == MediaAvailability.AVAILABLE_OFFLINE) {
-                                        onPlayMedia(item.id)
-                                    } else {
-                                        onShowMessage("No local playable file (${availability.label}). Link a local video file first.")
-                                    }
-                                },
+                                onPlay = { onPlayMedia(item.id) },
                                 onEdit = { editingItem = item },
                                 onLinkFile = {
                                     linkingTargetId = item.id
@@ -765,7 +776,6 @@ fun MediaVaultScreen(
 @Composable
 private fun YouTubeFeedVideoCard(
     item: MediaItemEntity,
-    availability: MediaAvailability,
     onPlay: () -> Unit,
     onEdit: () -> Unit,
     onLinkFile: () -> Unit,
@@ -827,25 +837,6 @@ private fun YouTubeFeedVideoCard(
                     contentDescription = null,
                     modifier = Modifier.size(44.dp),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            // Availability chip top-left
-            val badgeColor = when (availability) {
-                MediaAvailability.AVAILABLE_OFFLINE -> DeckGreen
-                MediaAvailability.METADATA_ONLY -> DeckAmber
-                MediaAvailability.DRIVE_DISCONNECTED -> DeckRed
-            }
-            Surface(
-                color = Color.Black.copy(alpha = 0.72f),
-                shape = RoundedCornerShape(4.dp),
-                modifier = Modifier.align(Alignment.TopStart).padding(8.dp)
-            ) {
-                Text(
-                    text = availability.label,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = badgeColor,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                 )
             }
 
@@ -1115,8 +1106,16 @@ fun MediaPlayerScreen(
         val loaded = app.database.mediaDao().getById(mediaId)
         item = loaded
         val uriStr = loaded?.localFileUri
-        if (!uriStr.isNullOrBlank() && app.driveManager.isUriOrFileAccessible(uriStr)) {
-            exoPlayer.setMediaItem(MediaItem.fromUri(uriStr))
+        val canOpen = !uriStr.isNullOrBlank() && withContext(Dispatchers.IO) {
+            app.driveManager.isUriOrFileAccessible(uriStr)
+        }
+        if (!uriStr.isNullOrBlank() && canOpen) {
+            val playUri = if (uriStr.startsWith("content://") || uriStr.startsWith("file://")) {
+                Uri.parse(uriStr)
+            } else {
+                Uri.fromFile(File(uriStr))
+            }
+            exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
             exoPlayer.prepare()
             if (loaded.watchedPositionMs > 0L) {
                 exoPlayer.seekTo(loaded.watchedPositionMs)
@@ -1404,7 +1403,8 @@ fun MediaPlayerScreen(
                                 val shareUri = if (localUri.startsWith("content://")) {
                                     Uri.parse(localUri)
                                 } else {
-                                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(localUri))
+                                    val path = if (localUri.startsWith("file://")) Uri.parse(localUri).path.orEmpty() else localUri
+                                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
                                 }
                                 val intent = Intent(Intent.ACTION_SEND).apply {
                                     type = if (isAudio) "audio/*" else "video/*"

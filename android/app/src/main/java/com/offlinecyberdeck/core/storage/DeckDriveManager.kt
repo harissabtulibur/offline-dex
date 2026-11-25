@@ -220,7 +220,8 @@ class DeckDriveManager(private val context: Context) {
         return if (uriOrPath.startsWith("content://")) {
             runCatching { context.contentResolver.openInputStream(Uri.parse(uriOrPath)) }.getOrNull()
         } else {
-            val file = File(uriOrPath)
+            val path = if (uriOrPath.startsWith("file://")) Uri.parse(uriOrPath).path.orEmpty() else uriOrPath
+            val file = File(path)
             if (file.exists() && file.canRead()) file.inputStream() else null
         }
     }
@@ -230,7 +231,8 @@ class DeckDriveManager(private val context: Context) {
         return if (uriOrPath.startsWith("content://")) {
             runCatching { context.contentResolver.openOutputStream(Uri.parse(uriOrPath), "w") }.getOrNull()
         } else {
-            val file = File(uriOrPath)
+            val path = if (uriOrPath.startsWith("file://")) Uri.parse(uriOrPath).path.orEmpty() else uriOrPath
+            val file = File(path)
             file.parentFile?.mkdirs()
             runCatching { file.outputStream() }.getOrNull()
         }
@@ -241,7 +243,8 @@ class DeckDriveManager(private val context: Context) {
         return if (uriOrPath.startsWith("content://")) {
             runCatching { context.contentResolver.openFileDescriptor(Uri.parse(uriOrPath), "r") }.getOrNull()
         } else {
-            val file = File(uriOrPath)
+            val path = if (uriOrPath.startsWith("file://")) Uri.parse(uriOrPath).path.orEmpty() else uriOrPath
+            val file = File(path)
             if (file.exists() && file.canRead()) {
                 runCatching { ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY) }.getOrNull()
             } else null
@@ -397,12 +400,30 @@ class DeckDriveManager(private val context: Context) {
     fun isUriOrFileAccessible(uriOrPath: String?): Boolean {
         if (uriOrPath.isNullOrBlank()) return false
         return if (uriOrPath.startsWith("content://")) {
+            val uri = Uri.parse(uriOrPath)
+            val isDocumentsUri = uri.authority?.contains("documents", ignoreCase = true) == true
+            if (isDocumentsUri) {
+                val docOk = runCatching {
+                    val doc = DocumentFile.fromSingleUri(context, uri)
+                    doc?.exists() == true && doc.canRead()
+                }.getOrDefault(false)
+                if (docOk) return true
+            }
+            val afdOk = runCatching {
+                context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { true } ?: false
+            }.getOrDefault(false)
+            if (afdOk) return true
             runCatching {
-                val doc = DocumentFile.fromSingleUri(context, Uri.parse(uriOrPath))
-                doc?.exists() == true && doc.canRead()
+                context.contentResolver.openInputStream(uri)?.use { true } ?: false
             }.getOrDefault(false)
         } else {
-            val f = File(uriOrPath)
+            val path = if (uriOrPath.startsWith("file://")) {
+                Uri.parse(uriOrPath).path.orEmpty()
+            } else {
+                uriOrPath
+            }
+            if (path.isBlank()) return false
+            val f = File(path)
             f.exists() && f.canRead()
         }
     }

@@ -28,7 +28,8 @@ import java.util.UUID
 
 data class VideoRefreshSummary(
     val importedCount: Int,
-    val skippedCount: Int
+    val skippedCount: Int,
+    val removedCount: Int = 0
 )
 
 class MediaVaultRepository(
@@ -84,6 +85,21 @@ class MediaVaultRepository(
         extraSafUris: List<String>
     ): Result<VideoRefreshSummary> = withContext(Dispatchers.IO) {
         runCatching {
+            var removed = 0
+            for (item in mediaDao.getAllSnapshot()) {
+                val uri = item.localFileUri
+                val accessible = !uri.isNullOrBlank() && driveManager.isUriOrFileAccessible(uri)
+                if (!accessible) {
+                    if (!uri.isNullOrBlank() || item.sourceUrl.isNullOrBlank()) {
+                        item.thumbnailPath?.let { path -> runCatching { File(path).delete() } }
+                        mediaDao.delete(item)
+                        removed++
+                    }
+                } else if (!item.matchConfirmed) {
+                    mediaDao.upsert(item.copy(matchConfirmed = true, matchConfidence = 1.0f))
+                }
+            }
+
             val existing = mediaDao.getAllSnapshot()
             val seenUris = existing.mapNotNull { it.localFileUri }.toMutableSet()
             val seenNames = existing.mapNotNull { it.localFileName?.lowercase(Locale.US) }.toMutableSet()
@@ -224,7 +240,7 @@ class MediaVaultRepository(
                 }
             }
 
-            VideoRefreshSummary(importedCount = imported, skippedCount = skipped)
+            VideoRefreshSummary(importedCount = imported, skippedCount = skipped, removedCount = removed)
         }
     }
 
@@ -282,7 +298,12 @@ class MediaVaultRepository(
         val normName = fileName.lowercase(Locale.US)
         if (seenNames != null && seenNames.contains(normName)) return false
         val existingAll = mediaDao.getAllSnapshot()
-        if (existingAll.any { it.localFileName?.equals(fileName, ignoreCase = true) == true && !it.localFileUri.isNullOrBlank() }) {
+        if (existingAll.any {
+                it.localFileName?.equals(fileName, ignoreCase = true) == true &&
+                    !it.localFileUri.isNullOrBlank() &&
+                    driveManager.isUriOrFileAccessible(it.localFileUri)
+            }
+        ) {
             seenNames?.add(normName)
             seenUris?.add(uriStr)
             return false
@@ -319,6 +340,13 @@ class MediaVaultRepository(
             }
         }
 
+        if (bestMatch == null) {
+            bestMatch = existingAll.firstOrNull {
+                it.localFileName?.equals(fileName, ignoreCase = true) == true
+            }
+            if (bestMatch != null) bestScore = 1.0f
+        }
+
         if (bestMatch != null) {
             mediaDao.upsert(
                 bestMatch.copy(
@@ -331,8 +359,8 @@ class MediaVaultRepository(
                     sizeBytes = sizeBytes.coerceAtLeast(0L),
                     thumbnailPath = extracted.thumbPath ?: bestMatch.thumbnailPath,
                     storageTarget = storageTarget,
-                    matchConfidence = bestScore,
-                    matchConfirmed = bestScore >= 0.99f
+                    matchConfidence = maxOf(bestScore, 1.0f),
+                    matchConfirmed = true
                 )
             )
             return true
@@ -404,7 +432,7 @@ class MediaVaultRepository(
                 sourceUrl = sourceUrl,
                 description = description,
                 matchConfidence = score,
-                matchConfirmed = score >= 0.99f
+                matchConfirmed = true
             )
         } else {
             MediaItemEntity(

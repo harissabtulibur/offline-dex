@@ -5,6 +5,7 @@ import android.os.ParcelFileDescriptor
 import android.util.LruCache
 import com.github.luben.zstd.ZstdInputStream
 import org.tukaani.xz.XZInputStream
+import java.io.BufferedInputStream
 import java.io.Closeable
 import java.io.EOFException
 import java.io.FileInputStream
@@ -12,6 +13,7 @@ import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.zip.InflaterInputStream
 import kotlin.math.min
 
 data class ZimHeaderInfo(
@@ -94,7 +96,9 @@ class ZimArchiveReader(
 
     private val fis = FileInputStream(pfd.fileDescriptor)
     private val channel: FileChannel = fis.channel
-    private val fileSize: Long = channel.size()
+    private val fileSize: Long = runCatching { channel.size() }.getOrNull()?.takeIf { it > 0L }
+        ?: pfd.statSize.takeIf { it > 0L }
+        ?: Long.MAX_VALUE
     private val ioLock = Any()
 
     val header: ZimHeaderInfo
@@ -125,7 +129,7 @@ class ZimArchiveReader(
         val mimeListPos = bb.getLong(56)
         val mainPage = bb.getInt(64).toLong() and 0xFFFFFFFFL
         val layoutPage = bb.getInt(68).toLong() and 0xFFFFFFFFL
-        val checksumPos = bb.getLong(72).let { if (it in 80..fileSize) it else fileSize }
+        val checksumPos = bb.getLong(72).let { if (it in 80L until fileSize) it else fileSize }
 
         header = ZimHeaderInfo(
             majorVersion = major,
@@ -178,25 +182,43 @@ class ZimArchiveReader(
         val probeNamespaces = listOf('C', 'A')
         for (ns in probeNamespaces) {
             val startIdx = lowerBoundNamespace(ns)
-            val endIdx = min(header.entryCount, startIdx + 2500)
-            for (i in startIdx until endIdx) {
+            val scanLimit = min(header.entryCount, startIdx + 25000)
+            var checked = 0
+            var i = startIdx
+            while (i < header.entryCount && checked < 8000 && i < scanLimit) {
                 val e = readDirectoryEntry(i)
                 if (e.namespace != ns) break
+                checked++
                 if (e is ZimDirectoryEntry.Content) {
                     val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
-                    if (mime.contains("html", ignoreCase = true)) {
+                    if (mime.contains("html", ignoreCase = true) && !e.url.startsWith("-/")) {
                         return e
                     }
                 }
+                i++
             }
         }
-        val fallbackLimit = min(header.entryCount, 1200)
+        val fallbackLimit = min(header.entryCount, 4000)
         for (i in 0 until fallbackLimit) {
-            val e = readDirectoryEntry(i)
-            if (e is ZimDirectoryEntry.Content && (e.namespace == 'C' || e.namespace == 'A')) {
-                val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
+            val resolved = resolveEntryIndex(i)
+            if (resolved != null && (resolved.namespace == 'C' || resolved.namespace == 'A')) {
+                val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
                 if (mime.contains("html", ignoreCase = true)) {
-                    return e
+                    return resolved
+                }
+            }
+        }
+        if (header.entryCount > 0 && header.titlePtrPos in 80L until fileSize) {
+            val titleScanLimit = min(header.entryCount, 400)
+            for (t in 0 until titleScanLimit) {
+                val entryIdx = readUInt32At(header.titlePtrPos + t.toLong() * 4L)
+                if (entryIdx !in 0 until header.entryCount) continue
+                val resolved = resolveEntryIndex(entryIdx) ?: continue
+                if (resolved.namespace == 'C' || resolved.namespace == 'A') {
+                    val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
+                    if (mime.contains("html", ignoreCase = true) && !resolved.url.startsWith("-/")) {
+                        return resolved
+                    }
                 }
             }
         }
@@ -209,12 +231,16 @@ class ZimArchiveReader(
         for (ns in listOf('C', 'A')) {
             if (out.size >= limit) break
             val startIdx = lowerBoundNamespace(ns)
-            val endIdx = min(header.entryCount, startIdx + 3000)
-            for (i in startIdx until endIdx) {
-                if (out.size >= limit) break
-                val e = readDirectoryEntry(i)
-                if (e.namespace != ns) break
-                if (e is ZimDirectoryEntry.Content) {
+            val span = (header.entryCount - startIdx).coerceAtLeast(1)
+            val step = if (span > 4000) (span / 2500).coerceAtLeast(1) else 1
+            var idx = startIdx
+            var scanned = 0
+            while (idx < header.entryCount && out.size < limit && scanned < 3000) {
+                scanned++
+                val raw = readDirectoryEntry(idx)
+                if (raw.namespace != ns) break
+                val e = if (raw is ZimDirectoryEntry.Redirect) resolveEntryIndex(raw.index) else raw as? ZimDirectoryEntry.Content
+                if (e != null && (e.namespace == 'C' || e.namespace == 'A') && !e.url.startsWith("-/")) {
                     val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
                     if (mime.contains("html", ignoreCase = true) && seen.add(e.fullKey)) {
                         out += ZimSearchHit(
@@ -225,6 +251,29 @@ class ZimArchiveReader(
                         )
                     }
                 }
+                idx += step
+            }
+        }
+        if (out.isEmpty() && header.entryCount > 0 && header.titlePtrPos in 80L until fileSize) {
+            val step = (header.entryCount / 1500).coerceAtLeast(1)
+            var t = 0
+            while (t < header.entryCount && out.size < limit) {
+                val entryIdx = readUInt32At(header.titlePtrPos + t.toLong() * 4L)
+                if (entryIdx in 0 until header.entryCount) {
+                    val e = resolveEntryIndex(entryIdx)
+                    if (e != null && (e.namespace == 'C' || e.namespace == 'A') && !e.url.startsWith("-/")) {
+                        val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
+                        if (mime.contains("html", ignoreCase = true) && seen.add(e.fullKey)) {
+                            out += ZimSearchHit(
+                                entryIndex = e.index,
+                                fullKey = e.fullKey,
+                                title = e.title.ifBlank { e.url },
+                                mimeType = mime
+                            )
+                        }
+                    }
+                }
+                t += step
             }
         }
         return out
@@ -345,11 +394,18 @@ class ZimArchiveReader(
             addVariants(ns, rest)
             addVariants('C', cleanPath)
             addVariants('A', cleanPath)
-            // Some relative links inside C/Foo/Bar resolve cleanly from C/ or A/ without namespace
             addVariants('C', rest)
             addVariants('A', rest)
             addVariants('-', rest)
             addVariants('I', rest)
+            addVariants('M', rest)
+            if (rest.length >= 2 && rest[1] == '/') {
+                val nestedNs = rest[0]
+                val nestedRest = rest.substring(2)
+                addVariants(nestedNs, nestedRest)
+                addVariants('C', nestedRest)
+                addVariants('A', nestedRest)
+            }
         } else {
             addVariants('C', cleanPath)
             addVariants('A', cleanPath)
@@ -360,6 +416,18 @@ class ZimArchiveReader(
                 val stripped = cleanPath.removePrefix("wiki/")
                 addVariants('C', stripped)
                 addVariants('A', stripped)
+            }
+        }
+
+        // Also handle deep relative asset paths like "C/foo/-/mw/style.css" or "A/bar/I/pic.png"
+        for (marker in listOf("/-/", "/I/", "/C/", "/A/", "/M/")) {
+            val idx = cleanPath.indexOf(marker)
+            if (idx > 0) {
+                val markerNs = marker[1]
+                val tail = cleanPath.substring(idx + 3)
+                addVariants(markerNs, tail)
+                addVariants('C', "${markerNs}/$tail")
+                addVariants('C', tail)
             }
         }
 
@@ -505,14 +573,20 @@ class ZimArchiveReader(
         }
 
         val clusterStart = readLongAt(header.clusterPtrPos + clusterNumber.toLong() * 8L)
-        val clusterEnd = if (clusterNumber + 1 < header.clusterCount) {
+        val rawNextClusterStart = if (clusterNumber + 1 < header.clusterCount) {
             readLongAt(header.clusterPtrPos + (clusterNumber + 1).toLong() * 8L)
         } else {
             header.checksumPos
         }
+        val clusterEnd = when {
+            rawNextClusterStart > clusterStart -> rawNextClusterStart
+            header.checksumPos > clusterStart -> header.checksumPos
+            else -> fileSize
+        }
         val clusterDataStart = clusterStart + 1L
         val clusterCompLen = (clusterEnd - clusterDataStart).coerceAtLeast(0L)
-        val infoByte = readBytesAt(clusterStart, 1)[0].toInt() and 0xFF
+        val infoByte = readBytesAt(clusterStart, 1).firstOrNull()?.toInt()?.and(0xFF)
+            ?: error("Unable to read ZIM cluster header at offset $clusterStart")
         val compression = infoByte and 0x0F
         val extended = (infoByte and 0x10) != 0
         val offsetSize = if (extended) 8 else 4
@@ -520,7 +594,7 @@ class ZimArchiveReader(
         openDecompressedClusterStream(clusterDataStart, clusterCompLen, compression).use { stream ->
             val firstOffsetBytes = readExact(stream, offsetSize)
             val firstOffset = parseOffset(firstOffsetBytes, extended)
-            if (firstOffset < offsetSize || firstOffset > 4_000_000L) {
+            if (firstOffset < offsetSize || firstOffset > 8_000_000L) {
                 error("Corrupt or oversized ZIM cluster offset table ($firstOffset)")
             }
             val blobCount = (firstOffset / offsetSize).toInt() - 1
@@ -575,9 +649,10 @@ class ZimArchiveReader(
         compressedLen: Long,
         compression: Int
     ): InputStream {
-        val slice = ChannelSliceInputStream(channel, dataStart, compressedLen, ioLock)
+        val slice = BufferedInputStream(ChannelSliceInputStream(channel, dataStart, compressedLen, ioLock), 16384)
         return when (compression) {
             0, 1 -> slice
+            2 -> InflaterInputStream(slice)
             4 -> XZInputStream(slice)
             5 -> ZstdInputStream(slice)
             else -> {
@@ -649,7 +724,7 @@ class ZimArchiveReader(
         var off = 0
         while (off < count) {
             val n = stream.read(out, off, count - off)
-            if (n <= 0) throw EOFException("Unexpected EOF in ZIM stream (read $off/$count)")
+            if (n < 0) throw EOFException("Unexpected EOF in ZIM stream (read $off/$count)")
             off += n
         }
         return out
@@ -661,7 +736,7 @@ class ZimArchiveReader(
         while (remaining > 0L) {
             val toRead = min(scratch.size.toLong(), remaining).toInt()
             val n = stream.read(scratch, 0, toRead)
-            if (n <= 0) throw EOFException("Unexpected EOF while skipping ZIM stream")
+            if (n < 0) throw EOFException("Unexpected EOF while skipping ZIM stream")
             remaining -= n
         }
     }

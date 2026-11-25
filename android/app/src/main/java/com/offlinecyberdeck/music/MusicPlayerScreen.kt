@@ -104,8 +104,11 @@ import com.offlinecyberdeck.CyberDeckApplication
 import com.offlinecyberdeck.core.database.entity.AppSettingsEntity
 import com.offlinecyberdeck.core.database.entity.MusicTrackEntity
 import com.offlinecyberdeck.core.format.Formatters
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 private val YtmRed = Color(0xFFFF0033)
 private val YtmBg = Color(0xFF030303)
@@ -134,6 +137,17 @@ fun MusicPlayerScreen(
     val scope = rememberCoroutineScope()
     val tracks by app.musicRepository.tracksFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val settings by app.settingsRepository.settingsFlow.collectAsStateWithLifecycle(initialValue = AppSettingsEntity())
+    val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
+    var accessibleIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(tracks, driveStatus) {
+        accessibleIds = withContext(Dispatchers.IO) {
+            tracks.filter { app.musicRepository.isTrackAccessible(it) }
+                .mapTo(HashSet()) { it.id }
+        }
+    }
+    val visibleTracks = remember(tracks, accessibleIds) {
+        tracks.filter { it.id in accessibleIds }
+    }
 
     var selectedTab by remember { mutableStateOf(MusicTab.QUICK_PICKS) }
     var searchOpen by remember { mutableStateOf(false) }
@@ -171,7 +185,12 @@ fun MusicPlayerScreen(
         }
         queue = list
         currentIndex = startIdx
-        exoPlayer.setMediaItem(MediaItem.fromUri(target.fileUri))
+        val playUri = if (target.fileUri.startsWith("content://") || target.fileUri.startsWith("file://")) {
+            Uri.parse(target.fileUri)
+        } else {
+            Uri.fromFile(File(target.fileUri))
+        }
+        exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
         exoPlayer.prepare()
         exoPlayer.setPlaybackSpeed(playbackSpeed)
         exoPlayer.playWhenReady = true
@@ -219,11 +238,16 @@ fun MusicPlayerScreen(
             app.musicRepository.autoImportAndRefresh(settings.deckDriveTreeUri, extraSaf)
                 .onSuccess { summary ->
                     if (manual) {
+                        val removedPart = if (summary.removedCount > 0) ", ${summary.removedCount} lagu nonaktif dibersihkan" else ""
                         onShowMessage(
-                            "Import selesai: ${summary.importedCount} MP3/audio baru ditambahkan, ${summary.skippedCount} file lama dilewati."
+                            "Import selesai: ${summary.importedCount} MP3/audio baru ditambahkan$removedPart (${summary.skippedCount} file lama dilewati)."
                         )
-                    } else if (summary.importedCount > 0) {
-                        onShowMessage("Auto-Import Musik: ${summary.importedCount} lagu baru ditemukan.")
+                    } else if (summary.importedCount > 0 || summary.removedCount > 0) {
+                        val parts = buildList {
+                            if (summary.importedCount > 0) add("${summary.importedCount} lagu baru")
+                            if (summary.removedCount > 0) add("${summary.removedCount} lagu terputus dibersihkan")
+                        }
+                        onShowMessage("Auto-Import Musik: ${parts.joinToString(", ")}.")
                     }
                 }
                 .onFailure {
@@ -307,8 +331,8 @@ fun MusicPlayerScreen(
         }
     }
 
-    val filteredTracks = remember(tracks, searchQuery, selectedTab, selectedGroupFilter) {
-        tracks.filter { t ->
+    val filteredTracks = remember(visibleTracks, searchQuery, selectedTab, selectedGroupFilter) {
+        visibleTracks.filter { t ->
             val qOk = searchQuery.isBlank() ||
                 t.title.contains(searchQuery, true) ||
                 t.artist.contains(searchQuery, true) ||
@@ -402,7 +426,7 @@ fun MusicPlayerScreen(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            "${tracks.size} lagu • Internal, SD & USB",
+                            "${visibleTracks.size} lagu • Internal, SD & USB",
                             color = YtmMuted,
                             fontSize = 11.sp
                         )
@@ -526,7 +550,7 @@ fun MusicPlayerScreen(
         // Main Content Area
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
-                tracks.isEmpty() -> {
+                visibleTracks.isEmpty() -> {
                     Column(
                         modifier = Modifier.align(Alignment.Center).padding(28.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -685,7 +709,7 @@ fun MusicPlayerScreen(
                                     Text("Putar Cepat", color = YtmInk, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                                     OutlinedButton(onClick = {
                                         shuffleEnabled = true
-                                        if (tracks.isNotEmpty()) playFromList(tracks.shuffled(), 0)
+                                        if (visibleTracks.isNotEmpty()) playFromList(visibleTracks.shuffled(), 0)
                                     }) {
                                         Icon(Icons.Filled.Shuffle, contentDescription = null, tint = YtmInk, modifier = Modifier.size(16.dp))
                                         Spacer(Modifier.width(6.dp))
@@ -696,13 +720,13 @@ fun MusicPlayerScreen(
                                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                                     contentPadding = PaddingValues(vertical = 8.dp)
                                 ) {
-                                    itemsIndexed(tracks.take(12), key = { _, t -> "qp_${t.id}" }) { idx, track ->
+                                    itemsIndexed(visibleTracks.take(12), key = { _, t -> "qp_${t.id}" }) { idx, track ->
                                         Surface(
                                             color = YtmCard,
                                             shape = RoundedCornerShape(10.dp),
                                             modifier = Modifier
                                                 .width(148.dp)
-                                                .clickable { playFromList(tracks, idx) }
+                                                .clickable { playFromList(visibleTracks, idx) }
                                         ) {
                                             Column(modifier = Modifier.padding(10.dp)) {
                                                 Box(

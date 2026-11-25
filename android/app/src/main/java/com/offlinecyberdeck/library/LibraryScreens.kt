@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -35,9 +36,11 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.OpenInBrowser
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -176,8 +179,19 @@ fun LibraryScreen(
                 )
             }
             else -> {
-                val filtered = remember(items, query, selectedCategory, favoritesOnly) {
-                    items.filter { item ->
+                val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
+                var availableIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+                LaunchedEffect(items, driveStatus) {
+                    availableIds = withContext(Dispatchers.IO) {
+                        items.filter { app.vaultRepository.isItemAvailable(it) }
+                            .mapTo(HashSet()) { it.id }
+                    }
+                }
+                val visibleItems = remember(items, availableIds) {
+                    items.filter { it.id in availableIds }
+                }
+                val filtered = remember(visibleItems, query, selectedCategory, favoritesOnly) {
+                    visibleItems.filter { item ->
                         val qOk = query.isBlank() ||
                             item.title.contains(query, true) ||
                             item.tags.contains(query, true) ||
@@ -196,13 +210,38 @@ fun LibraryScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "Knowledge Vault (${items.size})",
+                            "Knowledge Vault (${visibleItems.size})",
                             style = MaterialTheme.typography.titleLarge,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(
+                                onClick = {
+                                    if (!isAutoImporting) {
+                                        scope.launch {
+                                            isAutoImporting = true
+                                            app.vaultRepository.autoImportFromConfiguredSources(settings.deckDriveTreeUri)
+                                                .onSuccess { summary ->
+                                                    val removedPart = if (summary.removedCount > 0) ", ${summary.removedCount} nonaktif dibersihkan" else ""
+                                                    onShowMessage("Refresh Vault: ${summary.importedCount} file baru$removedPart (${summary.skippedCount} dilewati)")
+                                                }
+                                                .onFailure { err ->
+                                                    onShowMessage("Refresh Vault gagal: ${err.message}")
+                                                }
+                                            isAutoImporting = false
+                                        }
+                                    }
+                                },
+                                enabled = !isAutoImporting
+                            ) {
+                                if (isAutoImporting) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Icon(Icons.Filled.Refresh, contentDescription = "Refresh Vault")
+                                }
+                            }
                             OutlinedButton(onClick = { showAutoImportDialog = true }) {
                                 Icon(Icons.Filled.FolderOpen, contentDescription = null)
                                 Spacer(Modifier.width(4.dp))
@@ -252,8 +291,8 @@ fun LibraryScreen(
                     if (filtered.isEmpty()) {
                         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                             Text(
-                                text = if (items.isEmpty()) {
-                                    "Your offline Knowledge Vault is empty. Tap Import to catalog PDFs, EPUBs, HTML/Markdown guides, ZIM archives, or offline map packages."
+                                text = if (visibleItems.isEmpty()) {
+                                    "Your offline Knowledge Vault is empty. Tap Import or Refresh to catalog PDFs, EPUBs, HTML/Markdown guides, ZIM archives, or offline map packages."
                                 } else {
                                     "No items match your current filter."
                                 },
@@ -263,15 +302,10 @@ fun LibraryScreen(
                     } else {
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             items(filtered, key = { it.id }) { item ->
-                                val available = app.vaultRepository.isItemAvailable(item)
                                 Card(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            if (!available) {
-                                                onShowMessage("File unavailable — check Deck Drive connection.")
-                                                return@clickable
-                                            }
                                             scope.launch {
                                                 app.vaultRepository.updateItem(
                                                     item.copy(lastOpenedAt = System.currentTimeMillis())
@@ -324,9 +358,9 @@ fun LibraryScreen(
                                             }
                                         }
                                         Text(
-                                            text = if (available) "Offline Ready (${item.storageTarget.label})" else "Drive Disconnected / File Unavailable",
+                                            text = "Offline Ready (${item.storageTarget.label})",
                                             style = MaterialTheme.typography.labelMedium,
-                                            color = if (available) DeckGreen else DeckRed
+                                            color = DeckGreen
                                         )
                                         if (item.description.isNotBlank()) {
                                             Text(
@@ -458,8 +492,9 @@ fun LibraryScreen(
                                     app.vaultRepository.autoImportFromConfiguredSources(settings.deckDriveTreeUri)
                                         .onSuccess { summary ->
                                             showAutoImportDialog = false
+                                            val removedPart = if (summary.removedCount > 0) ", ${summary.removedCount} nonaktif dibersihkan" else ""
                                             onShowMessage(
-                                                "Auto Import: ${summary.importedCount} new items added (${summary.skippedCount} skipped)"
+                                                "Auto Import: ${summary.importedCount} file baru$removedPart (${summary.skippedCount} dilewati)"
                                             )
                                         }
                                         .onFailure { err ->

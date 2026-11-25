@@ -22,7 +22,8 @@ import java.util.UUID
 
 data class MusicRefreshSummary(
     val importedCount: Int,
-    val skippedCount: Int
+    val skippedCount: Int,
+    val removedCount: Int = 0
 )
 
 class MusicRepository(
@@ -130,6 +131,14 @@ class MusicRepository(
         extraSafUris: List<String>
     ): Result<MusicRefreshSummary> = withContext(Dispatchers.IO) {
         runCatching {
+            var removed = 0
+            for (track in musicDao.getAllSnapshot()) {
+                if (!driveManager.isUriOrFileAccessible(track.fileUri)) {
+                    musicDao.delete(track)
+                    removed++
+                }
+            }
+
             val existing = musicDao.getAllSnapshot()
             val seenUris = existing.mapTo(HashSet()) { it.fileUri }
             val seenNames = existing.mapTo(HashSet()) { it.fileName.lowercase(Locale.US) }
@@ -197,7 +206,7 @@ class MusicRepository(
             if (toInsert.isNotEmpty()) {
                 musicDao.upsertAll(toInsert)
             }
-            MusicRefreshSummary(importedCount = toInsert.size, skippedCount = skipped)
+            MusicRefreshSummary(importedCount = toInsert.size, skippedCount = skipped, removedCount = removed)
         }
     }
 
