@@ -165,7 +165,7 @@ class UnifiedSearchRepository(
                 score = score + 9,
                 isAvailableOffline = true,
                 targetRef = ref,
-                mimeType = mimeType,
+                mimeType = mimeType.orEmpty(),
                 fileSizeBytes = sizeBytes,
                 volumeLabel = volumeLabel
             )

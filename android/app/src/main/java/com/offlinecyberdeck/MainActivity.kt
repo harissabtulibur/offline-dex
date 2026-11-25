@@ -363,16 +363,20 @@ private fun CyberDeckRootShell(
                     enabled = settings.notificationSoundEnabled
                 )
                 postExternalStorageNotification(context, label)
+                val extraSafList = settings.extraMediaSafUris
+                    .lines()
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
                 if (settings.musicAutoImport) {
                     app.musicRepository.autoImportAndRefresh(
                         deckDriveTreeUri = settings.deckDriveTreeUri,
-                        extraSafUrisCsv = settings.extraMediaSafUris
+                        extraSafUris = extraSafList
                     )
                 }
                 if (settings.offlineTubeAutoImport) {
                     app.mediaRepository.autoImportAndRefreshVideos(
                         deckDriveTreeUri = settings.deckDriveTreeUri,
-                        extraSafUrisCsv = settings.extraMediaSafUris
+                        extraSafUris = extraSafList
                     )
                 }
             }

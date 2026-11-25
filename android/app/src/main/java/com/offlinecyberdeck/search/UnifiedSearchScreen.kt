@@ -116,14 +116,15 @@ fun UnifiedSearchScreen(
         isSearching = false
     }
 
-    val googleWordmark = remember {
+    val onSurfaceColor = MaterialTheme.colorScheme.onSurface
+    val googleWordmark = remember(onSurfaceColor) {
         buildAnnotatedString {
             withStyle(SpanStyle(color = Color(0xFF4285F4), fontWeight = FontWeight.Bold)) { append("C") }
             withStyle(SpanStyle(color = Color(0xFFEA4335), fontWeight = FontWeight.Bold)) { append("y") }
             withStyle(SpanStyle(color = Color(0xFFFBBC05), fontWeight = FontWeight.Bold)) { append("b") }
             withStyle(SpanStyle(color = Color(0xFF4285F4), fontWeight = FontWeight.Bold)) { append("e") }
             withStyle(SpanStyle(color = Color(0xFF34A853), fontWeight = FontWeight.Bold)) { append("r") }
-            withStyle(SpanStyle(color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Normal)) { append(" Search") }
+            withStyle(SpanStyle(color = onSurfaceColor, fontWeight = FontWeight.Normal)) { append(" Search") }
         }
     }
 
