@@ -1,11 +1,17 @@
 package com.offlinecyberdeck.library
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
+import android.util.Base64
 import android.view.ViewGroup
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -50,12 +56,14 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -65,6 +73,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -88,13 +97,18 @@ import java.io.ByteArrayInputStream
 private const val ZIM_HOST = "zim.offline"
 private const val ZIM_ORIGIN = "https://$ZIM_HOST"
 
-private fun buildZimUrl(key: String): String =
-    Uri.Builder()
-        .scheme("https")
-        .authority(ZIM_HOST)
-        .path("/${key.trimStart('/')}")
-        .build()
-        .toString()
+private data class PreparedZimPage(
+    val key: String,
+    val baseUrl: String,
+    val title: String,
+    val html: String
+)
+
+private fun buildZimUrl(key: String): String {
+    val clean = key.trimStart('/')
+    val encodedSegments = clean.split('/').joinToString("/") { Uri.encode(Uri.decode(it), "") }
+    return "$ZIM_ORIGIN/$encodedSegments"
+}
 
 private val WikiLightBg = Color(0xFFFFFFFF)
 private val WikiLightHeader = Color(0xFFF8F9FA)
@@ -117,6 +131,7 @@ fun ZimViewerScreen(
     webTextZoom: Int = 100,
     onBack: () -> Unit
 ) {
+    val context = LocalContext.current
     val view = LocalView.current
     val scope = rememberCoroutineScope()
 
@@ -126,9 +141,12 @@ fun ZimViewerScreen(
     var isLoadingArchive by remember { mutableStateOf(true) }
     var isPageLoading by remember { mutableStateOf(false) }
     var pageTitle by remember { mutableStateOf("Wikipedia Offline") }
-    var canGoBackWeb by remember { mutableStateOf(false) }
-    var canGoForwardWeb by remember { mutableStateOf(false) }
-    var mainPageUrl by remember { mutableStateOf("$ZIM_ORIGIN/__index__") }
+    var mainPageKey by remember { mutableStateOf("__index__") }
+    var activePathKey by remember { mutableStateOf<String?>(null) }
+    var loadedItemKey by remember { mutableStateOf<String?>(null) }
+
+    val backStack = remember { mutableStateListOf<String>() }
+    val forwardStack = remember { mutableStateListOf<String>() }
 
     var searchQuery by remember { mutableStateOf("") }
     var searchHits by remember { mutableStateOf<List<ZimSearchHit>>(emptyList()) }
@@ -136,14 +154,72 @@ fun ZimViewerScreen(
     var searchDropdownOpen by remember { mutableStateOf(false) }
     var nightFilterEnabled by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
-    var lastStartedInitialUrl by remember { mutableStateOf<String?>(null) }
     var searchJob by remember { mutableStateOf<Job?>(null) }
+    var navJob by remember { mutableStateOf<Job?>(null) }
 
     val headerBg = if (nightFilterEnabled) WikiDarkHeader else WikiLightHeader
     val surfaceBg = if (nightFilterEnabled) WikiDarkBg else WikiLightBg
     val borderCol = if (nightFilterEnabled) WikiDarkBorder else WikiLightBorder
     val inkCol = if (nightFilterEnabled) WikiDarkInk else WikiLightInk
     val mutedCol = if (nightFilterEnabled) WikiDarkMuted else WikiLightMuted
+
+    fun navigateToKey(rawKey: String, pushHistory: Boolean = true) {
+        val activeReader = reader ?: return
+        val wv = webViewRef ?: return
+        val target = rawKey.trimStart('/').ifBlank { "__index__" }
+        val prevKey = activePathKey
+        if (pushHistory && !prevKey.isNullOrBlank() && prevKey != target) {
+            if (backStack.size >= 50) backStack.removeAt(0)
+            backStack.add(prevKey)
+            forwardStack.clear()
+        }
+        navJob?.cancel()
+        navJob = scope.launch {
+            isPageLoading = true
+            try {
+                val prepared = prepareZimPage(
+                    reader = activeReader,
+                    targetKeyOrPath = target,
+                    archiveTitle = item?.title ?: "Wikipedia Offline",
+                    dark = nightFilterEnabled
+                )
+                activePathKey = prepared.key
+                pageTitle = prepared.title
+                wv.loadDataWithBaseURL(
+                    prepared.baseUrl,
+                    prepared.html,
+                    "text/html",
+                    "UTF-8",
+                    prepared.baseUrl
+                )
+            } catch (t: Throwable) {
+                isPageLoading = false
+                errorMessage = "Gagal memuat halaman ZIM: ${t.message ?: t.javaClass.simpleName}"
+            }
+        }
+    }
+
+    fun goBackHistory(): Boolean {
+        if (backStack.isEmpty()) return false
+        val prev = backStack.removeAt(backStack.size - 1)
+        val cur = activePathKey
+        if (!cur.isNullOrBlank()) {
+            forwardStack.add(cur)
+        }
+        navigateToKey(prev, pushHistory = false)
+        return true
+    }
+
+    fun goForwardHistory(): Boolean {
+        if (forwardStack.isEmpty()) return false
+        val next = forwardStack.removeAt(forwardStack.size - 1)
+        val cur = activePathKey
+        if (!cur.isNullOrBlank()) {
+            backStack.add(cur)
+        }
+        navigateToKey(next, pushHistory = false)
+        return true
+    }
 
     DisposableEffect(view) {
         val prev = view.keepScreenOn
@@ -154,7 +230,11 @@ fun ZimViewerScreen(
     LaunchedEffect(itemId) {
         isLoadingArchive = true
         errorMessage = null
-        lastStartedInitialUrl = null
+        loadedItemKey = null
+        activePathKey = null
+        backStack.clear()
+        forwardStack.clear()
+        navJob?.cancel()
         reader?.close()
         reader = null
         val loaded = app.database.libraryDao().getById(itemId)
@@ -171,16 +251,11 @@ fun ZimViewerScreen(
                 val pfd = app.driveManager.openReadFileDescriptor(loaded.fileUri)
                     ?: error("Tidak bisa mengakses file ZIM (${loaded.fileName}). Pastikan izin penyimpanan / Deck Drive aktif.")
                 val opened = ZimArchiveReader(pfd)
-                val startKey = opened.getMainPageKey()
-                val startUrl = if (!startKey.isNullOrBlank()) {
-                    buildZimUrl(startKey)
-                } else {
-                    "$ZIM_ORIGIN/__index__"
-                }
-                opened to startUrl
-            }.onSuccess { (opened, startUrl) ->
+                val startKey = opened.getMainPageKey()?.trimStart('/')?.takeIf { it.isNotBlank() } ?: "__index__"
+                opened to startKey
+            }.onSuccess { (opened, startKey) ->
                 reader = opened
-                mainPageUrl = startUrl
+                mainPageKey = startKey
                 isLoadingArchive = false
             }.onFailure { err ->
                 errorMessage = "Gagal membuka ZIM: ${err.message ?: err.javaClass.simpleName}"
@@ -191,26 +266,17 @@ fun ZimViewerScreen(
 
     DisposableEffect(Unit) {
         onDispose {
-            webViewRef?.apply {
-                stopLoading()
-                loadUrl("about:blank")
-                clearHistory()
-                removeAllViews()
-                destroy()
-            }
-            webViewRef = null
+            navJob?.cancel()
+            searchJob?.cancel()
             reader?.close()
             reader = null
         }
     }
 
     BackHandler {
-        val wv = webViewRef
         if (searchDropdownOpen) {
             searchDropdownOpen = false
-        } else if (wv != null && wv.canGoBack()) {
-            wv.goBack()
-        } else {
+        } else if (!goBackHistory()) {
             onBack()
         }
     }
@@ -221,17 +287,23 @@ fun ZimViewerScreen(
         if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
             runCatching { WebSettingsCompat.setAlgorithmicDarkeningAllowed(wv.settings, nightFilterEnabled) }
         }
-        if (wv.url?.startsWith(ZIM_ORIGIN) == true) {
-            wv.evaluateJavascript(buildWikipediaCssInjectionJs(nightFilterEnabled), null)
+        val curKey = activePathKey
+        if (!curKey.isNullOrBlank() && reader != null) {
+            if (curKey == "__index__") {
+                navigateToKey("__index__", pushHistory = false)
+            } else {
+                wv.evaluateJavascript(buildWikipediaCssInjectionJs(nightFilterEnabled), null)
+            }
         }
     }
 
-    LaunchedEffect(reader, mainPageUrl, webViewRef) {
+    LaunchedEffect(reader, mainPageKey, webViewRef) {
         val active = reader ?: return@LaunchedEffect
         val wv = webViewRef ?: return@LaunchedEffect
-        if (lastStartedInitialUrl != mainPageUrl && active != null) {
-            lastStartedInitialUrl = mainPageUrl
-            wv.loadUrl(mainPageUrl)
+        val token = "${itemId}_${mainPageKey}_${active.hashCode()}"
+        if (loadedItemKey != token) {
+            loadedItemKey = token
+            navigateToKey(mainPageKey, pushHistory = false)
         }
     }
 
@@ -247,8 +319,7 @@ fun ZimViewerScreen(
             ) {
                 IconButton(
                     onClick = {
-                        val wv = webViewRef
-                        if (wv != null && wv.canGoBack()) wv.goBack() else onBack()
+                        if (!goBackHistory()) onBack()
                     },
                     modifier = Modifier.size(36.dp)
                 ) {
@@ -259,14 +330,14 @@ fun ZimViewerScreen(
                     )
                 }
                 IconButton(
-                    onClick = { webViewRef?.goForward() },
-                    enabled = canGoForwardWeb,
+                    onClick = { goForwardHistory() },
+                    enabled = forwardStack.isNotEmpty(),
                     modifier = Modifier.size(36.dp)
                 ) {
                     Icon(
                         Icons.AutoMirrored.Filled.ArrowForward,
                         contentDescription = "Forward",
-                        tint = if (canGoForwardWeb) inkCol else mutedCol.copy(alpha = 0.35f)
+                        tint = if (forwardStack.isNotEmpty()) inkCol else mutedCol.copy(alpha = 0.35f)
                     )
                 }
 
@@ -278,7 +349,7 @@ fun ZimViewerScreen(
                         .background(if (nightFilterEnabled) Color(0xFF262D38) else Color(0xFFEFF2F6))
                         .clickable {
                             searchDropdownOpen = false
-                            webViewRef?.loadUrl(mainPageUrl)
+                            navigateToKey(mainPageKey, pushHistory = true)
                         },
                     contentAlignment = Alignment.Center
                 ) {
@@ -304,7 +375,7 @@ fun ZimViewerScreen(
                     val activeReader = reader
                     if (activeReader != null) {
                         Text(
-                            text = "Ensiklopedia Offline • ${activeReader.header.entryCount} entri (ZIM v${activeReader.header.majorVersion})",
+                            text = "Ensiklopedia Offline • ${activeReader.header.entryCount} entri (ZIM v${activeReader.header.majorVersion}.${activeReader.header.minorVersion})",
                             fontSize = 10.sp,
                             color = mutedCol,
                             maxLines = 1,
@@ -376,7 +447,7 @@ fun ZimViewerScreen(
                                         val first = searchHits.firstOrNull()
                                         if (first != null) {
                                             searchDropdownOpen = false
-                                            webViewRef?.loadUrl(buildZimUrl(first.fullKey))
+                                            navigateToKey(first.fullKey, pushHistory = true)
                                         }
                                     }
                                 ),
@@ -403,7 +474,7 @@ fun ZimViewerScreen(
                 IconButton(
                     onClick = {
                         searchDropdownOpen = false
-                        webViewRef?.loadUrl(mainPageUrl)
+                        navigateToKey(mainPageKey, pushHistory = true)
                     },
                     enabled = reader != null,
                     modifier = Modifier.size(34.dp)
@@ -413,7 +484,7 @@ fun ZimViewerScreen(
                 IconButton(
                     onClick = {
                         searchDropdownOpen = false
-                        webViewRef?.loadUrl("$ZIM_ORIGIN/__index__")
+                        navigateToKey("__index__", pushHistory = true)
                     },
                     enabled = reader != null,
                     modifier = Modifier.size(34.dp)
@@ -466,8 +537,32 @@ fun ZimViewerScreen(
                             text = errorMessage!!,
                             color = MaterialTheme.colorScheme.error
                         )
-                        Button(onClick = onBack) {
-                            Text("Tutup")
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+                                OutlinedButton(onClick = {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(
+                                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                Uri.parse("package:${context.packageName}")
+                                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        )
+                                    }
+                                }) {
+                                    Text("Izinkan Akses File")
+                                }
+                            }
+                            if (activeReader != null) {
+                                OutlinedButton(onClick = {
+                                    errorMessage = null
+                                    navigateToKey("__index__", pushHistory = false)
+                                }) {
+                                    Text("Buka Indeks")
+                                }
+                            }
+                            Button(onClick = onBack) {
+                                Text("Tutup")
+                            }
                         }
                     }
                 }
@@ -515,6 +610,7 @@ fun ZimViewerScreen(
                                     allowFileAccess = false
                                     allowContentAccess = false
                                 }
+                                webChromeClient = object : WebChromeClient() {}
                                 webViewClient = object : WebViewClient() {
                                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                                         isPageLoading = true
@@ -522,8 +618,6 @@ fun ZimViewerScreen(
 
                                     override fun onPageFinished(view: WebView?, url: String?) {
                                         isPageLoading = false
-                                        canGoBackWeb = view?.canGoBack() == true
-                                        canGoForwardWeb = view?.canGoForward() == true
                                         val title = view?.title?.takeIf {
                                             it.isNotBlank() && it != "about:blank" && !it.startsWith(ZIM_HOST)
                                         }
@@ -557,9 +651,29 @@ fun ZimViewerScreen(
                                         view: WebView?,
                                         request: WebResourceRequest?
                                     ): Boolean {
-                                        val url = request?.url ?: return false
+                                        val url = request?.url ?: return true
                                         if (url.host != ZIM_HOST) return true
-                                        return false
+                                        val rawPath = url.encodedPath.orEmpty().trimStart('/')
+                                        val fragment = url.fragment.orEmpty()
+                                        if (rawPath.isBlank() && fragment.isNotBlank()) {
+                                            val escapedFrag = fragment.replace("\\", "\\\\").replace("'", "\\'")
+                                            view?.evaluateJavascript(
+                                                "(function(){var e=document.getElementById('$escapedFrag')||document.getElementsByName('$escapedFrag')[0];if(e)e.scrollIntoView({behavior:'smooth'});})();",
+                                                null
+                                            )
+                                            return true
+                                        }
+                                        val targetPath = rawPath.ifBlank { mainPageKey }
+                                        if (targetPath == activePathKey && fragment.isNotBlank()) {
+                                            val escapedFrag = fragment.replace("\\", "\\\\").replace("'", "\\'")
+                                            view?.evaluateJavascript(
+                                                "(function(){var e=document.getElementById('$escapedFrag')||document.getElementsByName('$escapedFrag')[0];if(e)e.scrollIntoView({behavior:'smooth'});})();",
+                                                null
+                                            )
+                                            return true
+                                        }
+                                        scope.launch { navigateToKey(targetPath, pushHistory = true) }
+                                        return true
                                     }
 
                                     override fun shouldInterceptRequest(
@@ -572,7 +686,7 @@ fun ZimViewerScreen(
                                                 return emptyNotFound()
                                             }
                                             val path = uri.encodedPath.orEmpty().trimStart('/')
-                                            if (path == "__index__" || (path.isBlank() && mainPageUrl.endsWith("__index__"))) {
+                                            if (path == "__index__") {
                                                 val samples = runCatching { activeReader.getSampleArticles(50) }.getOrDefault(emptyList())
                                                 val html = buildWikipediaPortalHtml(
                                                     title = item?.title ?: "Wikipedia Offline",
@@ -583,61 +697,18 @@ fun ZimViewerScreen(
                                                 return okWebResponse("text/html", "UTF-8", html.toByteArray(Charsets.UTF_8))
                                             }
 
-                                            val result = activeReader.loadWebPath(path)
-                                            val loaded = result.getOrNull()
-                                            if (loaded != null) {
-                                                val cleanMime = when {
-                                                    loaded.mimeType.equals("application/xhtml+xml", ignoreCase = true) -> "text/html"
-                                                    else -> loaded.mimeType
-                                                }
-                                                val encoding = if (cleanMime.startsWith("text/") ||
-                                                    cleanMime.contains("javascript") ||
-                                                    cleanMime.contains("svg") ||
-                                                    cleanMime.contains("json") ||
-                                                    cleanMime.contains("xml")
-                                                ) "UTF-8" else null
-
-                                                if (cleanMime == "text/html" && loaded.bytes.isEmpty()) {
-                                                    val samples = runCatching { activeReader.getSampleArticles(25) }.getOrDefault(emptyList())
-                                                    val fallback = buildWikipediaMissingHtml(
-                                                        title = item?.title ?: "Wikipedia Offline",
-                                                        requestedPath = path,
-                                                        reason = "Halaman ini kosong (0 byte) di dalam arsip ZIM.",
-                                                        samples = samples,
-                                                        dark = nightFilterEnabled
-                                                    )
-                                                    return okWebResponse("text/html", "UTF-8", fallback.toByteArray(Charsets.UTF_8))
-                                                }
-                                                return okWebResponse(cleanMime, encoding, loaded.bytes)
-                                            }
-
-                                            val isMainFrame = request.isForMainFrame || isLikelyHtmlPath(path)
-                                            if (isMainFrame) {
-                                                val reason = result.exceptionOrNull()?.message ?: "Entri tidak ditemukan."
-                                                val samples = runCatching { activeReader.getSampleArticles(25) }.getOrDefault(emptyList())
-                                                val fallback = buildWikipediaMissingHtml(
-                                                    title = item?.title ?: "Wikipedia Offline",
-                                                    requestedPath = path,
-                                                    reason = reason,
-                                                    samples = samples,
-                                                    dark = nightFilterEnabled
-                                                )
-                                                return okWebResponse("text/html", "UTF-8", fallback.toByteArray(Charsets.UTF_8))
-                                            }
+                                            val loaded = activeReader.loadWebPath(path).getOrNull()
+                                                ?: return emptyNotFound()
+                                            val cleanMime = normalizeAssetMime(path, loaded.mimeType)
+                                            val encoding = if (cleanMime.startsWith("text/") ||
+                                                cleanMime.contains("javascript") ||
+                                                cleanMime.contains("svg") ||
+                                                cleanMime.contains("json") ||
+                                                cleanMime.contains("xml")
+                                            ) "UTF-8" else null
+                                            okWebResponse(cleanMime, encoding, loaded.bytes)
+                                        } catch (_: Throwable) {
                                             emptyNotFound()
-                                        } catch (t: Throwable) {
-                                            if (request?.isForMainFrame == true) {
-                                                val fallback = buildWikipediaMissingHtml(
-                                                    title = item?.title ?: "Wikipedia Offline",
-                                                    requestedPath = request.url?.path ?: "",
-                                                    reason = "Kesalahan membaca konten ZIM: ${t.message ?: t.javaClass.simpleName}",
-                                                    samples = emptyList(),
-                                                    dark = nightFilterEnabled
-                                                )
-                                                okWebResponse("text/html", "UTF-8", fallback.toByteArray(Charsets.UTF_8))
-                                            } else {
-                                                emptyNotFound()
-                                            }
                                         }
                                     }
                                 }
@@ -650,6 +721,7 @@ fun ZimViewerScreen(
                         onRelease = { wv ->
                             wv.stopLoading()
                             wv.loadUrl("about:blank")
+                            wv.clearHistory()
                             wv.removeAllViews()
                             wv.destroy()
                             if (webViewRef === wv) webViewRef = null
@@ -694,7 +766,7 @@ fun ZimViewerScreen(
                                             .fillMaxWidth()
                                             .clickable {
                                                 searchDropdownOpen = false
-                                                webViewRef?.loadUrl(buildZimUrl(hit.fullKey))
+                                                navigateToKey(hit.fullKey, pushHistory = true)
                                             }
                                             .padding(horizontal = 14.dp, vertical = 10.dp)
                                     ) {
@@ -726,6 +798,277 @@ fun ZimViewerScreen(
     }
 }
 
+private suspend fun prepareZimPage(
+    reader: ZimArchiveReader,
+    targetKeyOrPath: String,
+    archiveTitle: String,
+    dark: Boolean
+): PreparedZimPage = withContext(Dispatchers.IO) {
+    var currentTarget = targetKeyOrPath.trimStart('/')
+    if (currentTarget.isBlank() || currentTarget == "__index__") {
+        val samples = runCatching { reader.getSampleArticles(50) }.getOrDefault(emptyList())
+        return@withContext PreparedZimPage(
+            key = "__index__",
+            baseUrl = "$ZIM_ORIGIN/__index__",
+            title = archiveTitle,
+            html = buildWikipediaPortalHtml(
+                title = archiveTitle,
+                entryCount = reader.header.entryCount,
+                samples = samples,
+                dark = dark
+            )
+        )
+    }
+
+    var lastError: String? = null
+    repeat(5) {
+        val loadedRes = reader.loadWebPath(currentTarget)
+        val loaded = loadedRes.getOrNull()
+        if (loaded == null) {
+            lastError = loadedRes.exceptionOrNull()?.message ?: "Entri tidak ditemukan di ZIM."
+            val samples = runCatching { reader.getSampleArticles(30) }.getOrDefault(emptyList())
+            val diag = "ZIM v${reader.header.majorVersion}.${reader.header.minorVersion} • " +
+                "${reader.header.entryCount} entri • ${reader.header.clusterCount} kluster"
+            return@withContext PreparedZimPage(
+                key = currentTarget,
+                baseUrl = buildZimUrl(currentTarget),
+                title = archiveTitle,
+                html = buildWikipediaMissingHtml(
+                    title = archiveTitle,
+                    requestedPath = "$currentTarget ($diag)",
+                    reason = lastError!!,
+                    samples = samples,
+                    dark = dark
+                )
+            )
+        }
+
+        val normMime = normalizeAssetMime(loaded.finalKey, loaded.mimeType)
+        val looksHtml = normMime.contains("html", ignoreCase = true) ||
+            normMime.contains("xhtml", ignoreCase = true) ||
+            (normMime == "application/octet-stream" && bytesLookLikeHtml(loaded.bytes))
+
+        when {
+            looksHtml -> {
+                if (loaded.bytes.isEmpty()) {
+                    val samples = runCatching { reader.getSampleArticles(25) }.getOrDefault(emptyList())
+                    return@withContext PreparedZimPage(
+                        key = loaded.finalKey,
+                        baseUrl = buildZimUrl(loaded.finalKey),
+                        title = loaded.title.ifBlank { archiveTitle },
+                        html = buildWikipediaMissingHtml(
+                            title = archiveTitle,
+                            requestedPath = loaded.finalKey,
+                            reason = "Halaman kosong (0 byte) di arsip ZIM.",
+                            samples = samples,
+                            dark = dark
+                        )
+                    )
+                }
+                var rawHtml = loaded.bytes.toString(Charsets.UTF_8)
+                if (rawHtml.startsWith("\uFEFF")) rawHtml = rawHtml.substring(1)
+
+                val redirectTarget = extractHtmlRedirectTarget(rawHtml)
+                if (!redirectTarget.isNullOrBlank()) {
+                    val resolvedNext = resolveRelativeZimPath(loaded.finalKey, redirectTarget)
+                    if (resolvedNext.isNotBlank() && resolvedNext != loaded.finalKey) {
+                        currentTarget = resolvedNext
+                        return@repeat
+                    }
+                }
+
+                val extractedTitle = extractHtmlTitle(rawHtml)
+                val finalTitle = extractedTitle?.takeIf { it.isNotBlank() }
+                    ?: loaded.title.takeIf { it.isNotBlank() }
+                    ?: archiveTitle
+                val styledHtml = prepareStyledWikipediaHtml(rawHtml, dark)
+                return@withContext PreparedZimPage(
+                    key = loaded.finalKey,
+                    baseUrl = buildZimUrl(loaded.finalKey),
+                    title = finalTitle,
+                    html = styledHtml
+                )
+            }
+            normMime.startsWith("image/") -> {
+                val b64 = Base64.encodeToString(loaded.bytes, Base64.NO_WRAP)
+                val bg = if (dark) "#101418" else "#FFFFFF"
+                val ink = if (dark) "#E6EDF3" else "#202122"
+                val html = """
+                    <!doctype html><html><head><meta charset="utf-8"/>
+                    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+                    <title>${escapeHtml(loaded.title)}</title>
+                    <style>body{margin:0;padding:16px;background:$bg;color:$ink;font-family:sans-serif;text-align:center;}img{max-width:100%;height:auto;border-radius:6px;}</style>
+                    </head><body><img src="data:$normMime;base64,$b64"/><p>${escapeHtml(loaded.title)}</p></body></html>
+                """.trimIndent()
+                return@withContext PreparedZimPage(loaded.finalKey, buildZimUrl(loaded.finalKey), loaded.title, html)
+            }
+            normMime.startsWith("text/") || normMime.contains("json") || normMime.contains("xml") -> {
+                val text = loaded.bytes.toString(Charsets.UTF_8)
+                val bg = if (dark) "#101418" else "#FFFFFF"
+                val ink = if (dark) "#E6EDF3" else "#202122"
+                val html = """
+                    <!doctype html><html><head><meta charset="utf-8"/>
+                    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+                    <title>${escapeHtml(loaded.title)}</title>
+                    <style>body{margin:0 auto;max-width:920px;padding:18px;background:$bg;color:$ink;font-family:monospace;white-space:pre-wrap;word-break:break-word;line-height:1.5;}</style>
+                    </head><body><pre>${escapeHtml(text)}</pre></body></html>
+                """.trimIndent()
+                return@withContext PreparedZimPage(loaded.finalKey, buildZimUrl(loaded.finalKey), loaded.title, html)
+            }
+            else -> {
+                val bg = if (dark) "#101418" else "#FFFFFF"
+                val ink = if (dark) "#E6EDF3" else "#202122"
+                val html = """
+                    <!doctype html><html><head><meta charset="utf-8"/>
+                    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+                    <title>${escapeHtml(loaded.title)}</title>
+                    <style>body{margin:0 auto;max-width:720px;padding:24px;background:$bg;color:$ink;font-family:sans-serif;}</style>
+                    </head><body><h2>${escapeHtml(loaded.title)}</h2><p>Tipe berkas: <code>${escapeHtml(normMime)}</code> (${loaded.bytes.size} byte)</p><p><a href="/__index__">← Kembali ke Indeks</a></p></body></html>
+                """.trimIndent()
+                return@withContext PreparedZimPage(loaded.finalKey, buildZimUrl(loaded.finalKey), loaded.title, html)
+            }
+        }
+    }
+
+    val samples = runCatching { reader.getSampleArticles(25) }.getOrDefault(emptyList())
+    PreparedZimPage(
+        key = currentTarget,
+        baseUrl = buildZimUrl(currentTarget),
+        title = archiveTitle,
+        html = buildWikipediaMissingHtml(
+            title = archiveTitle,
+            requestedPath = currentTarget,
+            reason = lastError ?: "Terlalu banyak pengalihan halaman di arsip ZIM.",
+            samples = samples,
+            dark = dark
+        )
+    )
+}
+
+private fun bytesLookLikeHtml(bytes: ByteArray): Boolean {
+    if (bytes.isEmpty()) return false
+    val head = bytes.copyOf(bytes.size.coerceAtMost(256)).toString(Charsets.UTF_8).trimStart().lowercase()
+    return head.startsWith("<!doctype html") || head.startsWith("<html") || head.startsWith("<head") || head.startsWith("<meta") || head.startsWith("<body")
+}
+
+private fun normalizeAssetMime(path: String, rawMime: String): String {
+    val clean = rawMime.substringBefore(';').trim().lowercase()
+    if (clean.equals("application/xhtml+xml", ignoreCase = true)) return "text/html"
+    if (clean.isNotBlank() && clean != "application/octet-stream") return clean
+    val lower = path.substringBefore('?').substringBefore('#').lowercase()
+    return when {
+        lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml") -> "text/html"
+        lower.endsWith(".css") -> "text/css"
+        lower.endsWith(".js") || lower.endsWith(".mjs") -> "application/javascript"
+        lower.endsWith(".svg") -> "image/svg+xml"
+        lower.endsWith(".png") -> "image/png"
+        lower.endsWith(".jpg") || lower.endsWith(".jpeg") -> "image/jpeg"
+        lower.endsWith(".webp") -> "image/webp"
+        lower.endsWith(".gif") -> "image/gif"
+        lower.endsWith(".json") -> "application/json"
+        lower.endsWith(".woff2") -> "font/woff2"
+        lower.endsWith(".woff") -> "font/woff"
+        lower.endsWith(".ttf") -> "font/ttf"
+        else -> clean.ifBlank { "application/octet-stream" }
+    }
+}
+
+private val META_REFRESH_REGEX_1 = Regex(
+    """<meta[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'>\s;]+)""",
+    RegexOption.IGNORE_CASE
+)
+private val META_REFRESH_REGEX_2 = Regex(
+    """<meta[^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'>\s;]+)[^"']*["'][^>]*http-equiv\s*=\s*["']?refresh["']?""",
+    RegexOption.IGNORE_CASE
+)
+private val JS_LOCATION_REDIRECT_REGEX = Regex(
+    """window\.location(?:\.replace\s*\(\s*|\.(?:href)\s*=\s*|\s*=\s*)["']([^"']+)["']""",
+    RegexOption.IGNORE_CASE
+)
+private val CSP_META_REGEX = Regex(
+    """<meta[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>""",
+    RegexOption.IGNORE_CASE
+)
+private val HTML_TITLE_REGEX = Regex(
+    """<title[^>]*>(.*?)</title>""",
+    setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+)
+
+private fun extractHtmlRedirectTarget(html: String): String? {
+    val headSlice = if (html.length > 4096) html.substring(0, 4096) else html
+    val metaMatch = META_REFRESH_REGEX_1.find(headSlice) ?: META_REFRESH_REGEX_2.find(headSlice)
+    if (metaMatch != null) {
+        return metaMatch.groupValues[1].trim().trim('\'', '"').ifBlank { null }
+    }
+    if (html.length < 2500) {
+        val jsMatch = JS_LOCATION_REDIRECT_REGEX.find(html)
+        if (jsMatch != null) {
+            return jsMatch.groupValues[1].trim().ifBlank { null }
+        }
+    }
+    return null
+}
+
+private fun extractHtmlTitle(html: String): String? {
+    val headSlice = if (html.length > 8192) html.substring(0, 8192) else html
+    val raw = HTML_TITLE_REGEX.find(headSlice)?.groupValues?.getOrNull(1) ?: return null
+    return raw.replace(Regex("<[^>]+>"), " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .ifBlank { null }
+}
+
+private fun resolveRelativeZimPath(currentKey: String, rawTarget: String): String {
+    val cleanTarget = rawTarget.substringBefore('#').substringBefore('?').trim()
+    if (cleanTarget.isEmpty()) return currentKey
+    if (cleanTarget.startsWith(ZIM_ORIGIN, ignoreCase = true)) {
+        return cleanTarget.substring(ZIM_ORIGIN.length).trimStart('/')
+    }
+    val combined = if (cleanTarget.startsWith("/")) {
+        cleanTarget.trimStart('/')
+    } else {
+        val baseDir = currentKey.trimStart('/').substringBeforeLast('/', "")
+        if (baseDir.isEmpty()) cleanTarget else "$baseDir/$cleanTarget"
+    }
+    val parts = combined.split('/')
+    val stack = ArrayList<String>(parts.size)
+    for (p in parts) {
+        when (p) {
+            "", "." -> Unit
+            ".." -> if (stack.isNotEmpty()) stack.removeAt(stack.size - 1)
+            else -> stack += p
+        }
+    }
+    return stack.joinToString("/")
+}
+
+private fun prepareStyledWikipediaHtml(rawHtml: String, dark: Boolean): String {
+    val withoutCsp = CSP_META_REGEX.replace(rawHtml, "")
+    val injectBlock = """
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <style id="cd-wiki-style">${buildWikipediaCss(dark)}</style>
+    """.trimIndent()
+    val headOpenRegex = Regex("<head[^>]*>", RegexOption.IGNORE_CASE)
+    val headOpen = headOpenRegex.find(withoutCsp)
+    if (headOpen != null) {
+        val pos = headOpen.range.last + 1
+        return withoutCsp.substring(0, pos) + "\n" + injectBlock + "\n" + withoutCsp.substring(pos)
+    }
+    val htmlOpenRegex = Regex("<html[^>]*>", RegexOption.IGNORE_CASE)
+    val htmlOpen = htmlOpenRegex.find(withoutCsp)
+    if (htmlOpen != null) {
+        val pos = htmlOpen.range.last + 1
+        return withoutCsp.substring(0, pos) + "\n<head>$injectBlock</head>\n" + withoutCsp.substring(pos)
+    }
+    return "<!doctype html><html><head>$injectBlock</head><body>$withoutCsp</body></html>"
+}
+
 private fun okWebResponse(
     mimeType: String,
     encoding: String?,
@@ -751,58 +1094,57 @@ private fun emptyNotFound(): WebResourceResponse = WebResourceResponse(
     ByteArrayInputStream(ByteArray(0))
 )
 
-private fun isLikelyHtmlPath(path: String): Boolean {
-    val clean = path.substringBefore('?').substringBefore('#').lowercase()
-    if (clean.endsWith(".html") || clean.endsWith(".htm")) return true
-    val last = clean.substringAfterLast('/')
-    return !last.contains('.')
+private fun buildWikipediaCss(dark: Boolean): String = if (dark) {
+    """
+    html, body {
+      visibility: visible !important;
+      opacity: 1 !important;
+      background: #101418 !important;
+      color: #E6EDF3 !important;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.65;
+      max-width: 960px;
+      margin: 0 auto !important;
+      padding: 12px 18px 36px 18px !important;
+      box-sizing: border-box;
+    }
+    h1, h2 { font-family: Georgia, "Times New Roman", serif !important; border-bottom: 1px solid #2C3440 !important; padding-bottom: 4px; color: #F0F6FC !important; }
+    h3, h4, h5 { color: #E6EDF3 !important; }
+    a { color: #6B9EFF !important; }
+    table, .infobox, .wikitable, .navbox, .toc, .thumbinner, blockquote, pre, code {
+      background-color: #181D24 !important;
+      color: #E6EDF3 !important;
+      border-color: #2C3440 !important;
+    }
+    th { background-color: #222933 !important; color: #F0F6FC !important; }
+    img { max-width: 100%; height: auto; }
+    table { display: block; overflow-x: auto; max-width: 100%; }
+    """.trimIndent()
+} else {
+    """
+    html, body {
+      visibility: visible !important;
+      opacity: 1 !important;
+      background: #FFFFFF;
+      color: #202122;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.65;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 12px 18px 36px 18px;
+      box-sizing: border-box;
+    }
+    h1, h2 { font-family: Georgia, "Times New Roman", serif; border-bottom: 1px solid #A2A9B1; padding-bottom: 4px; font-weight: normal; color: #000000; }
+    a { color: #3366CC; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .infobox, .toc, .thumbinner { background-color: #F8F9FA; border: 1px solid #A2A9B1; }
+    img { max-width: 100%; height: auto; }
+    table { max-width: 100%; overflow-x: auto; }
+    """.trimIndent()
 }
 
 private fun buildWikipediaCssInjectionJs(dark: Boolean): String {
-    val css = if (dark) {
-        """
-        html, body {
-          background: #101418 !important;
-          color: #E6EDF3 !important;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          line-height: 1.65;
-          max-width: 960px;
-          margin: 0 auto !important;
-          padding: 12px 18px 36px 18px !important;
-          box-sizing: border-box;
-        }
-        h1, h2 { font-family: Georgia, "Times New Roman", serif !important; border-bottom: 1px solid #2C3440 !important; padding-bottom: 4px; color: #F0F6FC !important; }
-        h3, h4, h5 { color: #E6EDF3 !important; }
-        a { color: #6B9EFF !important; }
-        table, .infobox, .wikitable, .navbox, .toc, .thumbinner, blockquote, pre, code {
-          background-color: #181D24 !important;
-          color: #E6EDF3 !important;
-          border-color: #2C3440 !important;
-        }
-        th { background-color: #222933 !important; color: #F0F6FC !important; }
-        img { max-width: 100%; height: auto; }
-        table { display: block; overflow-x: auto; max-width: 100%; }
-        """.trimIndent()
-    } else {
-        """
-        html, body {
-          background: #FFFFFF;
-          color: #202122;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          line-height: 1.65;
-          max-width: 960px;
-          margin: 0 auto;
-          padding: 12px 18px 36px 18px;
-          box-sizing: border-box;
-        }
-        h1, h2 { font-family: Georgia, "Times New Roman", serif; border-bottom: 1px solid #A2A9B1; padding-bottom: 4px; font-weight: normal; color: #000000; }
-        a { color: #3366CC; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        .infobox, .toc, .thumbinner { background-color: #F8F9FA; border: 1px solid #A2A9B1; }
-        img { max-width: 100%; height: auto; }
-        table { max-width: 100%; overflow-x: auto; }
-        """.trimIndent()
-    }
+    val css = buildWikipediaCss(dark)
     val escaped = css.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
     return """
         (function(){
