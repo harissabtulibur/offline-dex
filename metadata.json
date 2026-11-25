@@ -1,0 +1,6 @@
+{
+  "name": "Offline Cyber Deck",
+  "description": "Native Android (Kotlin + Jetpack Compose) offline-first browser, page archiver, SAF external SSD manager, Knowledge Vault, and Media Vault.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
