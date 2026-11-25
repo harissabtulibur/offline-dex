@@ -2013,7 +2013,9 @@ fun DesktopLauncherScreen(
                                                                 overflow = TextOverflow.Ellipsis
                                                             )
                                                             Text(
-                                                                if (driveStatus.totalBytes > 0) "Tersedia ${Formatters.formatBytes(driveStatus.freeBytes)}" else "Terhubung",
+                                                                if ((driveStatus.totalBytes ?: 0L) > 0L) {
+                                                                    "Tersedia ${Formatters.formatBytes(driveStatus.availableBytes ?: 0L)}"
+                                                                } else "Terhubung",
                                                                 style = MaterialTheme.typography.bodySmall,
                                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                                             )

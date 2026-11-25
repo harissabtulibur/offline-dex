@@ -409,14 +409,14 @@ fun FileManagerScreen(
             }
         }
 
-        fun copyEntryToSaf(entry: ExplorerEntry, dstDirDoc: DocumentFile) {
+        suspend fun copyEntryToSaf(entry: ExplorerEntry, dstDirDoc: DocumentFile) {
             if (entry.isDirectory) {
                 val cleanName = app.driveManager.sanitizeFileName(entry.name)
                 val existing = dstDirDoc.findFile(cleanName)
                 val subDoc = if (existing != null && existing.isDirectory) existing
                 else dstDirDoc.createDirectory(cleanName) ?: error("Gagal membuat folder $cleanName di drive eksternal")
                 if (entry.localPath != null) {
-                    File(entry.localPath).listFiles().orEmpty().forEach { child ->
+                    for (child in File(entry.localPath).listFiles().orEmpty()) {
                         copyEntryToSaf(
                             ExplorerEntry(
                                 name = child.name,
@@ -432,7 +432,7 @@ fun FileManagerScreen(
                 } else if (entry.safUri != null) {
                     val srcDoc = DocumentFile.fromTreeUri(context, Uri.parse(entry.safUri))
                         ?: DocumentFile.fromSingleUri(context, Uri.parse(entry.safUri))
-                    srcDoc?.listFiles().orEmpty().forEach { child ->
+                    for (child in srcDoc?.listFiles().orEmpty()) {
                         copyEntryToSaf(
                             ExplorerEntry(
                                 name = child.name ?: "item",
