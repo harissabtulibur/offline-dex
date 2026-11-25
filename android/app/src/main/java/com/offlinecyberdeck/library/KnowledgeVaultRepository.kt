@@ -34,13 +34,14 @@ class KnowledgeVaultRepository(
     private val libraryDao: LibraryDao,
     private val driveManager: DeckDriveManager
 ) {
+    private val excludedArchiveExts = setOf("zip", "rar", "7z", "tar", "gz", "bz2")
     private val supportedAutoImportExts = setOf(
         "pdf", "epub", "zim", "html", "htm", "txt", "md", "csv", "json",
-        "zip", "mbtiles", "obf", "map", "gpx", "png", "jpg", "jpeg", "webp"
+        "mbtiles", "obf", "map", "gpx", "png", "jpg", "jpeg", "webp"
     )
     private val externalKnowledgeExts = setOf(
         "pdf", "epub", "zim", "html", "htm", "txt", "md", "csv", "json",
-        "zip", "mbtiles", "obf", "map", "gpx"
+        "mbtiles", "obf", "map", "gpx"
     )
 
     val itemsFlow: Flow<List<LibraryItemEntity>> = libraryDao.observeAll()
@@ -55,6 +56,10 @@ class KnowledgeVaultRepository(
     ): Result<LibraryItemEntity> = withContext(Dispatchers.IO) {
         runCatching {
             val (rawName, sizeBytes) = driveManager.queryDisplayNameAndSize(uri)
+            val ext = rawName.substringAfterLast('.', "").lowercase()
+            if (ext in excludedArchiveExts) {
+                error("File arsip (.$ext) seperti RAR/ZIP tidak dimasukkan ke Knowledge Vault. Buka melalui File Manager.")
+            }
             val fileType = detectFileType(rawName)
             val title = rawName.substringBeforeLast('.').ifBlank { rawName }
 
@@ -117,7 +122,11 @@ class KnowledgeVaultRepository(
             runCatching {
                 var removed = 0
                 for (item in libraryDao.getAllSnapshot()) {
-                    if (!isItemAvailable(item)) {
+                    val itemExt = item.fileName.substringAfterLast('.', "").lowercase()
+                    if (item.fileType == LibraryFileType.ZIP ||
+                        itemExt in excludedArchiveExts ||
+                        !isItemAvailable(item)
+                    ) {
                         libraryDao.delete(item)
                         removed++
                     }
@@ -389,6 +398,43 @@ class KnowledgeVaultRepository(
             lower.contains("science") || lower.contains("math") || lower.contains("phys") || lower.contains("chem") || lower.contains("med") -> LibraryCategory.SCIENCE
             lower.contains("history") -> LibraryCategory.HISTORY
             else -> LibraryCategory.BOOKS
+        }
+    }
+
+    suspend fun importOrFindZim(uriOrPath: String): Result<LibraryItemEntity> = withContext(Dispatchers.IO) {
+        runCatching {
+            val existing = libraryDao.getAllSnapshot().firstOrNull {
+                it.fileUri == uriOrPath && it.fileType == LibraryFileType.ZIM
+            }
+            if (existing != null) return@runCatching existing
+
+            val (rawName, sizeBytes) = if (uriOrPath.startsWith("content://")) {
+                val uri = Uri.parse(uriOrPath)
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+                driveManager.queryDisplayNameAndSize(uri)
+            } else {
+                val f = File(uriOrPath)
+                if (!f.exists() || !f.canRead()) error("File ZIM tidak dapat dibaca: $uriOrPath")
+                f.name to f.length()
+            }
+
+            val isExternal = uriOrPath.contains("external", ignoreCase = true) ||
+                uriOrPath.contains("/storage/", ignoreCase = true) && !uriOrPath.contains("/storage/emulated")
+            val item = buildAutoVaultItem(
+                rawName = rawName.ifBlank { "archive.zim" },
+                uriOrPath = uriOrPath,
+                sizeBytes = sizeBytes.coerceAtLeast(0L),
+                storageTarget = if (isExternal) StorageTarget.DECK_DRIVE else StorageTarget.INTERNAL,
+                source = "File Explorer",
+                fileType = LibraryFileType.ZIM
+            )
+            libraryDao.upsert(item)
+            item
         }
     }
 

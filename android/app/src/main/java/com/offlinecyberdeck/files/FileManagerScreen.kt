@@ -39,6 +39,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.ContentCopy
@@ -62,6 +64,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SdStorage
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.SelectAll
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.ViewList
@@ -136,10 +139,13 @@ private data class ExplorerEntry(
     val mimeType: String?,
     val localPath: String? = null,
     val safUri: String? = null
-)
+) {
+    val stableKey: String
+        get() = localPath ?: safUri ?: name
+}
 
 private data class FileClipboardItem(
-    val entry: ExplorerEntry,
+    val entries: List<ExplorerEntry>,
     val isCut: Boolean
 )
 
@@ -147,7 +153,8 @@ private data class FileClipboardItem(
 @Composable
 fun FileManagerScreen(
     app: CyberDeckApplication,
-    onShowMessage: (String) -> Unit
+    onShowMessage: (String) -> Unit,
+    onOpenZimPathOrUri: ((String) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -165,10 +172,12 @@ fun FileManagerScreen(
     var gridView by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableIntStateOf(0) }
 
+    var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    val inSelectionMode = selectedKeys.isNotEmpty()
     var clipboardItem by remember { mutableStateOf<FileClipboardItem?>(null) }
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var renamingEntry by remember { mutableStateOf<ExplorerEntry?>(null) }
-    var deletingEntry by remember { mutableStateOf<ExplorerEntry?>(null) }
+    var deletingEntries by remember { mutableStateOf<List<ExplorerEntry>>(emptyList()) }
     var propertiesEntry by remember { mutableStateOf<ExplorerEntry?>(null) }
     var textPreviewTitle by remember { mutableStateOf<String?>(null) }
     var textPreviewContent by remember { mutableStateOf<String?>(null) }
@@ -183,12 +192,14 @@ fun FileManagerScreen(
             navHistory.add(loc)
             navIndex = navHistory.lastIndex
         }
+        selectedKeys = emptySet()
         searchQuery = ""
     }
 
     fun goBack(): Boolean {
         return if (navIndex > 0) {
             navIndex--
+            selectedKeys = emptySet()
             searchQuery = ""
             true
         } else false
@@ -197,6 +208,7 @@ fun FileManagerScreen(
     fun goForward() {
         if (navIndex < navHistory.lastIndex) {
             navIndex++
+            selectedKeys = emptySet()
             searchQuery = ""
         }
     }
@@ -292,8 +304,17 @@ fun FileManagerScreen(
         isLoading = false
     }
 
-    BackHandler(enabled = navIndex > 0) {
-        goBack()
+    BackHandler(enabled = inSelectionMode || navIndex > 0) {
+        if (inSelectionMode) {
+            selectedKeys = emptySet()
+        } else {
+            goBack()
+        }
+    }
+
+    fun toggleSelection(entry: ExplorerEntry) {
+        val key = entry.stableKey
+        selectedKeys = if (key in selectedKeys) selectedKeys - key else selectedKeys + key
     }
 
     fun openEntry(entry: ExplorerEntry) {
@@ -311,7 +332,10 @@ fun FileManagerScreen(
             }
         } else {
             val ext = entry.name.substringAfterLast('.', "").lowercase(Locale.US)
-            if (ext in setOf("txt", "md", "json", "log", "csv", "xml", "yml", "yaml") && entry.sizeBytes <= 512_000L) {
+            if (ext == "zim" && onOpenZimPathOrUri != null) {
+                val ref = entry.localPath ?: entry.safUri ?: return
+                onOpenZimPathOrUri(ref)
+            } else if (ext in setOf("txt", "md", "json", "log", "csv", "xml", "yml", "yaml") && entry.sizeBytes <= 512_000L) {
                 val ref = entry.localPath ?: entry.safUri ?: return
                 scope.launch {
                     val content = withContext(Dispatchers.IO) {
@@ -339,51 +363,136 @@ fun FileManagerScreen(
             onShowMessage("Buka folder tujuan terlebih dahulu sebelum menempel.")
             return
         }
+
+        fun copyLocalRecursiveToLocal(src: File, dstParent: File) {
+            if (src.isDirectory) {
+                val dstDir = File(dstParent, app.driveManager.sanitizeFileName(src.name)).apply { mkdirs() }
+                src.listFiles().orEmpty().forEach { child -> copyLocalRecursiveToLocal(child, dstDir) }
+            } else {
+                val targetFile = app.driveManager.createUniqueInternalFile(dstParent, src.name)
+                src.inputStream().use { input ->
+                    targetFile.outputStream().use { output -> input.copyTo(output) }
+                }
+            }
+        }
+
+        fun copyEntryToLocal(entry: ExplorerEntry, dstParent: File) {
+            if (entry.localPath != null) {
+                val srcFile = File(entry.localPath)
+                if (!srcFile.exists()) error("Sumber tidak ditemukan: ${entry.name}")
+                copyLocalRecursiveToLocal(srcFile, dstParent)
+            } else if (entry.safUri != null) {
+                val srcDoc = DocumentFile.fromTreeUri(context, Uri.parse(entry.safUri))
+                    ?: DocumentFile.fromSingleUri(context, Uri.parse(entry.safUri))
+                    ?: error("Sumber SAF tidak dapat diakses")
+                if (entry.isDirectory) {
+                    val subDir = File(dstParent, app.driveManager.sanitizeFileName(entry.name)).apply { mkdirs() }
+                    srcDoc.listFiles().forEach { child ->
+                        copyEntryToLocal(
+                            ExplorerEntry(
+                                name = child.name ?: "item",
+                                isDirectory = child.isDirectory,
+                                sizeBytes = child.length(),
+                                lastModifiedMs = child.lastModified(),
+                                mimeType = child.type,
+                                safUri = child.uri.toString()
+                            ),
+                            subDir
+                        )
+                    }
+                } else {
+                    val targetFile = app.driveManager.createUniqueInternalFile(dstParent, entry.name)
+                    app.driveManager.openInputStream(entry.safUri)?.use { input ->
+                        targetFile.outputStream().use { output -> input.copyTo(output) }
+                    } ?: error("Gagal membaca sumber SAF: ${entry.name}")
+                }
+            }
+        }
+
+        fun copyEntryToSaf(entry: ExplorerEntry, dstDirDoc: DocumentFile) {
+            if (entry.isDirectory) {
+                val cleanName = app.driveManager.sanitizeFileName(entry.name)
+                val existing = dstDirDoc.findFile(cleanName)
+                val subDoc = if (existing != null && existing.isDirectory) existing
+                else dstDirDoc.createDirectory(cleanName) ?: error("Gagal membuat folder $cleanName di drive eksternal")
+                if (entry.localPath != null) {
+                    File(entry.localPath).listFiles().orEmpty().forEach { child ->
+                        copyEntryToSaf(
+                            ExplorerEntry(
+                                name = child.name,
+                                isDirectory = child.isDirectory,
+                                sizeBytes = child.length(),
+                                lastModifiedMs = child.lastModified(),
+                                mimeType = if (child.isDirectory) null else app.driveManager.guessMimeType(child.name),
+                                localPath = child.absolutePath
+                            ),
+                            subDoc
+                        )
+                    }
+                } else if (entry.safUri != null) {
+                    val srcDoc = DocumentFile.fromTreeUri(context, Uri.parse(entry.safUri))
+                        ?: DocumentFile.fromSingleUri(context, Uri.parse(entry.safUri))
+                    srcDoc?.listFiles().orEmpty().forEach { child ->
+                        copyEntryToSaf(
+                            ExplorerEntry(
+                                name = child.name ?: "item",
+                                isDirectory = child.isDirectory,
+                                sizeBytes = child.length(),
+                                lastModifiedMs = child.lastModified(),
+                                mimeType = child.type,
+                                safUri = child.uri.toString()
+                            ),
+                            subDoc
+                        )
+                    }
+                }
+            } else {
+                val srcRef = entry.localPath ?: entry.safUri ?: error("Sumber tidak valid")
+                val created = app.driveManager.createUniqueSafFile(
+                    dstDirDoc,
+                    entry.name,
+                    entry.mimeType ?: "application/octet-stream"
+                ) ?: error("Gagal membuat file di drive eksternal")
+                app.driveManager.openInputStream(srcRef)?.use { input ->
+                    context.contentResolver.openOutputStream(created.uri)?.use { output ->
+                        input.copyTo(output)
+                    }
+                } ?: error("Gagal menyalin data file ${entry.name}")
+            }
+        }
+
         scope.launch {
             val res = withContext(Dispatchers.IO) {
                 runCatching {
-                    val srcRef = clip.entry.localPath ?: clip.entry.safUri ?: error("Sumber tidak valid")
-                    if (clip.entry.isDirectory) error("Tempel saat ini mendukung file satuan.")
-                    when (val loc = currentLocation) {
-                        is ExplorerLocation.LocalDir -> {
-                            val targetFile = app.driveManager.createUniqueInternalFile(File(loc.path), clip.entry.name)
-                            app.driveManager.openInputStream(srcRef)?.use { input ->
-                                targetFile.outputStream().use { output -> input.copyTo(output) }
-                            } ?: error("Gagal membaca file sumber.")
-                            if (clip.isCut) {
-                                if (clip.entry.localPath != null) File(clip.entry.localPath).delete()
-                                else if (clip.entry.safUri != null) DocumentFile.fromSingleUri(context, Uri.parse(clip.entry.safUri))?.delete()
+                    var count = 0
+                    for (entry in clip.entries) {
+                        when (val loc = currentLocation) {
+                            is ExplorerLocation.LocalDir -> {
+                                copyEntryToLocal(entry, File(loc.path))
                             }
-                        }
-                        is ExplorerLocation.SafDir -> {
-                            val dirDoc = DocumentFile.fromTreeUri(context, Uri.parse(loc.docUri))
-                                ?: DocumentFile.fromSingleUri(context, Uri.parse(loc.docUri))
-                                ?: error("Folder tujuan SAF tidak dapat diakses")
-                            val created = app.driveManager.createUniqueSafFile(
-                                dirDoc,
-                                clip.entry.name,
-                                clip.entry.mimeType ?: "application/octet-stream"
-                            ) ?: error("Gagal membuat file di drive eksternal")
-                            app.driveManager.openInputStream(srcRef)?.use { input ->
-                                context.contentResolver.openOutputStream(created.uri)?.use { output ->
-                                    input.copyTo(output)
-                                }
-                            } ?: error("Gagal menyalin data file")
-                            if (clip.isCut) {
-                                if (clip.entry.localPath != null) File(clip.entry.localPath).delete()
-                                else if (clip.entry.safUri != null) DocumentFile.fromSingleUri(context, Uri.parse(clip.entry.safUri))?.delete()
+                            is ExplorerLocation.SafDir -> {
+                                val dirDoc = DocumentFile.fromTreeUri(context, Uri.parse(loc.docUri))
+                                    ?: DocumentFile.fromSingleUri(context, Uri.parse(loc.docUri))
+                                    ?: error("Folder tujuan SAF tidak dapat diakses")
+                                copyEntryToSaf(entry, dirDoc)
                             }
+                            ExplorerLocation.ThisPc -> Unit
                         }
-                        ExplorerLocation.ThisPc -> Unit
+                        if (clip.isCut) {
+                            if (entry.localPath != null) File(entry.localPath).deleteRecursively()
+                            else if (entry.safUri != null) DocumentFile.fromSingleUri(context, Uri.parse(entry.safUri))?.delete()
+                        }
+                        count++
                     }
+                    count
                 }
             }
-            res.onSuccess {
+            res.onSuccess { count ->
                 if (clip.isCut) clipboardItem = null
                 refreshTick++
-                onShowMessage("Berhasil menempel '${clip.entry.name}'.")
+                onShowMessage("Berhasil menempel $count item.")
             }.onFailure {
-                onShowMessage("Gagal menempel file: ${it.message}")
+                onShowMessage("Gagal menempel item: ${it.message}")
             }
         }
     }
@@ -391,6 +500,10 @@ fun FileManagerScreen(
     val displayedEntries = remember(entries, searchQuery) {
         if (searchQuery.isBlank()) entries
         else entries.filter { it.name.contains(searchQuery, ignoreCase = true) }
+    }
+
+    val selectedEntries = remember(entries, selectedKeys) {
+        entries.filter { it.stableKey in selectedKeys }
     }
 
     val quickFolders = remember(roots) {
@@ -546,6 +659,115 @@ fun FileManagerScreen(
                     }
                     IconButton(onClick = { gridView = !gridView }, modifier = Modifier.size(34.dp)) {
                         Icon(if (gridView) Icons.Filled.ViewList else Icons.Filled.GridView, contentDescription = "Ubah Tampilan")
+                    }
+                }
+
+                // Multi-Selection Contextual Command Bar
+                if (inSelectionMode && currentLocation != ExplorerLocation.ThisPc) {
+                    Spacer(Modifier.height(6.dp))
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = WinBlue.copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, WinBlue.copy(alpha = 0.45f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                "${selectedEntries.size} dipilih",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = WinBlue
+                            )
+                            TextButton(
+                                onClick = {
+                                    selectedKeys = if (selectedKeys.size == displayedEntries.size) {
+                                        emptySet()
+                                    } else {
+                                        displayedEntries.mapTo(HashSet()) { it.stableKey }
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Icon(Icons.Filled.SelectAll, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    if (selectedKeys.size == displayedEntries.size) "Batal Semua" else "Pilih Semua",
+                                    fontSize = 12.sp
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    if (selectedEntries.isNotEmpty()) {
+                                        clipboardItem = FileClipboardItem(selectedEntries, isCut = false)
+                                        onShowMessage("${selectedEntries.size} item disalin ke clipboard.")
+                                        selectedKeys = emptySet()
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Copy", fontSize = 12.sp)
+                            }
+                            TextButton(
+                                onClick = {
+                                    if (selectedEntries.isNotEmpty()) {
+                                        clipboardItem = FileClipboardItem(selectedEntries, isCut = true)
+                                        onShowMessage("${selectedEntries.size} item ditandai untuk dipindahkan.")
+                                        selectedKeys = emptySet()
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Icon(Icons.Filled.ContentCut, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Cut", fontSize = 12.sp)
+                            }
+                            if (selectedEntries.size == 1) {
+                                val single = selectedEntries.first()
+                                TextButton(
+                                    onClick = { renamingEntry = single },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Icon(Icons.Filled.DriveFileRenameOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Rename", fontSize = 12.sp)
+                                }
+                                TextButton(
+                                    onClick = { propertiesEntry = single },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Icon(Icons.Filled.Info, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("Properti", fontSize = 12.sp)
+                                }
+                            }
+                            TextButton(
+                                onClick = {
+                                    if (selectedEntries.isNotEmpty()) {
+                                        deletingEntries = selectedEntries
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                            ) {
+                                Icon(Icons.Filled.Delete, contentDescription = null, tint = Color(0xFFEF4444), modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Hapus", fontSize = 12.sp, color = Color(0xFFEF4444))
+                            }
+                            IconButton(
+                                onClick = { selectedKeys = emptySet() },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Filled.Close, contentDescription = "Tutup Seleksi", modifier = Modifier.size(16.dp))
+                            }
+                        }
                     }
                 }
             }
@@ -765,50 +987,72 @@ fun FileManagerScreen(
                             verticalArrangement = Arrangement.spacedBy(10.dp),
                             modifier = Modifier.fillMaxSize()
                         ) {
-                            items(displayedEntries, key = { it.localPath ?: it.safUri ?: it.name }) { entry ->
+                            items(displayedEntries, key = { it.stableKey }) { entry ->
                                 var menuOpen by remember { mutableStateOf(false) }
+                                val isSelected = entry.stableKey in selectedKeys
                                 Box {
                                     Surface(
                                         shape = RoundedCornerShape(8.dp),
-                                        color = MaterialTheme.colorScheme.surface,
-                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)),
+                                        color = if (isSelected) WinBlue.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface,
+                                        border = BorderStroke(
+                                            if (isSelected) 1.5.dp else 1.dp,
+                                            if (isSelected) WinBlue else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+                                        ),
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .combinedClickable(
-                                                onClick = { openEntry(entry) },
-                                                onLongClick = { menuOpen = true }
+                                                onClick = {
+                                                    if (inSelectionMode) toggleSelection(entry) else openEntry(entry)
+                                                },
+                                                onLongClick = { toggleSelection(entry) }
                                             )
                                     ) {
-                                        Column(
-                                            modifier = Modifier.padding(10.dp),
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = explorerEntryIcon(entry),
-                                                contentDescription = null,
-                                                tint = explorerEntryTint(entry, MaterialTheme.colorScheme.primary),
-                                                modifier = Modifier.size(38.dp)
-                                            )
-                                            Text(
-                                                entry.name,
-                                                fontSize = 12.sp,
-                                                maxLines = 2,
-                                                overflow = TextOverflow.Ellipsis,
-                                                textAlign = TextAlign.Center
-                                            )
+                                        Box(modifier = Modifier.fillMaxWidth()) {
+                                            if (inSelectionMode) {
+                                                Icon(
+                                                    imageVector = if (isSelected) Icons.Filled.CheckBox else Icons.Filled.CheckBoxOutlineBlank,
+                                                    contentDescription = null,
+                                                    tint = if (isSelected) WinBlue else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier
+                                                        .align(Alignment.TopEnd)
+                                                        .padding(6.dp)
+                                                        .size(18.dp)
+                                                )
+                                            }
+                                            Column(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(10.dp),
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = explorerEntryIcon(entry),
+                                                    contentDescription = null,
+                                                    tint = explorerEntryTint(entry, MaterialTheme.colorScheme.primary),
+                                                    modifier = Modifier.size(38.dp)
+                                                )
+                                                Text(
+                                                    entry.name,
+                                                    fontSize = 12.sp,
+                                                    maxLines = 2,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    textAlign = TextAlign.Center
+                                                )
+                                            }
                                         }
                                     }
                                     ExplorerContextMenu(
                                         expanded = menuOpen,
                                         entry = entry,
                                         onDismiss = { menuOpen = false },
+                                        onSelect = { toggleSelection(entry) },
                                         onOpen = { openEntry(entry) },
-                                        onCopy = { clipboardItem = FileClipboardItem(entry, isCut = false) },
-                                        onCut = { clipboardItem = FileClipboardItem(entry, isCut = true) },
+                                        onCopy = { clipboardItem = FileClipboardItem(listOf(entry), isCut = false) },
+                                        onCut = { clipboardItem = FileClipboardItem(listOf(entry), isCut = true) },
                                         onRename = { renamingEntry = entry },
                                         onProperties = { propertiesEntry = entry },
-                                        onDelete = { deletingEntry = entry }
+                                        onDelete = { deletingEntries = listOf(entry) }
                                     )
                                 }
                             }
@@ -833,14 +1077,18 @@ fun FileManagerScreen(
                             }
                             HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
                             LazyColumn(modifier = Modifier.weight(1f)) {
-                                items(displayedEntries, key = { it.localPath ?: it.safUri ?: it.name }) { entry ->
+                                items(displayedEntries, key = { it.stableKey }) { entry ->
                                     var menuOpen by remember { mutableStateOf(false) }
+                                    val isSelected = entry.stableKey in selectedKeys
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
+                                            .background(if (isSelected) WinBlue.copy(alpha = 0.14f) else Color.Transparent)
                                             .combinedClickable(
-                                                onClick = { openEntry(entry) },
-                                                onLongClick = { menuOpen = true }
+                                                onClick = {
+                                                    if (inSelectionMode) toggleSelection(entry) else openEntry(entry)
+                                                },
+                                                onLongClick = { toggleSelection(entry) }
                                             )
                                             .padding(horizontal = 14.dp, vertical = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically
@@ -850,6 +1098,14 @@ fun FileManagerScreen(
                                             verticalAlignment = Alignment.CenterVertically,
                                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                                         ) {
+                                            if (inSelectionMode) {
+                                                Icon(
+                                                    imageVector = if (isSelected) Icons.Filled.CheckBox else Icons.Filled.CheckBoxOutlineBlank,
+                                                    contentDescription = null,
+                                                    tint = if (isSelected) WinBlue else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    modifier = Modifier.size(19.dp)
+                                                )
+                                            }
                                             Icon(
                                                 imageVector = explorerEntryIcon(entry),
                                                 contentDescription = null,
@@ -887,12 +1143,13 @@ fun FileManagerScreen(
                                                 expanded = menuOpen,
                                                 entry = entry,
                                                 onDismiss = { menuOpen = false },
+                                                onSelect = { toggleSelection(entry) },
                                                 onOpen = { openEntry(entry) },
-                                                onCopy = { clipboardItem = FileClipboardItem(entry, isCut = false) },
-                                                onCut = { clipboardItem = FileClipboardItem(entry, isCut = true) },
+                                                onCopy = { clipboardItem = FileClipboardItem(listOf(entry), isCut = false) },
+                                                onCut = { clipboardItem = FileClipboardItem(listOf(entry), isCut = true) },
                                                 onRename = { renamingEntry = entry },
                                                 onProperties = { propertiesEntry = entry },
-                                                onDelete = { deletingEntry = entry }
+                                                onDelete = { deletingEntries = listOf(entry) }
                                             )
                                         }
                                     }
@@ -916,15 +1173,19 @@ fun FileManagerScreen(
                 Text(
                     text = if (currentLocation == ExplorerLocation.ThisPc) {
                         "${roots.size} penyimpanan terdeteksi"
+                    } else if (inSelectionMode) {
+                        "${selectedEntries.size} dari ${displayedEntries.size} item dipilih (tahan item lain untuk tambah)"
                     } else {
-                        "${displayedEntries.size} item"
+                        "${displayedEntries.size} item (tahan lama untuk multi-pilih)"
                     },
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 if (clipboardItem != null) {
+                    val clip = clipboardItem!!
+                    val summary = if (clip.entries.size == 1) clip.entries.first().name else "${clip.entries.size} item"
                     Text(
-                        "${if (clipboardItem!!.isCut) "Cut" else "Copy"}: ${clipboardItem!!.entry.name}",
+                        "${if (clip.isCut) "Cut" else "Copy"}: $summary",
                         fontSize = 11.sp,
                         color = WinBlue
                     )
@@ -1010,26 +1271,43 @@ fun FileManagerScreen(
         )
     }
 
-    deletingEntry?.let { entry ->
+    if (deletingEntries.isNotEmpty()) {
+        val targets = deletingEntries
         AlertDialog(
-            onDismissRequest = { deletingEntry = null },
-            title = { Text("Hapus Item?") },
-            text = { Text("Apakah Anda yakin ingin menghapus '${entry.name}'?") },
+            onDismissRequest = { deletingEntries = emptyList() },
+            title = { Text("Hapus ${targets.size} Item?") },
+            text = {
+                Text(
+                    if (targets.size == 1) "Apakah Anda yakin ingin menghapus '${targets.first().name}'?"
+                    else "Apakah Anda yakin ingin menghapus ${targets.size} file/folder yang dipilih?"
+                )
+            },
             confirmButton = {
                 Button(onClick = {
                     scope.launch {
-                        val ok = withContext(Dispatchers.IO) {
-                            if (entry.localPath != null) File(entry.localPath).deleteRecursively()
-                            else if (entry.safUri != null) DocumentFile.fromSingleUri(context, Uri.parse(entry.safUri))?.delete() == true
-                            else false
+                        val failedCount = withContext(Dispatchers.IO) {
+                            var failed = 0
+                            for (entry in targets) {
+                                val ok = if (entry.localPath != null) File(entry.localPath).deleteRecursively()
+                                else if (entry.safUri != null) DocumentFile.fromSingleUri(context, Uri.parse(entry.safUri))?.delete() == true
+                                else false
+                                if (!ok) failed++
+                            }
+                            failed
                         }
-                        if (ok) refreshTick++ else onShowMessage("Gagal menghapus item.")
+                        selectedKeys = emptySet()
+                        refreshTick++
+                        if (failedCount > 0) {
+                            onShowMessage("$failedCount item gagal dihapus.")
+                        } else {
+                            onShowMessage("${targets.size} item berhasil dihapus.")
+                        }
                     }
-                    deletingEntry = null
+                    deletingEntries = emptyList()
                 }) { Text("Hapus") }
             },
             dismissButton = {
-                TextButton(onClick = { deletingEntry = null }) { Text("Batal") }
+                TextButton(onClick = { deletingEntries = emptyList() }) { Text("Batal") }
             }
         )
     }
@@ -1114,6 +1392,7 @@ private fun ExplorerContextMenu(
     expanded: Boolean,
     entry: ExplorerEntry,
     onDismiss: () -> Unit,
+    onSelect: () -> Unit,
     onOpen: () -> Unit,
     onCopy: () -> Unit,
     onCut: () -> Unit,
@@ -1123,18 +1402,21 @@ private fun ExplorerContextMenu(
 ) {
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         DropdownMenuItem(text = { Text("Buka") }, onClick = { onDismiss(); onOpen() })
-        if (!entry.isDirectory) {
-            DropdownMenuItem(
-                text = { Text("Salin (Copy)") },
-                leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
-                onClick = { onDismiss(); onCopy() }
-            )
-            DropdownMenuItem(
-                text = { Text("Pindahkan (Cut)") },
-                leadingIcon = { Icon(Icons.Filled.ContentCut, contentDescription = null) },
-                onClick = { onDismiss(); onCut() }
-            )
-        }
+        DropdownMenuItem(
+            text = { Text("Pilih (Multi-Select)") },
+            leadingIcon = { Icon(Icons.Filled.SelectAll, contentDescription = null) },
+            onClick = { onDismiss(); onSelect() }
+        )
+        DropdownMenuItem(
+            text = { Text("Salin (Copy)") },
+            leadingIcon = { Icon(Icons.Filled.ContentCopy, contentDescription = null) },
+            onClick = { onDismiss(); onCopy() }
+        )
+        DropdownMenuItem(
+            text = { Text("Pindahkan (Cut)") },
+            leadingIcon = { Icon(Icons.Filled.ContentCut, contentDescription = null) },
+            onClick = { onDismiss(); onCut() }
+        )
         DropdownMenuItem(
             text = { Text("Ubah Nama") },
             leadingIcon = { Icon(Icons.Filled.DriveFileRenameOutline, contentDescription = null) },

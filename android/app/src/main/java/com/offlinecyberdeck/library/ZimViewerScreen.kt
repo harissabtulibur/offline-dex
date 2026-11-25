@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.view.ViewGroup
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.filled.Contrast
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -134,6 +136,7 @@ fun ZimViewerScreen(
     var searchDropdownOpen by remember { mutableStateOf(false) }
     var nightFilterEnabled by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    var lastStartedInitialUrl by remember { mutableStateOf<String?>(null) }
     var searchJob by remember { mutableStateOf<Job?>(null) }
 
     val headerBg = if (nightFilterEnabled) WikiDarkHeader else WikiLightHeader
@@ -151,6 +154,7 @@ fun ZimViewerScreen(
     LaunchedEffect(itemId) {
         isLoadingArchive = true
         errorMessage = null
+        lastStartedInitialUrl = null
         reader?.close()
         reader = null
         val loaded = app.database.libraryDao().getById(itemId)
@@ -222,9 +226,11 @@ fun ZimViewerScreen(
         }
     }
 
-    LaunchedEffect(mainPageUrl, webViewRef) {
+    LaunchedEffect(reader, mainPageUrl, webViewRef) {
+        val active = reader ?: return@LaunchedEffect
         val wv = webViewRef ?: return@LaunchedEffect
-        if (wv.url.isNullOrBlank() || wv.url == "about:blank") {
+        if (lastStartedInitialUrl != mainPageUrl && active != null) {
+            lastStartedInitialUrl = mainPageUrl
             wv.loadUrl(mainPageUrl)
         }
     }
@@ -447,7 +453,7 @@ fun ZimViewerScreen(
                     Column(
                         modifier = Modifier.align(Alignment.Center).padding(28.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
                             text = "W",
@@ -460,6 +466,9 @@ fun ZimViewerScreen(
                             text = errorMessage!!,
                             color = MaterialTheme.colorScheme.error
                         )
+                        Button(onClick = onBack) {
+                            Text("Tutup")
+                        }
                     }
                 }
                 activeReader == null -> {
@@ -533,6 +542,15 @@ fun ZimViewerScreen(
                                         if (request?.isForMainFrame == true) {
                                             isPageLoading = false
                                         }
+                                    }
+
+                                    override fun onRenderProcessGone(
+                                        view: WebView?,
+                                        detail: RenderProcessGoneDetail?
+                                    ): Boolean {
+                                        isPageLoading = false
+                                        errorMessage = "Renderer WebView berhenti sementara. Tutup & buka ulang arsip ZIM."
+                                        return true
                                     }
 
                                     override fun shouldOverrideUrlLoading(
@@ -624,7 +642,6 @@ fun ZimViewerScreen(
                                     }
                                 }
                                 webViewRef = this
-                                loadUrl(mainPageUrl)
                             }
                         },
                         update = { wv ->

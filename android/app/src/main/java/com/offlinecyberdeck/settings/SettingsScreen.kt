@@ -141,7 +141,7 @@ fun SettingsScreen(
     }
 
     val wallpaperPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             scope.launch {
@@ -412,6 +412,12 @@ fun SettingsScreen(
                 ) {
                     Text("Izin DeX Launcher & Floating Apps (WA, YouTube)")
                 }
+                OutlinedButton(
+                    onClick = { onShowMessage(DesktopLauncherManager.openSystemNavigationSettings(context)) },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Pengaturan Navigasi Android (Beralih ke Gesture / Sembunyikan 3 Tombol)")
+                }
             }
         }
 
@@ -560,7 +566,7 @@ fun SettingsScreen(
                             }
                             OutlinedButton(onClick = {
                                 pendingWallpaperSlot = slot
-                                wallpaperPicker.launch("image/*")
+                                wallpaperPicker.launch(arrayOf("image/*"))
                             }) {
                                 Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(4.dp))

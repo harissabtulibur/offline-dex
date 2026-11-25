@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -12,6 +13,7 @@ import android.os.StatFs
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.system.Os
 import android.webkit.MimeTypeMap
 import androidx.core.content.FileProvider
@@ -33,7 +35,8 @@ data class ExternalVolumeInfo(
     val id: String,
     val label: String,
     val isMounted: Boolean,
-    val mountPath: String? = null
+    val mountPath: String? = null,
+    val isEjectedInSession: Boolean = false
 )
 
 data class StorageRootInfo(
@@ -47,6 +50,9 @@ data class StorageRootInfo(
 )
 
 class DeckDriveManager(private val context: Context) {
+
+    private val prefs = context.getSharedPreferences("cyberdeck_ui_prefs", Context.MODE_PRIVATE)
+    private val ejectedPrefsKey = "ejected_volume_ids"
 
     private val _status = MutableStateFlow(DeckDriveStatus())
     val status: StateFlow<DeckDriveStatus> = _status.asStateFlow()
@@ -271,27 +277,147 @@ class DeckDriveManager(private val context: Context) {
         return null
     }
 
-    fun detectRemovableExternalVolumes(): List<ExternalVolumeInfo> {
-        return runCatching {
-            val sm = context.getSystemService(StorageManager::class.java) ?: return emptyList()
-            sm.storageVolumes
-                .filter { vol ->
+    private fun getEjectedVolumeIds(): Set<String> =
+        prefs.getStringSet(ejectedPrefsKey, emptySet()).orEmpty().toSet()
+
+    private fun saveEjectedVolumeIds(ids: Set<String>) {
+        prefs.edit().putStringSet(ejectedPrefsKey, ids).apply()
+    }
+
+    fun markVolumeEjected(volumeId: String) {
+        val next = getEjectedVolumeIds().toMutableSet()
+        next.add(volumeId)
+        saveEjectedVolumeIds(next)
+    }
+
+    fun remountVolumeInApp(volumeId: String) {
+        val next = getEjectedVolumeIds().toMutableSet()
+        if (next.remove(volumeId)) {
+            saveEjectedVolumeIds(next)
+        }
+    }
+
+    suspend fun ejectExternalPartition(
+        volume: ExternalVolumeInfo,
+        configuredSafUri: String?
+    ): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        markVolumeEjected(volume.id)
+        var safDetached = false
+        if (!configuredSafUri.isNullOrBlank()) {
+            val matchesSaf = configuredSafUri.contains(volume.id, ignoreCase = true) ||
+                configuredSafUri.contains(volume.label, ignoreCase = true)
+            if (matchesSaf) {
+                detachDeckDrive(configuredSafUri)
+                safDetached = true
+            }
+        }
+        val sysUnmounted = runCatching {
+            val sm = context.getSystemService(StorageManager::class.java)
+            val vol = sm?.storageVolumes?.firstOrNull { (it.uuid ?: "") == volume.id }
+            if (vol != null) {
+                val unmountMethod = StorageManager::class.java.methods.firstOrNull {
+                    it.name == "unmount" && it.parameterCount == 1
+                }
+                if (unmountMethod != null) {
+                    val getId = vol.javaClass.methods.firstOrNull { it.name == "getId" }
+                    val internalId = getId?.invoke(vol) as? String
+                    if (!internalId.isNullOrBlank()) {
+                        unmountMethod.invoke(sm, internalId)
+                        true
+                    } else false
+                } else false
+            } else false
+        }.getOrDefault(false)
+
+        val msg = when {
+            sysUnmounted -> "${volume.label} berhasil di-unmount oleh sistem dan aman dilepas."
+            safDetached -> "${volume.label} dilepas dari aplikasi & izin SAF ditutup. Jika kabel USB akan dicabut, konfirmasi Eject di Storage Android."
+            else -> "${volume.label} ditandai Eject & dilepas dari daftar aktif Cyber Deck."
+        }
+        safDetached to msg
+    }
+
+    fun openAndroidStorageSettings(): String {
+        val candidates = listOf(
+            Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS),
+            Intent(Settings.ACTION_MEMORY_CARD_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        for (intent in candidates) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val ok = runCatching {
+                context.startActivity(intent)
+                true
+            }.getOrDefault(false)
+            if (ok) return "Membuka Pengaturan Penyimpanan Android untuk Unmount fisik USB/SSD."
+        }
+        return "Buka Settings → Storage untuk unmount fisik."
+    }
+
+    fun detectAllMountedRemovablePartitions(): List<ExternalVolumeInfo> {
+        val ejected = getEjectedVolumeIds()
+        val found = LinkedHashMap<String, ExternalVolumeInfo>()
+
+        runCatching {
+            val sm = context.getSystemService(StorageManager::class.java)
+            sm?.storageVolumes
+                ?.filter { vol ->
                     vol.isRemovable && !vol.isPrimary && vol.state == Environment.MEDIA_MOUNTED
                 }
-                .mapIndexed { index, vol ->
+                ?.forEachIndexed { index, vol ->
+                    val dir = resolveVolumeDirectory(vol)
                     val label = runCatching { vol.getDescription(context) }.getOrNull()
                         ?.takeIf { it.isNotBlank() }
-                        ?: "External USB / SD Storage"
-                    val id = vol.uuid ?: "${label}_$index"
-                    val dir = resolveVolumeDirectory(vol)
-                    ExternalVolumeInfo(
+                        ?: dir?.name?.takeIf { it.isNotBlank() }
+                        ?: "Partisi Eksternal #${index + 1}"
+                    val id = vol.uuid?.takeIf { it.isNotBlank() }
+                        ?: dir?.name?.takeIf { it.isNotBlank() }
+                        ?: "${label}_$index"
+                    found[id] = ExternalVolumeInfo(
                         id = id,
                         label = label,
                         isMounted = true,
-                        mountPath = dir?.absolutePath
+                        mountPath = dir?.absolutePath,
+                        isEjectedInSession = id in ejected
                     )
                 }
-        }.getOrDefault(emptyList())
+        }
+
+        // Fallback scan /storage/* for multi-partition USB SSDs where secondary partition is mounted directly
+        runCatching {
+            val storageRoot = File("/storage")
+            val children = storageRoot.listFiles().orEmpty()
+            for (dir in children) {
+                val name = dir.name
+                if (!dir.isDirectory || name == "emulated" || name == "self" || name.startsWith(".")) continue
+                if (found.containsKey(name) || found.values.any { it.mountPath == dir.absolutePath }) continue
+                val mounted = runCatching {
+                    Environment.getExternalStorageState(dir) == Environment.MEDIA_MOUNTED
+                }.getOrDefault(dir.exists() && dir.canRead())
+                if (mounted && dir.exists()) {
+                    found[name] = ExternalVolumeInfo(
+                        id = name,
+                        label = "Partisi USB/SD ($name)",
+                        isMounted = true,
+                        mountPath = dir.absolutePath,
+                        isEjectedInSession = name in ejected
+                    )
+                }
+            }
+        }
+
+        // Automatically clear stale ejected IDs once hardware partition is physically unplugged
+        val mountedIds = found.keys
+        val cleanedEjected = ejected.filter { it in mountedIds }.toSet()
+        if (cleanedEjected.size != ejected.size) {
+            saveEjectedVolumeIds(cleanedEjected)
+        }
+
+        return found.values.toList()
+    }
+
+    fun detectRemovableExternalVolumes(): List<ExternalVolumeInfo> {
+        return detectAllMountedRemovablePartitions().filter { !it.isEjectedInSession }
     }
 
     fun getAllStorageRoots(configuredSafUri: String?): List<StorageRootInfo> {
@@ -354,46 +480,87 @@ class DeckDriveManager(private val context: Context) {
     }
 
     suspend fun copyAndResizeWallpaper(sourceUri: Uri): Result<String> = withContext(Dispatchers.IO) {
+        val tempFile = File(context.cacheDir, "wallpaper_import_tmp_${System.currentTimeMillis()}")
         runCatching {
-            val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            context.contentResolver.openInputStream(sourceUri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, boundsOpts)
-            } ?: error("Gagal membaca file gambar.")
-
-            val srcW = boundsOpts.outWidth
-            val srcH = boundsOpts.outHeight
-            if (srcW <= 0 || srcH <= 0) error("Format gambar tidak valid.")
+            // Read source URI once into cache file so single-shot Photo Picker / Gallery streams never fail on second read
+            context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                FileOutputStream(tempFile).use { out ->
+                    val copied = input.copyTo(out)
+                    if (copied <= 0L) error("File gambar kosong.")
+                    out.flush()
+                }
+            } ?: error("Tidak dapat membuka file gambar dari perangkat.")
 
             val maxDim = 1920
-            var sampleSize = 1
-            while (srcW / sampleSize > maxDim * 2 || srcH / sampleSize > maxDim * 2) {
-                sampleSize *= 2
+            var decoded: Bitmap? = null
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                decoded = runCatching {
+                    val source = ImageDecoder.createSource(tempFile)
+                    ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                        decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                        val w = info.size.width
+                        val h = info.size.height
+                        if (w > maxDim || h > maxDim) {
+                            val ratio = maxDim.toFloat() / max(w, h).toFloat()
+                            decoder.setTargetSize(
+                                (w * ratio).roundToInt().coerceAtLeast(1),
+                                (h * ratio).roundToInt().coerceAtLeast(1)
+                            )
+                        }
+                    }
+                }.getOrNull()
             }
 
-            val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            val decoded = context.contentResolver.openInputStream(sourceUri)?.use { stream ->
-                BitmapFactory.decodeStream(stream, null, decodeOpts)
-            } ?: error("Gagal memuat gambar wallpaper.")
+            if (decoded == null) {
+                val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(tempFile.absolutePath, boundsOpts)
+                val srcW = boundsOpts.outWidth
+                val srcH = boundsOpts.outHeight
+                if (srcW <= 0 || srcH <= 0) error("Format gambar tidak didukung atau file rusak.")
 
-            val longest = max(decoded.width, decoded.height)
-            val finalBmp = if (longest > maxDim) {
-                val ratio = maxDim.toFloat() / longest.toFloat()
-                val dstW = (decoded.width * ratio).roundToInt().coerceAtLeast(1)
-                val dstH = (decoded.height * ratio).roundToInt().coerceAtLeast(1)
-                Bitmap.createScaledBitmap(decoded, dstW, dstH, true).also {
+                var sampleSize = 1
+                while (srcW / sampleSize > maxDim * 2 || srcH / sampleSize > maxDim * 2) {
+                    sampleSize *= 2
+                }
+                val decodeOpts = BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+                decoded = BitmapFactory.decodeFile(tempFile.absolutePath, decodeOpts)
+                    ?: error("Gagal mendekode gambar wallpaper.")
+            }
+
+            val softwareBmp = if (decoded.config == Bitmap.Config.ARGB_8888) {
+                decoded
+            } else {
+                decoded.copy(Bitmap.Config.ARGB_8888, false).also {
                     if (it !== decoded) decoded.recycle()
                 }
+            }
+
+            val longest = max(softwareBmp.width, softwareBmp.height)
+            val finalBmp = if (longest > maxDim) {
+                val ratio = maxDim.toFloat() / longest.toFloat()
+                val dstW = (softwareBmp.width * ratio).roundToInt().coerceAtLeast(1)
+                val dstH = (softwareBmp.height * ratio).roundToInt().coerceAtLeast(1)
+                Bitmap.createScaledBitmap(softwareBmp, dstW, dstH, true).also {
+                    if (it !== softwareBmp) softwareBmp.recycle()
+                }
             } else {
-                decoded
+                softwareBmp
             }
 
             val outFile = File(internalWallpapersDir, "wallpaper_${System.currentTimeMillis()}.jpg")
             FileOutputStream(outFile).use { fos ->
-                finalBmp.compress(Bitmap.CompressFormat.JPEG, 88, fos)
+                val ok = finalBmp.compress(Bitmap.CompressFormat.JPEG, 90, fos)
                 fos.flush()
+                if (!ok) error("Gagal menyimpan file wallpaper JPEG.")
             }
             finalBmp.recycle()
             outFile.absolutePath
+        }.also {
+            runCatching { tempFile.delete() }
         }
     }
 

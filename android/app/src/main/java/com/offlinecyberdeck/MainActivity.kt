@@ -30,7 +30,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -105,6 +104,7 @@ import com.offlinecyberdeck.core.storage.ExternalVolumeInfo
 import com.offlinecyberdeck.desktop.DesktopLauncherManager
 import com.offlinecyberdeck.desktop.DesktopLauncherScreen
 import com.offlinecyberdeck.desktop.DexPermissionsSetupDialog
+import com.offlinecyberdeck.desktop.FloatingNavigationOverlay
 import com.offlinecyberdeck.desktop.NotificationCenterStore
 import com.offlinecyberdeck.desktop.TaskManagerScreen
 import com.offlinecyberdeck.downloads.DownloadsScreen
@@ -136,19 +136,16 @@ class MainActivity : ComponentActivity() {
 
     private var pendingExternalUrl by mutableStateOf<String?>(null)
 
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
+    private val startupPermissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
     ) { _ -> }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        forceImmersiveFullscreen(isDark = true)
         handleIncomingIntent(intent)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        requestStartupPermissions()
 
         val app = application as CyberDeckApplication
         setContent {
@@ -171,20 +168,11 @@ class MainActivity : ComponentActivity() {
             }
 
             LaunchedEffect(
-                settings.immersiveFullscreen,
                 settings.brightnessOverrideEnabled,
                 settings.screenBrightnessPercent,
                 isDarkNow
             ) {
-                val controller = WindowCompat.getInsetsController(window, window.decorView)
-                controller.isAppearanceLightStatusBars = !isDarkNow
-                controller.isAppearanceLightNavigationBars = !isDarkNow
-                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-                if (settings.immersiveFullscreen) {
-                    controller.hide(WindowInsetsCompat.Type.systemBars())
-                } else {
-                    controller.show(WindowInsetsCompat.Type.systemBars())
-                }
+                forceImmersiveFullscreen(isDark = isDarkNow)
                 val lp = window.attributes
                 lp.screenBrightness = if (settings.brightnessOverrideEnabled) {
                     (settings.screenBrightnessPercent.coerceIn(10, 100) / 100f).coerceIn(0.05f, 1f)
@@ -224,6 +212,57 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        forceImmersiveFullscreen()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            forceImmersiveFullscreen()
+        }
+    }
+
+    private fun requestStartupPermissions() {
+        val needed = buildList {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+                add(Manifest.permission.READ_MEDIA_AUDIO)
+                add(Manifest.permission.READ_MEDIA_VIDEO)
+                add(Manifest.permission.READ_MEDIA_IMAGES)
+            } else {
+                add(Manifest.permission.READ_EXTERNAL_STORAGE)
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                    add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                }
+            }
+        }.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (needed.isNotEmpty()) {
+            startupPermissionsLauncher.launch(needed.toTypedArray())
+        }
+    }
+
+    private fun forceImmersiveFullscreen(isDark: Boolean? = null) {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val lp = window.attributes
+            lp.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = lp
+        }
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        if (isDark != null) {
+            controller.isAppearanceLightStatusBars = !isDark
+            controller.isAppearanceLightNavigationBars = !isDark
+        }
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleIncomingIntent(intent)
@@ -256,12 +295,21 @@ private fun CyberDeckRootShell(
     val lifecycleOwner = LocalLifecycleOwner.current
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
 
+    val uiPrefs = remember(context) {
+        context.getSharedPreferences("cyberdeck_ui_prefs", Context.MODE_PRIVATE)
+    }
     var removableVolumes by remember { mutableStateOf<List<ExternalVolumeInfo>>(emptyList()) }
-    var handledExternalKey by remember { mutableStateOf<String?>(null) }
+    var acknowledgedExternalKey by remember {
+        mutableStateOf(uiPrefs.getString("ack_external_key", null))
+    }
     var notifiedExternalKey by remember { mutableStateOf<String?>(null) }
     var showExternalDetectedDialog by remember { mutableStateOf(false) }
+    var showExternalRemovedDialog by remember { mutableStateOf(false) }
     var showDexPermissionsDialog by remember { mutableStateOf(false) }
     var autoPromptChecked by remember { mutableStateOf(false) }
+    var isGestureNavEnabled by remember {
+        mutableStateOf(DesktopLauncherManager.isGestureNavigationEnabled(context))
+    }
 
     LaunchedEffect(settings.desktopLauncherMode, settings.dexSetupPromptDismissed) {
         if (!autoPromptChecked && settings.desktopLauncherMode && !settings.dexSetupPromptDismissed) {
@@ -321,6 +369,7 @@ private fun CyberDeckRootShell(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 refreshExternalDevices()
+                isGestureNavEnabled = DesktopLauncherManager.isGestureNavigationEnabled(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -339,34 +388,58 @@ private fun CyberDeckRootShell(
     }
 
     LaunchedEffect(currentExternalKey) {
+        val extraSafList = settings.extraMediaSafUris
+            .lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+
         if (currentExternalKey == null) {
-            handledExternalKey = null
             notifiedExternalKey = null
             showExternalDetectedDialog = false
+            val hadExternal = uiPrefs.getBoolean("had_external_connected", false)
+            if (hadExternal) {
+                uiPrefs.edit()
+                    .remove("ack_external_key")
+                    .putBoolean("had_external_connected", false)
+                    .apply()
+                acknowledgedExternalKey = null
+                showExternalRemovedDialog = true
+                if (settings.musicAutoImport) {
+                    app.musicRepository.autoImportAndRefresh(
+                        deckDriveTreeUri = settings.deckDriveTreeUri,
+                        extraSafUris = extraSafList
+                    )
+                }
+                if (settings.offlineTubeAutoImport) {
+                    app.mediaRepository.autoImportAndRefreshVideos(
+                        deckDriveTreeUri = settings.deckDriveTreeUri,
+                        extraSafUris = extraSafList
+                    )
+                }
+            }
         } else {
-            if (currentExternalKey != handledExternalKey) {
+            uiPrefs.edit().putBoolean("had_external_connected", true).apply()
+            if (currentExternalKey != acknowledgedExternalKey) {
                 showExternalDetectedDialog = true
             }
             if (currentExternalKey != notifiedExternalKey) {
                 notifiedExternalKey = currentExternalKey
-                val label = removableVolumes.firstOrNull()?.label
-                    ?: driveStatus.displayName.takeIf { driveStatus.isConnected }
-                    ?: "Penyimpanan Eksternal"
-                NotificationCenterStore.postInternalAlert(
-                    title = "Penyimpanan Eksternal Terdeteksi",
-                    text = "$label siap. Pilih penyimpanan Offline Archive & Download (Internal / Eksternal).",
-                    appLabel = "Cyber Deck Storage",
-                    keyPrefix = "ext_storage"
-                )
-                NotificationCenterStore.playNotificationSound(
-                    context = context,
-                    enabled = settings.notificationSoundEnabled
-                )
-                postExternalStorageNotification(context, label)
-                val extraSafList = settings.extraMediaSafUris
-                    .lines()
-                    .map { it.trim() }
-                    .filter { it.isNotBlank() }
+                if (currentExternalKey != acknowledgedExternalKey) {
+                    val label = removableVolumes.firstOrNull()?.label
+                        ?: driveStatus.displayName.takeIf { driveStatus.isConnected }
+                        ?: "Penyimpanan Eksternal"
+                    NotificationCenterStore.postInternalAlert(
+                        title = "Penyimpanan Eksternal Terdeteksi",
+                        text = "$label siap. Pilih penyimpanan Offline Archive & Download (Internal / Eksternal).",
+                        appLabel = "Cyber Deck Storage",
+                        keyPrefix = "ext_storage"
+                    )
+                    NotificationCenterStore.playNotificationSound(
+                        context = context,
+                        enabled = settings.notificationSoundEnabled
+                    )
+                    postExternalStorageNotification(context, label)
+                }
                 if (settings.musicAutoImport) {
                     app.musicRepository.autoImportAndRefresh(
                         deckDriveTreeUri = settings.deckDriveTreeUri,
@@ -460,9 +533,7 @@ private fun CyberDeckRootShell(
     )
 
     Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .let { if (settings.immersiveFullscreen) it else it.safeDrawingPadding() },
+        modifier = Modifier.fillMaxSize(),
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
             if (!settings.desktopLauncherMode && !useRail && !hideNavChrome) {
@@ -499,11 +570,6 @@ private fun CyberDeckRootShell(
                     browserViewModel = browserViewModel,
                     settings = settings,
                     onShowPermissionsDialog = { showDexPermissionsDialog = true },
-                    onSwitchToClassicMode = {
-                        scope.launch {
-                            app.settingsRepository.updateSettings { it.copy(desktopLauncherMode = false) }
-                        }
-                    },
                     onShowMessage = showMessage
                 )
             }
@@ -633,6 +699,13 @@ private fun CyberDeckRootShell(
                         MainDestination.FILES -> {
                             FileManagerScreen(
                                 app = app,
+                                onOpenZimPathOrUri = { ref ->
+                                    scope.launch {
+                                        app.vaultRepository.importOrFindZim(ref)
+                                            .onSuccess { item -> overlay = OverlayReader.ZimReader(item.id) }
+                                            .onFailure { err -> showMessage("Gagal membuka ZIM: ${err.message}") }
+                                    }
+                                },
                                 onShowMessage = showMessage
                             )
                         }
@@ -707,6 +780,38 @@ private fun CyberDeckRootShell(
                         )
                     }
                 }
+
+                if (!isGestureNavEnabled) {
+                    FloatingNavigationOverlay(
+                        onBack = {
+                            if (overlay != null) {
+                                overlay = null
+                            } else if (currentDest != MainDestination.BROWSER) {
+                                currentDest = MainDestination.BROWSER
+                            } else {
+                                scope.launch {
+                                    app.settingsRepository.updateSettings { it.copy(desktopLauncherMode = true) }
+                                }
+                            }
+                        },
+                        onHome = {
+                            overlay = null
+                            scope.launch {
+                                app.settingsRepository.updateSettings { it.copy(desktopLauncherMode = true) }
+                            }
+                        },
+                        onRecentsOrDrawer = {
+                            overlay = null
+                            scope.launch {
+                                app.settingsRepository.updateSettings { it.copy(desktopLauncherMode = true) }
+                            }
+                        },
+                        onOpenNavSettings = {
+                            showMessage(DesktopLauncherManager.openSystemNavigationSettings(context))
+                        },
+                        modifier = Modifier.align(Alignment.BottomEnd)
+                    )
+                }
             }
         }
         }
@@ -714,7 +819,12 @@ private fun CyberDeckRootShell(
 
     if (showDexPermissionsDialog) {
         DexPermissionsSetupDialog(
-            onDismiss = { showDexPermissionsDialog = false },
+            onDismiss = {
+                showDexPermissionsDialog = false
+                scope.launch {
+                    app.settingsRepository.updateSettings { it.copy(dexSetupPromptDismissed = true) }
+                }
+            },
             onDismissForever = {
                 showDexPermissionsDialog = false
                 scope.launch {
@@ -740,11 +850,16 @@ private fun CyberDeckRootShell(
             )
         }
 
+        val acknowledgeCurrentExternal: () -> Unit = {
+            currentExternalKey?.let { key ->
+                acknowledgedExternalKey = key
+                uiPrefs.edit().putString("ack_external_key", key).apply()
+            }
+            showExternalDetectedDialog = false
+        }
+
         AlertDialog(
-            onDismissRequest = {
-                handledExternalKey = currentExternalKey
-                showExternalDetectedDialog = false
-            },
+            onDismissRequest = acknowledgeCurrentExternal,
             title = { Text("External Storage Detected") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -800,8 +915,7 @@ private fun CyberDeckRootShell(
             },
             confirmButton = {
                 Button(onClick = {
-                    handledExternalKey = currentExternalKey
-                    showExternalDetectedDialog = false
+                    acknowledgeCurrentExternal()
                     scope.launch {
                         app.settingsRepository.updateSettings {
                             it.copy(
@@ -816,10 +930,37 @@ private fun CyberDeckRootShell(
                 }) { Text("Simpan Pengaturan") }
             },
             dismissButton = {
-                TextButton(onClick = {
-                    handledExternalKey = currentExternalKey
-                    showExternalDetectedDialog = false
-                }) { Text("Nanti") }
+                TextButton(onClick = acknowledgeCurrentExternal) { Text("Nanti") }
+            }
+        )
+    }
+
+    if (showExternalRemovedDialog) {
+        AlertDialog(
+            onDismissRequest = { showExternalRemovedDialog = false },
+            title = { Text("Penyimpanan Eksternal Terputus") },
+            text = {
+                Text(
+                    "Drive eksternal / SSD sudah tidak terdeteksi. Jika ada Archive atau Download yang masih diarahkan ke Eksternal, Anda bisa mengalihkannya kembali ke Internal Storage.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showExternalRemovedDialog = false
+                    scope.launch {
+                        app.settingsRepository.updateSettings {
+                            it.copy(
+                                archiveStorageTarget = StorageTarget.INTERNAL,
+                                downloadStorageTarget = StorageTarget.INTERNAL
+                            )
+                        }
+                        showMessage("Offline Archive & Download dialihkan ke Internal Storage.")
+                    }
+                }) { Text("Gunakan Internal") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showExternalRemovedDialog = false }) { Text("Biarkan") }
             }
         )
     }

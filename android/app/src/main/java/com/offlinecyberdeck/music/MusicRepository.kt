@@ -232,75 +232,90 @@ class MusicRepository(
             }
         }.toTypedArray()
 
-        runCatching {
-            context.contentResolver.query(
-                MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                null,
-                null,
-                "${MediaStore.Audio.Media.DATE_ADDED} DESC"
-            )?.use { cursor ->
-                val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
-                val nameIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
-                val titleIdx = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
-                val artistIdx = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
-                val albumIdx = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM)
-                val durIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
-                val sizeIdx = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
-                val volIdx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    cursor.getColumnIndex(MediaStore.Audio.Media.VOLUME_NAME)
-                } else -1
-                val dataIdx = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                    @Suppress("DEPRECATION")
-                    cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
-                } else -1
+        val targetUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val vols = runCatching { MediaStore.getExternalVolumeNames(context) }.getOrNull().orEmpty()
+            if (vols.isEmpty()) {
+                listOf("external" to MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+            } else {
+                vols.map { vol -> vol to MediaStore.Audio.Media.getContentUri(vol) }
+            }
+        } else {
+            listOf("external" to MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+        }
 
-                while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idIdx)
-                    val fileName = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)
-                        ?.takeIf { it.isNotBlank() } ?: continue
-                    val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
-                    if (ext !in audioExtensions) continue
+        for ((volumeTag, collectionUri) in targetUris) {
+            runCatching {
+                context.contentResolver.query(
+                    collectionUri,
+                    projection,
+                    null,
+                    null,
+                    "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+                )?.use { cursor ->
+                    val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                    val nameIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DISPLAY_NAME)
+                    val titleIdx = cursor.getColumnIndex(MediaStore.Audio.Media.TITLE)
+                    val artistIdx = cursor.getColumnIndex(MediaStore.Audio.Media.ARTIST)
+                    val albumIdx = cursor.getColumnIndex(MediaStore.Audio.Media.ALBUM)
+                    val durIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DURATION)
+                    val sizeIdx = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+                    val volIdx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        cursor.getColumnIndex(MediaStore.Audio.Media.VOLUME_NAME)
+                    } else -1
+                    val dataIdx = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        @Suppress("DEPRECATION")
+                        cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
+                    } else -1
 
-                    val contentUri = ContentUris.withAppendedId(
-                        MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-                        id
-                    )
-                    val uriStr = contentUri.toString()
-                    val normName = fileName.lowercase(Locale.US)
-                    if (seenUris.contains(uriStr) || seenNames.contains(normName)) {
-                        onSkipped()
-                        continue
+                    while (cursor.moveToNext()) {
+                        val id = cursor.getLong(idIdx)
+                        val fileName = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)
+                            ?.takeIf { it.isNotBlank() } ?: continue
+                        val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
+                        if (ext !in audioExtensions) continue
+
+                        val contentUri = ContentUris.withAppendedId(collectionUri, id)
+                        val uriStr = contentUri.toString()
+                        val normName = fileName.lowercase(Locale.US)
+                        if (seenUris.contains(uriStr) || seenNames.contains(normName)) {
+                            onSkipped()
+                            continue
+                        }
+                        if (!driveManager.isUriOrFileAccessible(uriStr)) {
+                            continue
+                        }
+
+                        val sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
+                        val durMs = if (durIdx >= 0 && !cursor.isNull(durIdx)) cursor.getLong(durIdx) else 0L
+                        if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
+
+                        val rawTitle = if (titleIdx >= 0) cursor.getString(titleIdx)?.trim() else null
+                        val rawArtist = if (artistIdx >= 0) cursor.getString(artistIdx)?.trim() else null
+                        val rawAlbum = if (albumIdx >= 0) cursor.getString(albumIdx)?.trim() else null
+
+                        val volName = if (volIdx >= 0) cursor.getString(volIdx).orEmpty().ifBlank { volumeTag } else {
+                            val path = if (dataIdx >= 0) cursor.getString(dataIdx).orEmpty() else ""
+                            if (path.contains("/storage/emulated")) "external_primary" else volumeTag
+                        }
+                        val isPrimary = volName.equals("external_primary", ignoreCase = true) ||
+                            volName.equals("external", ignoreCase = true) ||
+                            volName.isBlank()
+
+                        seenUris += uriStr
+                        seenNames += normName
+                        out += MusicTrackEntity(
+                            id = UUID.randomUUID().toString(),
+                            title = rawTitle?.takeIf { it.isNotBlank() } ?: cleanAudioTitle(fileName),
+                            artist = rawArtist?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Unknown Artist",
+                            album = rawAlbum?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Local Music",
+                            fileName = fileName,
+                            fileUri = uriStr,
+                            durationMs = durMs.coerceAtLeast(0L),
+                            sizeBytes = sizeBytes.coerceAtLeast(0L),
+                            storageTarget = if (isPrimary) StorageTarget.INTERNAL else StorageTarget.DECK_DRIVE,
+                            volumeLabel = if (isPrimary) "Internal" else "SD / USB ($volName)"
+                        )
                     }
-
-                    val sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
-                    val durMs = if (durIdx >= 0 && !cursor.isNull(durIdx)) cursor.getLong(durIdx) else 0L
-                    if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
-
-                    val rawTitle = if (titleIdx >= 0) cursor.getString(titleIdx)?.trim() else null
-                    val rawArtist = if (artistIdx >= 0) cursor.getString(artistIdx)?.trim() else null
-                    val rawAlbum = if (albumIdx >= 0) cursor.getString(albumIdx)?.trim() else null
-
-                    val volName = if (volIdx >= 0) cursor.getString(volIdx).orEmpty() else {
-                        val path = if (dataIdx >= 0) cursor.getString(dataIdx).orEmpty() else ""
-                        if (path.contains("/storage/emulated")) "external_primary" else "external"
-                    }
-                    val isPrimary = volName.equals("external_primary", ignoreCase = true) || volName.isBlank()
-
-                    seenUris += uriStr
-                    seenNames += normName
-                    out += MusicTrackEntity(
-                        id = UUID.randomUUID().toString(),
-                        title = rawTitle?.takeIf { it.isNotBlank() } ?: cleanAudioTitle(fileName),
-                        artist = rawArtist?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Unknown Artist",
-                        album = rawAlbum?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Local Music",
-                        fileName = fileName,
-                        fileUri = uriStr,
-                        durationMs = durMs.coerceAtLeast(0L),
-                        sizeBytes = sizeBytes.coerceAtLeast(0L),
-                        storageTarget = if (isPrimary) StorageTarget.INTERNAL else StorageTarget.DECK_DRIVE,
-                        volumeLabel = if (isPrimary) "Internal" else "SD / USB ($volName)"
-                    )
                 }
             }
         }

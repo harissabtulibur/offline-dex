@@ -2,14 +2,17 @@ package com.offlinecyberdeck.library
 
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import android.system.Os
 import android.util.LruCache
 import com.github.luben.zstd.ZstdInputStream
 import org.tukaani.xz.XZInputStream
 import java.io.BufferedInputStream
 import java.io.Closeable
 import java.io.EOFException
+import java.io.FileDescriptor
 import java.io.FileInputStream
 import java.io.InputStream
+import java.net.URLDecoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
@@ -96,12 +99,14 @@ class ZimArchiveReader(
 
     private val fis = FileInputStream(pfd.fileDescriptor)
     private val channel: FileChannel = fis.channel
+    private val fd: FileDescriptor = pfd.fileDescriptor
     private val fileSize: Long = runCatching { channel.size() }.getOrNull()?.takeIf { it > 0L }
         ?: pfd.statSize.takeIf { it > 0L }
         ?: Long.MAX_VALUE
     private val ioLock = Any()
 
     val header: ZimHeaderInfo
+    val titleEntryCount: Int
     val mimeTypes: List<String>
 
     // Strict 3.5 MB LRU cache for small uncompressed clusters (saves repeated XZ/Zstd decompress of CSS/JS/articles)
@@ -144,6 +149,11 @@ class ZimArchiveReader(
             layoutPage = layoutPage,
             checksumPos = checksumPos
         )
+        titleEntryCount = if (titlePtrPos in 80L until clusterPtrPos) {
+            ((clusterPtrPos - titlePtrPos) / 4L).toInt().coerceIn(0, entryCount)
+        } else {
+            0
+        }
         mimeTypes = readMimeList(mimeListPos)
     }
 
@@ -160,13 +170,21 @@ class ZimArchiveReader(
             if (resolved != null) return resolved.fullKey
         }
         val commonMains = listOf(
+            'W' to "mainPage",
+            'C' to "mainPage",
             'C' to "index.html",
             'C' to "index.htm",
             'C' to "index",
             'C' to "Main_Page",
+            'C' to "Halaman_Utama",
             'C' to "Wikipedia",
+            'C' to "Home",
+            'C' to "home.html",
+            'C' to "Start",
+            'C' to "welcome.html",
             'A' to "index.html",
             'A' to "Main_Page",
+            'A' to "Halaman_Utama",
             'A' to "index"
         )
         for ((ns, url) in commonMains) {
@@ -179,46 +197,53 @@ class ZimArchiveReader(
     }
 
     private fun findFirstHtmlEntry(): ZimDirectoryEntry.Content? {
-        val probeNamespaces = listOf('C', 'A')
-        for (ns in probeNamespaces) {
-            val startIdx = lowerBoundNamespace(ns)
-            val scanLimit = min(header.entryCount, startIdx + 25000)
-            var checked = 0
-            var i = startIdx
-            while (i < header.entryCount && checked < 8000 && i < scanLimit) {
-                val e = readDirectoryEntry(i)
-                if (e.namespace != ns) break
-                checked++
-                if (e is ZimDirectoryEntry.Content) {
-                    val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
-                    if (mime.contains("html", ignoreCase = true) && !e.url.startsWith("-/")) {
-                        return e
-                    }
-                }
-                i++
-            }
-        }
-        val fallbackLimit = min(header.entryCount, 4000)
-        for (i in 0 until fallbackLimit) {
-            val resolved = resolveEntryIndex(i)
-            if (resolved != null && (resolved.namespace == 'C' || resolved.namespace == 'A')) {
-                val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
-                if (mime.contains("html", ignoreCase = true)) {
-                    return resolved
-                }
-            }
-        }
-        if (header.entryCount > 0 && header.titlePtrPos in 80L until fileSize) {
-            val titleScanLimit = min(header.entryCount, 400)
+        // 1. Check title pointer table first (modern OpenZIM puts only front HTML articles here)
+        if (titleEntryCount > 0 && header.titlePtrPos in 80L until fileSize) {
+            val titleScanLimit = min(titleEntryCount, 300)
             for (t in 0 until titleScanLimit) {
                 val entryIdx = readUInt32At(header.titlePtrPos + t.toLong() * 4L)
                 if (entryIdx !in 0 until header.entryCount) continue
                 val resolved = resolveEntryIndex(entryIdx) ?: continue
-                if (resolved.namespace == 'C' || resolved.namespace == 'A') {
+                if ((resolved.namespace == 'C' || resolved.namespace == 'A') && !resolved.url.startsWith("-/")) {
                     val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
-                    if (mime.contains("html", ignoreCase = true) && !resolved.url.startsWith("-/")) {
+                    if (mime.contains("html", ignoreCase = true)) {
                         return resolved
                     }
+                }
+            }
+        }
+
+        // 2. Probe namespaces C and A, jumping past '-/' CSS/JS/asset prefixes
+        val probeNamespaces = listOf('C', 'A')
+        for (ns in probeNamespaces) {
+            for (startPrefix in listOf("A", "0", "")) {
+                val startIdx = if (startPrefix.isEmpty()) lowerBoundNamespace(ns) else lowerBoundNamespaceUrl(ns, startPrefix)
+                val scanLimit = min(header.entryCount, startIdx + 12000)
+                var checked = 0
+                var i = startIdx
+                while (i < header.entryCount && checked < 4000 && i < scanLimit) {
+                    val raw = readDirectoryEntry(i)
+                    if (raw.namespace != ns) break
+                    checked++
+                    val e = if (raw is ZimDirectoryEntry.Redirect) resolveEntryIndex(raw.index) else raw as? ZimDirectoryEntry.Content
+                    if (e != null && (e.namespace == 'C' || e.namespace == 'A') && !e.url.startsWith("-/")) {
+                        val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
+                        if (mime.contains("html", ignoreCase = true)) {
+                            return e
+                        }
+                    }
+                    i++
+                }
+            }
+        }
+
+        val fallbackLimit = min(header.entryCount, 4000)
+        for (i in 0 until fallbackLimit) {
+            val resolved = resolveEntryIndex(i)
+            if (resolved != null && (resolved.namespace == 'C' || resolved.namespace == 'A') && !resolved.url.startsWith("-/")) {
+                val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
+                if (mime.contains("html", ignoreCase = true)) {
+                    return resolved
                 }
             }
         }
@@ -228,9 +253,39 @@ class ZimArchiveReader(
     fun getSampleArticles(limit: Int = 30): List<ZimSearchHit> {
         val out = mutableListOf<ZimSearchHit>()
         val seen = HashSet<String>()
+
+        // 1. Sample from title pointer table first (cleanest list of user-facing articles)
+        if (titleEntryCount > 0 && header.titlePtrPos in 80L until fileSize) {
+            val step = (titleEntryCount / limit.coerceAtLeast(1)).coerceAtLeast(1)
+            var t = 0
+            var visited = 0
+            while (t < titleEntryCount && out.size < limit && visited < limit * 6) {
+                visited++
+                val entryIdx = readUInt32At(header.titlePtrPos + t.toLong() * 4L)
+                if (entryIdx in 0 until header.entryCount) {
+                    val e = resolveEntryIndex(entryIdx)
+                    if (e != null && (e.namespace == 'C' || e.namespace == 'A') && !e.url.startsWith("-/")) {
+                        val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
+                        if (mime.contains("html", ignoreCase = true) && seen.add(e.fullKey)) {
+                            out += ZimSearchHit(
+                                entryIndex = e.index,
+                                fullKey = e.fullKey,
+                                title = e.title.ifBlank { e.url },
+                                mimeType = mime
+                            )
+                        }
+                    }
+                }
+                t += step
+            }
+        }
+
+        // 2. Fallback scan across C and A namespaces starting from 'A' then namespace start
         for (ns in listOf('C', 'A')) {
             if (out.size >= limit) break
-            val startIdx = lowerBoundNamespace(ns)
+            val startIdx = lowerBoundNamespaceUrl(ns, "A").let { aIdx ->
+                if (aIdx < header.entryCount) aIdx else lowerBoundNamespace(ns)
+            }
             val span = (header.entryCount - startIdx).coerceAtLeast(1)
             val step = if (span > 4000) (span / 2500).coerceAtLeast(1) else 1
             var idx = startIdx
@@ -254,35 +309,16 @@ class ZimArchiveReader(
                 idx += step
             }
         }
-        if (out.isEmpty() && header.entryCount > 0 && header.titlePtrPos in 80L until fileSize) {
-            val step = (header.entryCount / 1500).coerceAtLeast(1)
-            var t = 0
-            while (t < header.entryCount && out.size < limit) {
-                val entryIdx = readUInt32At(header.titlePtrPos + t.toLong() * 4L)
-                if (entryIdx in 0 until header.entryCount) {
-                    val e = resolveEntryIndex(entryIdx)
-                    if (e != null && (e.namespace == 'C' || e.namespace == 'A') && !e.url.startsWith("-/")) {
-                        val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
-                        if (mime.contains("html", ignoreCase = true) && seen.add(e.fullKey)) {
-                            out += ZimSearchHit(
-                                entryIndex = e.index,
-                                fullKey = e.fullKey,
-                                title = e.title.ifBlank { e.url },
-                                mimeType = mime
-                            )
-                        }
-                    }
-                }
-                t += step
-            }
-        }
         return out
     }
 
     fun loadWebPath(rawPath: String): Result<ZimBlobResponse> = runCatching {
-        val clean = decodeCleanPath(rawPath)
-        val entry = findContentByWebPath(clean)
-            ?: error("Article or resource not found in ZIM: $clean")
+        val noQuery = rawPath.substringBefore('#').substringBefore('?')
+        val cleanDecoded = decodeCleanPath(noQuery)
+        val cleanRaw = normalizePathSegments(noQuery)
+        val entry = findContentByWebPath(cleanDecoded)
+            ?: (if (cleanRaw != cleanDecoded) findContentByWebPath(cleanRaw) else null)
+            ?: error("Article or resource not found in ZIM: $cleanDecoded")
         val mime = mimeTypes.getOrNull(entry.mimeIndex)
             ?.substringBefore(';')
             ?.trim()
@@ -304,25 +340,55 @@ class ZimArchiveReader(
         val seenKeys = hashSetOf<String>()
 
         // 1. Fast binary prefix search in sorted titlePtrPos (4-byte unsigned entry indices)
-        val prefixPos = lowerBoundTitle(q)
-        val scanAround = min(header.entryCount, prefixPos + 100)
-        for (tIdx in prefixPos until scanAround) {
-            if (results.size >= limit) break
-            val entryIdx = readUInt32At(header.titlePtrPos + tIdx.toLong() * 4L)
-            if (entryIdx < 0 || entryIdx >= header.entryCount) continue
-            val resolved = resolveEntryIndex(entryIdx) ?: continue
-            if (resolved.namespace != 'C' && resolved.namespace != 'A') continue
-            val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
-            if (!mime.contains("html", ignoreCase = true)) continue
-            val displayTitle = resolved.title.ifBlank { resolved.url }
-            if (displayTitle.contains(q, ignoreCase = true) || resolved.url.contains(q, ignoreCase = true)) {
-                if (seenKeys.add(resolved.fullKey)) {
-                    results += ZimSearchHit(resolved.index, resolved.fullKey, displayTitle, mime)
+        if (titleEntryCount > 0 && header.titlePtrPos in 80L until fileSize) {
+            val prefixPos = lowerBoundTitle(q)
+            val scanAround = min(titleEntryCount, prefixPos + 120)
+            for (tIdx in prefixPos until scanAround) {
+                if (results.size >= limit) break
+                val entryIdx = readUInt32At(header.titlePtrPos + tIdx.toLong() * 4L)
+                if (entryIdx < 0 || entryIdx >= header.entryCount) continue
+                val resolved = resolveEntryIndex(entryIdx) ?: continue
+                if (resolved.namespace != 'C' && resolved.namespace != 'A') continue
+                val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
+                if (!mime.contains("html", ignoreCase = true)) continue
+                val displayTitle = resolved.title.ifBlank { resolved.url }
+                if (displayTitle.contains(q, ignoreCase = true) || resolved.url.contains(q, ignoreCase = true)) {
+                    if (seenKeys.add(resolved.fullKey)) {
+                        results += ZimSearchHit(resolved.index, resolved.fullKey, displayTitle, mime)
+                    }
                 }
             }
         }
 
-        // 2. Bounded scan across C/A entries for substring matches if prefix hits were sparse
+        // 2. Also probe direct URL prefix match in C/A (for exact/camelCase article titles)
+        if (results.size < limit) {
+            for (ns in listOf('C', 'A')) {
+                val urlVariants = linkedSetOf(q, q.replace(' ', '_'), q.replaceFirstChar { it.uppercase() }.replace(' ', '_'))
+                for (uv in urlVariants) {
+                    val startIdx = lowerBoundNamespaceUrl(ns, uv)
+                    val endIdx = min(header.entryCount, startIdx + 25)
+                    for (i in startIdx until endIdx) {
+                        if (results.size >= limit) break
+                        val raw = readDirectoryEntry(i)
+                        if (raw.namespace != ns) break
+                        val resolved = if (raw is ZimDirectoryEntry.Redirect) resolveEntryIndex(raw.index) else raw as? ZimDirectoryEntry.Content
+                        if (resolved != null && !resolved.url.startsWith("-/")) {
+                            val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
+                            if (mime.contains("html", ignoreCase = true)) {
+                                val t = resolved.title.ifBlank { resolved.url }
+                                if ((t.contains(q, ignoreCase = true) || resolved.url.contains(q, ignoreCase = true)) &&
+                                    seenKeys.add(resolved.fullKey)
+                                ) {
+                                    results += ZimSearchHit(resolved.index, resolved.fullKey, t, mime)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Bounded scan across C/A entries for substring matches if prefix hits were sparse
         if (results.size < limit) {
             val cStart = lowerBoundNamespace('C')
             val start = if (cStart < header.entryCount) cStart else 0
@@ -331,14 +397,15 @@ class ZimArchiveReader(
             var idx = start
             while (idx < header.entryCount && results.size < limit) {
                 val raw = readDirectoryEntry(idx)
-                if (raw is ZimDirectoryEntry.Content && (raw.namespace == 'C' || raw.namespace == 'A')) {
-                    val mime = mimeTypes.getOrNull(raw.mimeIndex).orEmpty()
+                val resolved = if (raw is ZimDirectoryEntry.Redirect) resolveEntryIndex(raw.index) else raw as? ZimDirectoryEntry.Content
+                if (resolved != null && (resolved.namespace == 'C' || resolved.namespace == 'A') && !resolved.url.startsWith("-/")) {
+                    val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
                     if (mime.contains("html", ignoreCase = true)) {
-                        val t = raw.title.ifBlank { raw.url }
-                        if ((t.contains(q, ignoreCase = true) || raw.url.contains(q, ignoreCase = true)) &&
-                            seenKeys.add(raw.fullKey)
+                        val t = resolved.title.ifBlank { resolved.url }
+                        if ((t.contains(q, ignoreCase = true) || resolved.url.contains(q, ignoreCase = true)) &&
+                            seenKeys.add(resolved.fullKey)
                         ) {
-                            results += ZimSearchHit(raw.index, raw.fullKey, t, mime)
+                            results += ZimSearchHit(resolved.index, resolved.fullKey, t, mime)
                         }
                     }
                 }
@@ -350,7 +417,8 @@ class ZimArchiveReader(
 
     private fun decodeCleanPath(rawPath: String): String {
         val noQuery = rawPath.substringBefore('#').substringBefore('?')
-        val decoded = runCatching { Uri.decode(noQuery) }.getOrDefault(noQuery)
+        val decoded = runCatching { URLDecoder.decode(noQuery.replace("+", "%2B"), "UTF-8") }
+            .getOrElse { runCatching { Uri.decode(noQuery) }.getOrDefault(noQuery) }
         return normalizePathSegments(decoded)
     }
 
@@ -454,8 +522,11 @@ class ZimArchiveReader(
         return null
     }
 
-    private fun lowerBoundNamespace(ns: Char): Int {
-        val targetBytes = byteArrayOf(ns.code.toByte())
+    private fun lowerBoundNamespace(ns: Char): Int =
+        lowerBoundNamespaceUrl(ns, "")
+
+    private fun lowerBoundNamespaceUrl(ns: Char, urlPrefix: String): Int {
+        val targetBytes = (ns.toString() + urlPrefix).toByteArray(Charsets.UTF_8)
         var low = 0
         var high = header.entryCount
         while (low < high) {
@@ -488,9 +559,10 @@ class ZimArchiveReader(
     }
 
     private fun lowerBoundTitle(query: String): Int {
+        if (titleEntryCount <= 0) return 0
         val targetBytes = query.lowercase().toByteArray(Charsets.UTF_8)
         var low = 0
-        var high = header.entryCount
+        var high = titleEntryCount
         while (low < high) {
             val mid = (low + high) ushr 1
             val entryIdx = readUInt32At(header.titlePtrPos + mid.toLong() * 4L)
@@ -612,6 +684,9 @@ class ZimArchiveReader(
             val totalClusterDecompressed = offsets[blobCount]
             val blobStart = offsets[blobNumber]
             val blobEnd = offsets[blobNumber + 1]
+            if (blobStart < firstOffset || blobEnd < blobStart) {
+                error("Invalid ZIM blob offsets ($blobStart..$blobEnd)")
+            }
             val blobLen = (blobEnd - blobStart).coerceAtLeast(0L)
             if (blobLen > 16L * 1024L * 1024L) {
                 error("ZIM entry too large (${blobLen / (1024 * 1024)} MB) for 4 GB RAM safety limit")
@@ -649,7 +724,7 @@ class ZimArchiveReader(
         compressedLen: Long,
         compression: Int
     ): InputStream {
-        val slice = BufferedInputStream(ChannelSliceInputStream(channel, dataStart, compressedLen, ioLock), 16384)
+        val slice = BufferedInputStream(ChannelSliceInputStream(channel, fd, dataStart, compressedLen, ioLock), 16384)
         return when (compression) {
             0, 1 -> slice
             2 -> InflaterInputStream(slice)
@@ -707,15 +782,31 @@ class ZimArchiveReader(
         if (len <= 0) return ByteArray(0)
         val out = ByteArray(len)
         val buf = ByteBuffer.wrap(out)
+        var readCount = 0
         synchronized(ioLock) {
             var offset = pos
-            while (buf.hasRemaining()) {
-                val n = channel.read(buf, offset)
-                if (n <= 0) break
-                offset += n
+            val channelOk = runCatching {
+                while (buf.hasRemaining()) {
+                    val n = channel.read(buf, offset)
+                    if (n <= 0) break
+                    offset += n
+                }
+                true
+            }.getOrDefault(false)
+            if (channelOk && buf.position() > 0) {
+                readCount = buf.position()
+            } else {
+                var off = 0
+                var curPos = pos
+                while (off < len) {
+                    val n = runCatching { Os.pread(fd, out, off, len - off, curPos) }.getOrDefault(-1)
+                    if (n <= 0) break
+                    off += n
+                    curPos += n
+                }
+                readCount = off
             }
         }
-        val readCount = buf.position()
         return if (readCount == len) out else out.copyOf(readCount)
     }
 
@@ -744,6 +835,7 @@ class ZimArchiveReader(
 
 private class ChannelSliceInputStream(
     private val channel: FileChannel,
+    private val fd: FileDescriptor,
     startOffset: Long,
     length: Long,
     private val lock: Any
@@ -764,7 +856,9 @@ private class ChannelSliceInputStream(
         val toRead = min(len.toLong(), remaining).toInt()
         val buf = ByteBuffer.wrap(b, off, toRead)
         val readBytes = synchronized(lock) {
-            channel.read(buf, cursor)
+            runCatching { channel.read(buf, cursor) }.getOrElse {
+                runCatching { Os.pread(fd, b, off, toRead, cursor) }.getOrDefault(-1)
+            }
         }
         if (readBytes <= 0) return -1
         cursor += readBytes

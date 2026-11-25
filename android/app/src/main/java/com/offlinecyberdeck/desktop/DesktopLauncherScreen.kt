@@ -1,10 +1,16 @@
 package com.offlinecyberdeck.desktop
 
+import android.content.Context
 import android.graphics.BitmapFactory
 import android.text.format.DateFormat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -41,6 +47,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AdminPanelSettings
 import androidx.compose.material.icons.filled.Apps
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BatteryFull
@@ -54,12 +61,14 @@ import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Eject
 import androidx.compose.material.icons.filled.FilterNone
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.Memory
@@ -67,6 +76,7 @@ import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Refresh
@@ -74,6 +84,9 @@ import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.Wallpaper
 import androidx.compose.material.icons.filled.Warning
@@ -148,6 +161,8 @@ import com.offlinecyberdeck.core.format.Formatters
 import com.offlinecyberdeck.core.model.DesktopBackgroundPreset
 import com.offlinecyberdeck.core.model.DownloadStatus
 import com.offlinecyberdeck.core.model.LibraryFileType
+import com.offlinecyberdeck.core.model.StorageTarget
+import com.offlinecyberdeck.core.storage.ExternalVolumeInfo
 import com.offlinecyberdeck.downloads.DownloadsScreen
 import com.offlinecyberdeck.files.FileManagerScreen
 import com.offlinecyberdeck.library.LibraryScreen
@@ -193,7 +208,7 @@ enum class DesktopWindowKind(val defaultTitle: String) {
 }
 
 private enum class TaskbarTrayPopup {
-    NETWORK, BATTERY, CLOCK
+    NETWORK, BATTERY, CLOCK, STORAGE
 }
 
 data class DesktopWindowState(
@@ -217,7 +232,6 @@ fun DesktopLauncherScreen(
     browserViewModel: BrowserViewModel,
     settings: AppSettingsEntity,
     onShowPermissionsDialog: () -> Unit,
-    onSwitchToClassicMode: () -> Unit,
     onShowMessage: (String) -> Unit
 ) {
     val context = LocalContext.current
@@ -246,6 +260,10 @@ fun DesktopLauncherScreen(
     val downloads by app.database.downloadDao().observeAll().collectAsStateWithLifecycle(initialValue = emptyList())
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
 
+    var mountedPartitions by remember { mutableStateOf(app.driveManager.detectAllMountedRemovablePartitions()) }
+    var isGestureNavEnabled by remember { mutableStateOf(DesktopLauncherManager.isGestureNavigationEnabled(context)) }
+    var isBlinkingNetIndicator by remember { mutableStateOf(false) }
+
     var taskbarVisible by remember(settings.taskbarAutoHide) { mutableStateOf(!settings.taskbarAutoHide) }
     var activeTrayPopup by remember { mutableStateOf<TaskbarTrayPopup?>(null) }
     var windowMenuId by remember { mutableStateOf<String?>(null) }
@@ -254,6 +272,30 @@ fun DesktopLauncherScreen(
     var pendingWallpaperSlot by remember { mutableIntStateOf(0) }
     var floatingNotif by remember { mutableStateOf<DeckNotificationItem?>(null) }
     val notifSoundEnabledState by rememberUpdatedState(settings.notificationSoundEnabled)
+
+    LaunchedEffect(driveStatus) {
+        mountedPartitions = app.driveManager.detectAllMountedRemovablePartitions()
+    }
+
+    fun refreshAfterStorageChange() {
+        mountedPartitions = app.driveManager.detectAllMountedRemovablePartitions()
+        val extraSafList = settings.extraMediaSafUris
+            .lines()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+        scope.launch {
+            app.driveManager.refreshStatus(settings.deckDriveTreeUri)
+            app.musicRepository.autoImportAndRefresh(
+                deckDriveTreeUri = settings.deckDriveTreeUri,
+                extraSafUris = extraSafList
+            )
+            app.mediaRepository.autoImportAndRefreshVideos(
+                deckDriveTreeUri = settings.deckDriveTreeUri,
+                extraSafUris = extraSafList
+            )
+            app.vaultRepository.autoImportFromConfiguredSources(settings.deckDriveTreeUri)
+        }
+    }
 
     val customWallpaperPaths = remember(settings.customWallpaperPaths) {
         settings.customWallpaperPaths
@@ -278,7 +320,7 @@ fun DesktopLauncherScreen(
     }
 
     val wallpaperPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             scope.launch {
@@ -328,31 +370,31 @@ fun DesktopLauncherScreen(
         }
     }
 
-    // Open Cyber Deck Browser as a floating DeX window on initial start so desktop & controls are visible
+    // Load installed apps cleanly on startup without auto-opening Cyber Deck Browser
     LaunchedEffect(Unit) {
-        if (windows.isEmpty()) {
-            windows += DesktopWindowState(
-                id = "main_browser",
-                kind = DesktopWindowKind.BROWSER,
-                title = "Cyber Deck Browser",
-                isMaximized = false,
-                xDp = 130f,
-                yDp = 24f,
-                widthDp = 720f,
-                heightDp = 440f,
-                zIndex = ++topZ
-            )
-        }
         installedApps = DesktopLauncherManager.loadInstalledApps(context)
     }
 
-    // Refresh permissions & installed apps on resume
+    // Check online status every 10 minutes and blink indicator for 10 seconds
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(600_000L)
+            app.networkMonitor.refresh()
+            isBlinkingNetIndicator = true
+            delay(10_000L)
+            isBlinkingNetIndicator = false
+        }
+    }
+
+    // Refresh permissions, storage partitions, navigation mode & installed apps on resume
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 permStatus = DesktopLauncherManager.inspectPermissions(context)
                 batteryStatus = DesktopLauncherManager.readBatteryStatus(context)
                 systemUsage = DesktopLauncherManager.readSystemUsage(context)
+                mountedPartitions = app.driveManager.detectAllMountedRemovablePartitions()
+                isGestureNavEnabled = DesktopLauncherManager.isGestureNavigationEnabled(context)
                 scope.launch {
                     installedApps = DesktopLauncherManager.loadInstalledApps(context)
                 }
@@ -624,12 +666,36 @@ fun DesktopLauncherScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "CYBER DECK DESKTOP",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = if (isLightDesktop) Color(0xFF0E7490) else MaterialTheme.colorScheme.primary.copy(alpha = 0.9f),
-                            fontFamily = FontFamily.Monospace
+                        val infiniteTransition = rememberInfiniteTransition(label = "net_indicator_blink")
+                        val blinkAlpha by infiniteTransition.animateFloat(
+                            initialValue = 1f,
+                            targetValue = 0.2f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(durationMillis = 450),
+                                repeatMode = RepeatMode.Reverse
+                            ),
+                            label = "net_blink_alpha"
                         )
+                        val dotAlpha = if (isBlinkingNetIndicator) blinkAlpha else 1f
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        (if (isOnline) DeckGreen else Color(0xFFEF4444)).copy(alpha = dotAlpha)
+                                    )
+                            )
+                            Text(
+                                text = "CYBER DECK DESKTOP",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (isLightDesktop) Color(0xFF0E7490) else MaterialTheme.colorScheme.primary.copy(alpha = 0.9f),
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
 
                         // Live RAM, CPU & Temp Usage Pill -> opens Windows-style Task Manager
                         val tempSuffix = systemUsage.cpuTempC?.let {
@@ -995,6 +1061,21 @@ fun DesktopLauncherScreen(
                                             DesktopWindowKind.FILES -> {
                                                 FileManagerScreen(
                                                     app = app,
+                                                    onOpenZimPathOrUri = { ref ->
+                                                        scope.launch {
+                                                            app.vaultRepository.importOrFindZim(ref)
+                                                                .onSuccess { item ->
+                                                                    openOrFocusWindow(
+                                                                        DesktopWindowKind.ZIM_READER,
+                                                                        item.id,
+                                                                        item.title
+                                                                    )
+                                                                }
+                                                                .onFailure { err ->
+                                                                    onShowMessage("Gagal membuka ZIM: ${err.message}")
+                                                                }
+                                                        }
+                                                    },
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
@@ -1800,6 +1881,213 @@ fun DesktopLauncherScreen(
                                     }
                                 }
 
+                                TaskbarTrayPopup.STORAGE -> {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Usb, contentDescription = null, tint = DeckGreen)
+                                            Text("Penyimpanan Eksternal & SSD", style = MaterialTheme.typography.titleMedium)
+                                        }
+                                        IconButton(
+                                            onClick = { activeTrayPopup = null },
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Close, contentDescription = "Tutup", modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+
+                                    val activeParts = mountedPartitions.filter { !it.isEjectedInSession }
+                                    if (mountedPartitions.isEmpty() && !driveStatus.isConnected) {
+                                        Text(
+                                            "Tidak ada SSD / Flashdisk / Kartu SD eksternal terpasang saat ini.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    } else {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(max = 260.dp)
+                                                .verticalScroll(rememberScrollState()),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            mountedPartitions.forEachIndexed { idx, part ->
+                                                Card(
+                                                    colors = CardDefaults.cardColors(
+                                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                                                    ),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(10.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Filled.Storage,
+                                                            contentDescription = null,
+                                                            tint = if (part.isEjectedInSession) DeckAmber else DeckGreen,
+                                                            modifier = Modifier.size(20.dp)
+                                                        )
+                                                        Column(modifier = Modifier.weight(1f)) {
+                                                            Text(
+                                                                text = "Partisi #${idx + 1}: ${part.label}",
+                                                                style = MaterialTheme.typography.labelLarge,
+                                                                maxLines = 1,
+                                                                overflow = TextOverflow.Ellipsis
+                                                            )
+                                                            Text(
+                                                                text = if (part.isEjectedInSession) "Sudah di-Eject (Lepas aman)"
+                                                                else part.mountPath ?: part.id,
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                                maxLines = 1,
+                                                                overflow = TextOverflow.Ellipsis
+                                                            )
+                                                        }
+                                                        if (!part.isEjectedInSession) {
+                                                            OutlinedButton(
+                                                                onClick = {
+                                                                    scope.launch {
+                                                                        val (safDetached, msg) = app.driveManager.ejectExternalPartition(
+                                                                            part,
+                                                                            settings.deckDriveTreeUri
+                                                                        )
+                                                                        if (safDetached) {
+                                                                            app.settingsRepository.updateSettings {
+                                                                                it.copy(
+                                                                                    deckDriveTreeUri = null,
+                                                                                    deckDriveLabel = "Not connected",
+                                                                                    archiveStorageTarget = StorageTarget.INTERNAL,
+                                                                                    downloadStorageTarget = StorageTarget.INTERNAL
+                                                                                )
+                                                                            }
+                                                                        }
+                                                                        refreshAfterStorageChange()
+                                                                        onShowMessage(msg)
+                                                                    }
+                                                                }
+                                                            ) {
+                                                                Icon(Icons.Filled.Eject, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                                Spacer(Modifier.width(4.dp))
+                                                                Text("Eject")
+                                                            }
+                                                        } else {
+                                                            TextButton(
+                                                                onClick = {
+                                                                    app.driveManager.remountVolumeInApp(part.id)
+                                                                    refreshAfterStorageChange()
+                                                                    onShowMessage("${part.label} diaktifkan kembali.")
+                                                                }
+                                                            ) {
+                                                                Text("Pasang Lagi")
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            if (driveStatus.isConnected) {
+                                                Card(
+                                                    colors = CardDefaults.cardColors(
+                                                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+                                                    ),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(10.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                                    ) {
+                                                        Column(modifier = Modifier.weight(1f)) {
+                                                            Text(
+                                                                "Deck Drive SAF: ${driveStatus.displayName}",
+                                                                style = MaterialTheme.typography.labelLarge,
+                                                                maxLines = 1,
+                                                                overflow = TextOverflow.Ellipsis
+                                                            )
+                                                            Text(
+                                                                if (driveStatus.totalBytes > 0) "Tersedia ${Formatters.formatBytes(driveStatus.freeBytes)}" else "Terhubung",
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                            )
+                                                        }
+                                                        OutlinedButton(
+                                                            onClick = {
+                                                                scope.launch {
+                                                                    app.driveManager.detachDeckDrive(settings.deckDriveTreeUri)
+                                                                    app.settingsRepository.updateSettings {
+                                                                        it.copy(
+                                                                            deckDriveTreeUri = null,
+                                                                            deckDriveLabel = "Not connected",
+                                                                            archiveStorageTarget = StorageTarget.INTERNAL,
+                                                                            downloadStorageTarget = StorageTarget.INTERNAL
+                                                                        )
+                                                                    }
+                                                                    refreshAfterStorageChange()
+                                                                    onShowMessage("Deck Drive SAF dilepas.")
+                                                                }
+                                                            }
+                                                        ) {
+                                                            Text("Lepas SAF")
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (activeParts.size > 1) {
+                                        Button(
+                                            onClick = {
+                                                scope.launch {
+                                                    var safCleared = false
+                                                    activeParts.forEach { p ->
+                                                        val (detached, _) = app.driveManager.ejectExternalPartition(
+                                                            p,
+                                                            settings.deckDriveTreeUri
+                                                        )
+                                                        if (detached) safCleared = true
+                                                    }
+                                                    if (safCleared) {
+                                                        app.settingsRepository.updateSettings {
+                                                            it.copy(
+                                                                deckDriveTreeUri = null,
+                                                                deckDriveLabel = "Not connected",
+                                                                archiveStorageTarget = StorageTarget.INTERNAL,
+                                                                downloadStorageTarget = StorageTarget.INTERNAL
+                                                            )
+                                                        }
+                                                    }
+                                                    refreshAfterStorageChange()
+                                                    onShowMessage("${activeParts.size} partisi eksternal berhasil di-eject.")
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Icon(Icons.Filled.Eject, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text("Eject Semua Partisi (${activeParts.size})")
+                                        }
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            activeTrayPopup = null
+                                            onShowMessage(app.driveManager.openAndroidStorageSettings())
+                                        },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("Setelan Storage Android (Unmount Fisik)")
+                                    }
+                                }
+
                                 null -> Unit
                             }
                         }
@@ -1933,6 +2221,42 @@ fun DesktopLauncherScreen(
                         )
                     }
                 }
+            }
+
+            // MINIMIZABLE FLOATING NAVIGATION OVERLAY (Hidden automatically when Gesture Nav is active)
+            if (!isGestureNavEnabled) {
+                FloatingNavigationOverlay(
+                    onBack = {
+                        when {
+                            activeTrayPopup != null -> activeTrayPopup = null
+                            notifPanelOpen -> notifPanelOpen = false
+                            appDrawerOpen -> appDrawerOpen = false
+                            else -> {
+                                val topWin = windows.filter { !it.isMinimized }.maxByOrNull { it.zIndex }
+                                if (topWin != null) {
+                                    toggleMinimize(topWin.id)
+                                }
+                            }
+                        }
+                    },
+                    onHome = {
+                        activeTrayPopup = null
+                        notifPanelOpen = false
+                        appDrawerOpen = false
+                        minimizeAllWindows()
+                    },
+                    onRecentsOrDrawer = {
+                        activeTrayPopup = null
+                        notifPanelOpen = false
+                        appDrawerOpen = !appDrawerOpen
+                    },
+                    onOpenNavSettings = {
+                        onShowMessage(DesktopLauncherManager.openSystemNavigationSettings(context))
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .zIndex(9996f)
+                )
             }
         }
 
@@ -2195,6 +2519,45 @@ fun DesktopLauncherScreen(
                             }
                         }
 
+                        // SSD / External Partition Eject Tray
+                        val activePartitionCount = mountedPartitions.count { !it.isEjectedInSession }
+                        if (mountedPartitions.isNotEmpty() || driveStatus.isConnected) {
+                            Surface(
+                                color = if (activeTrayPopup == TaskbarTrayPopup.STORAGE) {
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                                },
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.clickable {
+                                    appDrawerOpen = false
+                                    notifPanelOpen = false
+                                    activeTrayPopup = if (activeTrayPopup == TaskbarTrayPopup.STORAGE) null else TaskbarTrayPopup.STORAGE
+                                }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Usb,
+                                        contentDescription = "Eject SSD / USB",
+                                        tint = if (activePartitionCount > 0 || driveStatus.isConnected) DeckGreen else DeckAmber,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Text(
+                                        text = if (mountedPartitions.size > 1) "SSD (${activePartitionCount}/${mountedPartitions.size})"
+                                        else if (activePartitionCount > 0) "SSD"
+                                        else "SAF",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = if (activePartitionCount > 0 || driveStatus.isConnected) DeckGreen else DeckAmber
+                                    )
+                                }
+                            }
+                        }
+
                         IconButton(
                             onClick = onShowPermissionsDialog,
                             modifier = Modifier.size(28.dp)
@@ -2203,16 +2566,6 @@ fun DesktopLauncherScreen(
                                 Icons.Filled.AdminPanelSettings,
                                 contentDescription = "Izin DeX & Floating",
                                 tint = if (permStatus.allCoreReady) DeckGreen else DeckAmber,
-                                modifier = Modifier.size(17.dp)
-                            )
-                        }
-                        IconButton(
-                            onClick = onSwitchToClassicMode,
-                            modifier = Modifier.size(28.dp)
-                        ) {
-                            Icon(
-                                Icons.Filled.Fullscreen,
-                                contentDescription = "Mode Browser Penuh",
                                 modifier = Modifier.size(17.dp)
                             )
                         }
@@ -2523,7 +2876,7 @@ fun DesktopLauncherScreen(
                                 OutlinedButton(
                                     onClick = {
                                         pendingWallpaperSlot = slot
-                                        wallpaperPicker.launch("image/*")
+                                        wallpaperPicker.launch(arrayOf("image/*"))
                                     }
                                 ) {
                                     Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -2719,6 +3072,12 @@ fun DexPermissionsSetupDialog(
                             ) {
                                 Text("Info App & Baterai", maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
+                        }
+                        OutlinedButton(
+                            onClick = { onShowMessage(DesktopLauncherManager.openSystemNavigationSettings(context)) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Navigasi Sistem (Aktifkan Gesture / Sembunyikan 3 Tombol)", maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
@@ -2937,4 +3296,121 @@ private fun windowIconForKind(kind: DesktopWindowKind): ImageVector = when (kind
     DesktopWindowKind.HISTORY -> Icons.Filled.History
     DesktopWindowKind.SEARCH -> Icons.Filled.Search
     DesktopWindowKind.SETTINGS -> Icons.Filled.Settings
+}
+
+@Composable
+fun FloatingNavigationOverlay(
+    onBack: () -> Unit,
+    onHome: () -> Unit,
+    onRecentsOrDrawer: () -> Unit,
+    onOpenNavSettings: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val prefs = remember(context) {
+        context.getSharedPreferences("cyberdeck_ui_prefs", Context.MODE_PRIVATE)
+    }
+    var isMinimized by remember {
+        mutableStateOf(prefs.getBoolean("floating_nav_minimized", false))
+    }
+    var offsetX by remember { mutableFloatStateOf(-16f) }
+    var offsetY by remember { mutableFloatStateOf(-16f) }
+
+    fun setMinimizedState(min: Boolean) {
+        isMinimized = min
+        prefs.edit().putBoolean("floating_nav_minimized", min).apply()
+    }
+
+    Box(
+        modifier = modifier
+            .offset { IntOffset(offsetX.roundToInt(), offsetY.roundToInt()) }
+            .pointerInput(Unit) {
+                detectDragGestures { change, dragAmount ->
+                    change.consume()
+                    offsetX += dragAmount.x
+                    offsetY += dragAmount.y
+                }
+            }
+    ) {
+        if (isMinimized) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)),
+                shadowElevation = 10.dp,
+                modifier = Modifier.clickable { setMinimizedState(false) }
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.OpenWith,
+                        contentDescription = "Buka Navigasi Floating",
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "Nav",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        } else {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)),
+                shadowElevation = 12.dp
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back", modifier = Modifier.size(18.dp))
+                    }
+                    IconButton(
+                        onClick = onHome,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Icon(Icons.Filled.Home, contentDescription = "Home", modifier = Modifier.size(18.dp))
+                    }
+                    IconButton(
+                        onClick = onRecentsOrDrawer,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Icon(Icons.Filled.Apps, contentDescription = "Apps / Recents", modifier = Modifier.size(18.dp))
+                    }
+                    IconButton(
+                        onClick = onOpenNavSettings,
+                        modifier = Modifier.size(34.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Tune,
+                            contentDescription = "Pengaturan Navigasi",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = { setMinimizedState(true) },
+                        modifier = Modifier.size(30.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.KeyboardArrowRight,
+                            contentDescription = "Minimize Navigasi",
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
 }

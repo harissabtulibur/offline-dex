@@ -261,6 +261,26 @@ object DesktopLauncherManager {
         )
     }
 
+    fun isGestureNavigationEnabled(context: Context): Boolean {
+        return runCatching {
+            Settings.Secure.getInt(context.contentResolver, "navigation_mode", 0) == 2
+        }.getOrDefault(false)
+    }
+
+    fun openSystemNavigationSettings(context: Context): String {
+        val candidates = listOf(
+            Intent().setClassName("com.android.settings", "com.android.settings.Settings\$NavigationBarSettingsActivity"),
+            Intent("com.android.settings.SEARCH_RESULT_TRAMPOLINE").putExtra(":settings:fragment_args_key", "gesture_system_navigation"),
+            Intent(Settings.ACTION_DISPLAY_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        return launchFirstWorkingSettings(
+            context,
+            candidates,
+            "Buka Navigasi Sistem (Display → Navigation Bar) untuk beralih ke Gesture Navigation agar tombol bawah Android tersembunyi"
+        )
+    }
+
     private fun launchFirstWorkingSettings(
         context: Context,
         candidates: List<Intent>,

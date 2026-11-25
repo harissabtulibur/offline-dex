@@ -96,8 +96,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.offlinecyberdeck.CyberDeckApplication
@@ -170,7 +174,15 @@ fun MusicPlayerScreen(
     var showSpeedMenu by remember { mutableStateOf(false) }
 
     val exoPlayer = remember {
-        ExoPlayer.Builder(context).build()
+        ExoPlayer.Builder(context)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                true
+            )
+            .build()
     }
 
     val currentTrack = queue.getOrNull(currentIndex)
@@ -180,15 +192,21 @@ fun MusicPlayerScreen(
         if (list.isEmpty() || startIdx !in list.indices) return
         val target = list[startIdx]
         if (!app.musicRepository.isTrackAccessible(target)) {
-            onShowMessage("File audio '${target.fileName}' tidak dapat diakses. Hubungkan SD/USB atau refresh import.")
+            onShowMessage("File audio '${target.fileName}' tidak dapat diakses. Hubungkan SD/USB atau tekan Refresh Import.")
             return
         }
         queue = list
         currentIndex = startIdx
-        val playUri = if (target.fileUri.startsWith("content://") || target.fileUri.startsWith("file://")) {
-            Uri.parse(target.fileUri)
-        } else {
-            Uri.fromFile(File(target.fileUri))
+        val playUri = when {
+            target.fileUri.startsWith("content://") || target.fileUri.startsWith("file://") -> {
+                Uri.parse(target.fileUri)
+            }
+            else -> {
+                val f = File(target.fileUri)
+                runCatching {
+                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
+                }.getOrElse { Uri.fromFile(f) }
+            }
         }
         exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
         exoPlayer.prepare()
@@ -275,6 +293,20 @@ fun MusicPlayerScreen(
                     durationMs = exoPlayer.duration.coerceAtLeast(0L)
                 } else if (playbackState == Player.STATE_ENDED) {
                     playNextTrack(autoTriggered = true)
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                val track = queue.getOrNull(currentIndex)
+                val fallbackUri = if (track != null && !track.fileUri.startsWith("content://")) {
+                    Uri.fromFile(File(track.fileUri))
+                } else null
+                if (fallbackUri != null && exoPlayer.currentMediaItem?.localConfiguration?.uri != fallbackUri) {
+                    exoPlayer.setMediaItem(MediaItem.fromUri(fallbackUri))
+                    exoPlayer.prepare()
+                    exoPlayer.playWhenReady = true
+                } else {
+                    onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
                 }
             }
         }
