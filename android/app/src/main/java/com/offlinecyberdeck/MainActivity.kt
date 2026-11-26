@@ -137,7 +137,7 @@ private sealed interface OverlayReader {
 class MainActivity : ComponentActivity() {
 
     private var pendingExternalUrl by mutableStateOf<String?>(null)
-    private var hardwareEscapeHandler: (() -> Unit)? = null
+    private var hardwareTabTerminalHandler: (() -> Unit)? = null
     private var hardwareBackspaceHandler: (() -> Boolean)? = null
     private var isComposeTextInputFocused: Boolean = false
 
@@ -149,10 +149,13 @@ class MainActivity : ComponentActivity() {
         val fromPhysicalKeyboard = event.device?.let { !it.isVirtual } != false
         if (fromPhysicalKeyboard && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             when (event.keyCode) {
-                KeyEvent.KEYCODE_ESCAPE -> {
-                    hardwareEscapeHandler?.let { handler ->
-                        handler.invoke()
-                        return true
+                KeyEvent.KEYCODE_TAB -> {
+                    val hasModifiers = event.isAltPressed || event.isCtrlPressed || event.isMetaPressed || event.isShiftPressed
+                    if (!hasModifiers) {
+                        hardwareTabTerminalHandler?.let { handler ->
+                            handler.invoke()
+                            return true
+                        }
                     }
                 }
                 KeyEvent.KEYCODE_DEL -> {
@@ -226,7 +229,7 @@ class MainActivity : ComponentActivity() {
                         app = app,
                         browserViewModel = browserVm,
                         settings = settings,
-                        onRegisterEscapeHandler = { hardwareEscapeHandler = it },
+                        onRegisterTerminalTabHandler = { hardwareTabTerminalHandler = it },
                         onRegisterBackspaceHandler = { hardwareBackspaceHandler = it },
                         onTextInputFocusChanged = { isComposeTextInputFocused = it }
                     )
@@ -314,7 +317,7 @@ private fun CyberDeckRootShell(
     app: CyberDeckApplication,
     browserViewModel: BrowserViewModel,
     settings: AppSettingsEntity,
-    onRegisterEscapeHandler: ((() -> Unit)?) -> Unit,
+    onRegisterTerminalTabHandler: ((() -> Unit)?) -> Unit,
     onRegisterBackspaceHandler: ((() -> Boolean)?) -> Unit,
     onTextInputFocusChanged: (Boolean) -> Unit
 ) {
@@ -617,7 +620,7 @@ private fun CyberDeckRootShell(
                     settings = settings,
                     onShowPermissionsDialog = { showDexPermissionsDialog = true },
                     onShowMessage = showMessage,
-                    onRegisterToggleTerminal = { handler -> onRegisterEscapeHandler(handler) },
+                    onRegisterToggleTerminal = { handler -> onRegisterTerminalTabHandler(handler) },
                     onRegisterActiveBackHandler = { handler -> onRegisterBackspaceHandler(handler) },
                     onTextInputFocusChanged = onTextInputFocusChanged
                 )
@@ -792,6 +795,7 @@ private fun CyberDeckRootShell(
                                 onOpenMediaItem = { id -> overlay = OverlayReader.MediaPlayer(id) },
                                 onOpenUrl = { url -> openUrlInBrowser(url, false) },
                                 onOpenFileExplorer = { currentDest = MainDestination.FILES },
+                                onTextInputFocusChanged = onTextInputFocusChanged,
                                 onShowMessage = showMessage
                             )
                         }

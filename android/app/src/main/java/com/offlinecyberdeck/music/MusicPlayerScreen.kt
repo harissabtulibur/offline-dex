@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
@@ -103,6 +104,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -144,6 +149,7 @@ fun MusicPlayerScreen(
     onShowMessage: (String) -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val tracks by app.musicRepository.tracksFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val settings by app.settingsRepository.settingsFlow.collectAsStateWithLifecycle(initialValue = AppSettingsEntity())
@@ -160,12 +166,14 @@ fun MusicPlayerScreen(
             ContextCompat.checkSelfPermission(context, requiredAudioPerm) == PackageManager.PERMISSION_GRANTED
         )
     }
-    val hasAllFilesAccess = remember(tracks, driveStatus) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+    var hasAllFilesAccess by remember {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+        )
     }
 
     var accessibleIds by remember { mutableStateOf<Set<String>>(emptySet()) }
-    LaunchedEffect(tracks, driveStatus, settings.extraMediaSafUris, hasAudioPermission) {
+    LaunchedEffect(tracks, driveStatus, settings.extraMediaSafUris, hasAudioPermission, hasAllFilesAccess) {
         accessibleIds = withContext(Dispatchers.IO) {
             tracks.filter { app.musicRepository.isTrackAccessible(it) }
                 .mapTo(HashSet()) { it.id }
@@ -183,6 +191,7 @@ fun MusicPlayerScreen(
     var isRefreshing by remember { mutableStateOf(false) }
     var autoImportedOnce by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showNowPlayingPopup by remember { mutableStateOf(false) }
     var fullPlayerExpanded by remember { mutableStateOf(false) }
 
     var queue by remember { mutableStateOf<List<MusicTrackEntity>>(emptyList()) }
@@ -194,6 +203,8 @@ fun MusicPlayerScreen(
     var repeatMode by remember { mutableStateOf(MusicRepeatMode.ALL) }
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
     var showSpeedMenu by remember { mutableStateOf(false) }
+    var playRequestToken by remember { mutableLongStateOf(0L) }
+    var cacheFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
 
     val exoPlayer = remember {
         ExoPlayer.Builder(context)
@@ -210,29 +221,38 @@ fun MusicPlayerScreen(
     val currentTrack = queue.getOrNull(currentIndex)
         ?.let { cur -> tracks.firstOrNull { it.id == cur.id } ?: cur }
 
-    fun playFromList(list: List<MusicTrackEntity>, startIdx: Int) {
+    fun playFromList(list: List<MusicTrackEntity>, startIdx: Int, openPopup: Boolean = true) {
         if (list.isEmpty() || startIdx !in list.indices) return
         val target = list[startIdx]
-        if (!app.musicRepository.isTrackAccessible(target)) {
-            onShowMessage("File audio '${target.fileName}' tidak dapat diakses. Hubungkan SD/USB atau tekan Refresh Import.")
-            return
-        }
         queue = list
         currentIndex = startIdx
-        val playUri = when {
-            target.fileUri.startsWith("content://") || target.fileUri.startsWith("file://") -> {
-                Uri.parse(target.fileUri)
-            }
-            else -> {
-                // Direct File URI inside ExoPlayer works reliably across internal & removable SD Card volumes
-                Uri.fromFile(File(target.fileUri))
+        positionMs = 0L
+        durationMs = target.durationMs.coerceAtLeast(0L)
+        cacheFallbackTriedTrackId = null
+        if (openPopup) {
+            showNowPlayingPopup = true
+        }
+        val token = ++playRequestToken
+        val extraSaf = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
+
+        scope.launch {
+            val resolvedRes = app.musicRepository.resolvePlayableUri(
+                track = target,
+                deckDriveTreeUri = settings.deckDriveTreeUri,
+                extraSafUris = extraSaf
+            )
+            if (token != playRequestToken) return@launch
+
+            resolvedRes.onSuccess { playUri ->
+                exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
+                exoPlayer.prepare()
+                exoPlayer.setPlaybackSpeed(playbackSpeed)
+                exoPlayer.playWhenReady = true
+                app.musicRepository.recordPlay(target)
+            }.onFailure { err ->
+                onShowMessage(err.message ?: "Gagal memutar '${target.title}'. Coba Refresh Import.")
             }
         }
-        exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
-        exoPlayer.prepare()
-        exoPlayer.setPlaybackSpeed(playbackSpeed)
-        exoPlayer.playWhenReady = true
-        scope.launch { app.musicRepository.recordPlay(target) }
     }
 
     fun playNextTrack(autoTriggered: Boolean) {
@@ -252,7 +272,7 @@ fun MusicPlayerScreen(
             else -1
         }
         if (nextIdx in queue.indices) {
-            playFromList(queue, nextIdx)
+            playFromList(queue, nextIdx, openPopup = false)
         } else {
             exoPlayer.pause()
         }
@@ -265,7 +285,7 @@ fun MusicPlayerScreen(
             return
         }
         val prevIdx = if (currentIndex - 1 >= 0) currentIndex - 1 else queue.lastIndex
-        playFromList(queue, prevIdx)
+        playFromList(queue, prevIdx, openPopup = false)
     }
 
     fun runRefreshImport(manual: Boolean) {
@@ -293,6 +313,22 @@ fun MusicPlayerScreen(
                 }
             isRefreshing = false
         }
+    }
+
+    DisposableEffect(lifecycleOwner, requiredAudioPerm) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val prevAudio = hasAudioPermission
+                val prevAllFiles = hasAllFilesAccess
+                hasAudioPermission = ContextCompat.checkSelfPermission(context, requiredAudioPerm) == PackageManager.PERMISSION_GRANTED
+                hasAllFilesAccess = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+                if ((!prevAudio && hasAudioPermission) || (!prevAllFiles && hasAllFilesAccess)) {
+                    runRefreshImport(manual = false)
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val audioPermLauncher = rememberLauncherForActivityResult(
@@ -329,13 +365,31 @@ fun MusicPlayerScreen(
 
             override fun onPlayerError(error: PlaybackException) {
                 val track = queue.getOrNull(currentIndex)
-                val fallbackUri = if (track != null && !track.fileUri.startsWith("content://")) {
-                    Uri.fromFile(File(track.fileUri))
-                } else null
-                if (fallbackUri != null && exoPlayer.currentMediaItem?.localConfiguration?.uri != fallbackUri) {
-                    exoPlayer.setMediaItem(MediaItem.fromUri(fallbackUri))
-                    exoPlayer.prepare()
-                    exoPlayer.playWhenReady = true
+                val failedUri = exoPlayer.currentMediaItem?.localConfiguration?.uri
+                if (track != null && failedUri != null && cacheFallbackTriedTrackId != track.id) {
+                    cacheFallbackTriedTrackId = track.id
+                    scope.launch {
+                        val cachedUri = if (failedUri.scheme == "content") {
+                            app.musicRepository.cacheContentUriForPlayback(track, failedUri)
+                        } else null
+                        val retryUri = cachedUri ?: app.musicRepository.resolvePlayableUri(
+                            track = track,
+                            deckDriveTreeUri = settings.deckDriveTreeUri,
+                            extraSafUris = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                        ).getOrNull()?.let { resolved ->
+                            if (resolved.scheme == "content") {
+                                app.musicRepository.cacheContentUriForPlayback(track, resolved) ?: resolved
+                            } else resolved
+                        }
+                        if (retryUri != null && retryUri != failedUri) {
+                            exoPlayer.setMediaItem(MediaItem.fromUri(retryUri))
+                            exoPlayer.prepare()
+                            exoPlayer.setPlaybackSpeed(playbackSpeed)
+                            exoPlayer.playWhenReady = true
+                        } else {
+                            onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                        }
+                    }
                 } else {
                     onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
                 }
@@ -357,8 +411,12 @@ fun MusicPlayerScreen(
         }
     }
 
-    BackHandler(enabled = fullPlayerExpanded) {
-        fullPlayerExpanded = false
+    BackHandler(enabled = fullPlayerExpanded || showNowPlayingPopup) {
+        if (fullPlayerExpanded) {
+            fullPlayerExpanded = false
+        } else {
+            showNowPlayingPopup = false
+        }
     }
 
     val audioFilePicker = rememberLauncherForActivityResult(
@@ -449,6 +507,7 @@ fun MusicPlayerScreen(
         return
     }
 
+    Box(modifier = Modifier.fillMaxSize().background(YtmBg)) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -904,46 +963,46 @@ fun MusicPlayerScreen(
             }
         }
 
-        // YouTube Music-style Persistent Mini Player Bar
+        // YouTube Music-style Persistent Mini Player Bar (with Song Title, Navigator & Seek Progress)
         if (currentTrack != null) {
             HorizontalDivider(color = Color(0xFF282832))
             Surface(
                 color = YtmSurface,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { fullPlayerExpanded = true }
+                    .clickable { showNowPlayingPopup = true }
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
                     val dur = (if (durationMs > 0L) durationMs else currentTrack.durationMs).coerceAtLeast(1L)
-                    val prog = (positionMs.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
-                    Box(
+                    val safePos = positionMs.coerceIn(0L, dur)
+                    Slider(
+                        value = safePos.toFloat() / dur.toFloat(),
+                        onValueChange = { frac -> exoPlayer.seekTo((frac * dur).toLong()) },
+                        colors = SliderDefaults.colors(
+                            thumbColor = Color.White,
+                            activeTrackColor = YtmRed,
+                            inactiveTrackColor = Color(0xFF2B2B36)
+                        ),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(2.dp)
-                            .background(Color(0xFF2B2B36))
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth(prog)
-                                .height(2.dp)
-                                .background(YtmRed)
-                        )
-                    }
+                            .height(22.dp)
+                            .padding(horizontal = 8.dp)
+                    )
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                            .padding(start = 12.dp, end = 8.dp, bottom = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(44.dp)
+                                .size(40.dp)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(Brush.linearGradient(listOf(YtmRed.copy(alpha = 0.7f), Color(0xFF282836)))),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.GraphicEq, contentDescription = null, tint = Color.White)
+                            Icon(Icons.Filled.GraphicEq, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
                         }
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
@@ -955,9 +1014,162 @@ fun MusicPlayerScreen(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                "${currentTrack.artist} • ${currentTrack.volumeLabel}",
+                                "${currentTrack.artist} • ${Formatters.formatDurationMs(safePos)} / ${Formatters.formatDurationMs(dur)}",
                                 color = YtmMuted,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        IconButton(onClick = { scope.launch { app.musicRepository.toggleFavorite(currentTrack) } }, modifier = Modifier.size(34.dp)) {
+                            Icon(
+                                if (currentTrack.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                contentDescription = "Favorit",
+                                tint = if (currentTrack.isFavorite) YtmRed else YtmMuted,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        IconButton(onClick = { playPrevTrack() }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White)
+                        }
+                        IconButton(
+                            onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() },
+                            modifier = Modifier.size(38.dp)
+                        ) {
+                            Icon(
+                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = "Play/Pause",
+                                tint = Color.White,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                        IconButton(onClick = { playNextTrack(autoTriggered = false) }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Floating Now-Playing Popup Overlay (Song Title + Music Navigator + Interactive Progress Bar)
+    if (showNowPlayingPopup && currentTrack != null) {
+        val safeDur = (if (durationMs > 0L) durationMs else currentTrack.durationMs).coerceAtLeast(1L)
+        val safePos = positionMs.coerceIn(0L, safeDur)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(50f)
+                .background(Color.Black.copy(alpha = 0.65f))
+                .clickable { showNowPlayingPopup = false },
+            contentAlignment = Alignment.Center
+        ) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = YtmSurface,
+                border = BorderStroke(1.dp, YtmRed.copy(alpha = 0.55f)),
+                shadowElevation = 18.dp,
+                modifier = Modifier
+                    .fillMaxWidth(0.92f)
+                    .padding(16.dp)
+                    .clickable(enabled = false) {}
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "SEDANG DIPUTAR • ${currentTrack.volumeLabel}",
+                            color = YtmRed,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box {
+                                TextButton(onClick = { showSpeedMenu = !showSpeedMenu }) {
+                                    Icon(Icons.Filled.Speed, contentDescription = null, tint = YtmInk, modifier = Modifier.size(15.dp))
+                                    Spacer(Modifier.width(3.dp))
+                                    Text("${playbackSpeed}x", color = YtmInk, fontSize = 12.sp)
+                                }
+                                DropdownMenu(expanded = showSpeedMenu, onDismissRequest = { showSpeedMenu = false }) {
+                                    listOf(0.75f, 1.0f, 1.15f, 1.25f, 1.5f).forEach { sp ->
+                                        DropdownMenuItem(
+                                            text = { Text("${sp}x") },
+                                            onClick = {
+                                                playbackSpeed = sp
+                                                exoPlayer.setPlaybackSpeed(sp)
+                                                showSpeedMenu = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            IconButton(
+                                onClick = {
+                                    showNowPlayingPopup = false
+                                    fullPlayerExpanded = true
+                                },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Filled.OpenInFull, contentDescription = "Layar Penuh", tint = YtmMuted, modifier = Modifier.size(16.dp))
+                            }
+                            IconButton(
+                                onClick = { showNowPlayingPopup = false },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(Icons.Filled.Close, contentDescription = "Tutup Popup", tint = YtmInk, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(68.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(
+                                    Brush.linearGradient(
+                                        listOf(YtmRed.copy(alpha = 0.85f), Color(0xFF28193B))
+                                    )
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                if (isPlaying) Icons.Filled.GraphicEq else Icons.Filled.MusicNote,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(34.dp)
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text(
+                                text = currentTrack.title,
+                                color = YtmInk,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 18.sp,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "${currentTrack.artist} • ${currentTrack.album}",
+                                color = YtmMuted,
+                                fontSize = 13.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = currentTrack.fileName,
+                                color = YtmMuted.copy(alpha = 0.7f),
+                                fontSize = 11.sp,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
@@ -966,24 +1178,86 @@ fun MusicPlayerScreen(
                             Icon(
                                 if (currentTrack.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                                 contentDescription = "Favorit",
-                                tint = if (currentTrack.isFavorite) YtmRed else YtmMuted
+                                tint = if (currentTrack.isFavorite) YtmRed else YtmInk
                             )
                         }
-                        IconButton(onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() }) {
+                    }
+
+                    // Progress Bar & Timestamps
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Slider(
+                            value = safePos.toFloat() / safeDur.toFloat(),
+                            onValueChange = { frac -> exoPlayer.seekTo((frac * safeDur).toLong()) },
+                            colors = SliderDefaults.colors(
+                                thumbColor = Color.White,
+                                activeTrackColor = YtmRed,
+                                inactiveTrackColor = Color(0xFF3A3A48)
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(Formatters.formatDurationMs(safePos), color = YtmMuted, fontSize = 12.sp)
+                            Text(Formatters.formatDurationMs(safeDur), color = YtmMuted, fontSize = 12.sp)
+                        }
+                    }
+
+                    // Music Navigator Controls
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        IconButton(onClick = { shuffleEnabled = !shuffleEnabled }) {
+                            Icon(
+                                Icons.Filled.Shuffle,
+                                contentDescription = "Acak",
+                                tint = if (shuffleEnabled) YtmRed else YtmMuted
+                            )
+                        }
+                        IconButton(onClick = { playPrevTrack() }, modifier = Modifier.size(44.dp)) {
+                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White, modifier = Modifier.size(30.dp))
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(56.dp)
+                                .clip(CircleShape)
+                                .background(Color.White)
+                                .clickable {
+                                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
                             Icon(
                                 if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                                 contentDescription = "Play/Pause",
-                                tint = Color.White,
-                                modifier = Modifier.size(28.dp)
+                                tint = Color.Black,
+                                modifier = Modifier.size(32.dp)
                             )
                         }
-                        IconButton(onClick = { playNextTrack(autoTriggered = false) }) {
-                            Icon(Icons.Filled.SkipNext, contentDescription = "Lagu Berikutnya", tint = Color.White)
+                        IconButton(onClick = { playNextTrack(autoTriggered = false) }, modifier = Modifier.size(44.dp)) {
+                            Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White, modifier = Modifier.size(30.dp))
+                        }
+                        IconButton(onClick = {
+                            repeatMode = when (repeatMode) {
+                                MusicRepeatMode.OFF -> MusicRepeatMode.ALL
+                                MusicRepeatMode.ALL -> MusicRepeatMode.ONE
+                                MusicRepeatMode.ONE -> MusicRepeatMode.OFF
+                            }
+                        }) {
+                            Icon(
+                                if (repeatMode == MusicRepeatMode.ONE) Icons.Filled.RepeatOne else Icons.Filled.Repeat,
+                                contentDescription = "Ulangi",
+                                tint = if (repeatMode != MusicRepeatMode.OFF) YtmRed else YtmMuted
+                            )
                         }
                     }
                 }
             }
         }
+    }
     }
 
     if (showSettingsDialog) {

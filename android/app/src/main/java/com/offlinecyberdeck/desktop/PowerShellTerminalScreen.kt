@@ -102,6 +102,7 @@ fun PowerShellTerminalScreen(
     onOpenWindow: (DesktopWindowKind) -> Unit,
     onLaunchPackage: (String) -> Unit,
     onCloseTerminal: () -> Unit,
+    isWindowFocused: Boolean = true,
     onTextInputFocusChanged: (Boolean) -> Unit = {},
     onShowMessage: (String) -> Unit
 ) {
@@ -113,7 +114,7 @@ fun PowerShellTerminalScreen(
     val lines = remember {
         mutableStateListOf(
             TerminalLine(1L, "Windows PowerShell [CyberDeck Edition v1.2]", TerminalTone.INFO),
-            TerminalLine(2L, "Copyright (C) Offline Cyber Deck. Tekan ESC pada keyboard untuk buka/tutup cepat.", TerminalTone.MUTED),
+            TerminalLine(2L, "Copyright (C) Offline Cyber Deck. Tekan TAB pada keyboard untuk buka/tutup cepat.", TerminalTone.MUTED),
             TerminalLine(3L, "Ketik 'help' untuk daftar perintah, shortcut sistem, dan custom command.", TerminalTone.WARN),
             TerminalLine(4L, "")
         )
@@ -162,7 +163,7 @@ fun PowerShellTerminalScreen(
                 appendLine("  ${cmd.command.padEnd(18)} -> ${cmd.label} [${cmd.targetType.label}]", TerminalTone.SUCCESS)
             }
         }
-        appendLine("Lainnya: cls / clear, exit (tutup terminal), ESC (toggle cepat).", TerminalTone.MUTED)
+        appendLine("Lainnya: cls / clear, exit (tutup terminal), TAB (toggle cepat).", TerminalTone.MUTED)
     }
 
     fun executeCommand(rawInput: String) {
@@ -367,8 +368,10 @@ fun PowerShellTerminalScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
-        runCatching { focusRequester.requestFocus() }
+    LaunchedEffect(isWindowFocused) {
+        if (isWindowFocused) {
+            runCatching { focusRequester.requestFocus() }
+        }
     }
 
     DisposableEffect(Unit) {

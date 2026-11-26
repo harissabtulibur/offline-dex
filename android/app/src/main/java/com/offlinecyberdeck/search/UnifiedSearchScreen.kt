@@ -47,6 +47,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -56,6 +57,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
@@ -88,10 +92,13 @@ fun UnifiedSearchScreen(
     onOpenMediaItem: (String) -> Unit,
     onOpenUrl: (String) -> Unit,
     onOpenFileExplorer: (() -> Unit)? = null,
+    isWindowFocused: Boolean = true,
+    onTextInputFocusChanged: (Boolean) -> Unit = {},
     onShowMessage: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
+    val searchFocusRequester = remember { FocusRequester() }
     val recentSearches by app.searchRepository.recentSearchesFlow
         .collectAsStateWithLifecycle(initialValue = emptyList())
     val scope = rememberCoroutineScope()
@@ -102,6 +109,10 @@ fun UnifiedSearchScreen(
     var isSearching by remember { mutableStateOf(false) }
 
     val hasAllFiles = DesktopLauncherManager.hasAllFilesAccess(context)
+
+    DisposableEffect(Unit) {
+        onDispose { onTextInputFocusChanged(false) }
+    }
 
     LaunchedEffect(query, selectedFilter) {
         if (query.isBlank()) {
@@ -128,271 +139,257 @@ fun UnifiedSearchScreen(
         }
     }
 
-    if (query.isBlank()) {
-        // Classic Google Home Initial Screen
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-                .padding(horizontal = 20.dp, vertical = 16.dp)
-        ) {
-            // Top-right quick utility bar (like Google Account / Apps bar)
-            Row(
-                modifier = Modifier.align(Alignment.TopEnd),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (!hasAllFiles) {
-                    OutlinedButton(onClick = {
-                        onShowMessage(DesktopLauncherManager.openAllFilesAccessSettings(context))
-                    }) {
-                        Icon(Icons.Filled.Security, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("Izin Semua File", fontSize = 12.sp)
-                    }
-                }
-                if (onOpenFileExplorer != null) {
-                    TextButton(onClick = onOpenFileExplorer) {
-                        Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("File Explorer")
-                    }
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .widthIn(max = 660.dp)
-                    .fillMaxWidth(),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = googleWordmark,
-                    fontSize = 44.sp,
-                    letterSpacing = (-0.5).sp
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "Telusuri Arsip, Buku, Video, Bookmark, serta File di Internal, SD Card & USB secara Offline",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Spacer(Modifier.height(22.dp))
-
-                // Centered Google-style Pill Search Box
-                Surface(
-                    shape = RoundedCornerShape(28.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    shadowElevation = 4.dp,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)),
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        // Slot 0: Header / Hero area (changes smoothly without unmounting the Search Box below)
+        Surface(color = if (query.isBlank()) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.surface) {
+            if (query.isBlank()) {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(52.dp)
+                        .padding(horizontal = 20.dp, vertical = 14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = 18.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            Icons.Filled.Search,
-                            contentDescription = null,
-                            tint = Color(0xFF4285F4),
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Spacer(Modifier.width(12.dp))
-                        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                            if (query.isEmpty()) {
-                                Text(
-                                    "Ketik nama file, PDF, MP3, MP4, arsip web, atau kata kunci...",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    fontSize = 14.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
-                            BasicTextField(
-                                value = query,
-                                onValueChange = { query = it },
-                                singleLine = true,
-                                textStyle = TextStyle(
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    fontSize = 15.sp
-                                ),
-                                cursorBrush = SolidColor(Color(0xFF4285F4)),
-                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                                keyboardActions = KeyboardActions(onSearch = {
-                                    focusManager.clearFocus()
-                                    scope.launch { app.searchRepository.recordSearch(query) }
-                                }),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(16.dp))
-
-                // Filter scope chips
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SearchScopeTab(
-                        label = "Semua",
-                        selected = selectedFilter == null,
-                        onClick = { selectedFilter = null }
-                    )
-                    SearchResultType.entries.forEach { type ->
-                        SearchScopeTab(
-                            label = type.label,
-                            selected = selectedFilter == type,
-                            onClick = { selectedFilter = type }
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(18.dp))
-
-                if (recentSearches.isNotEmpty()) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            "Pencarian Terakhir",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        TextButton(onClick = { scope.launch { app.searchRepository.clearRecentSearches() } }) {
-                            Text("Hapus", fontSize = 12.sp)
+                        if (!hasAllFiles) {
+                            OutlinedButton(onClick = {
+                                onShowMessage(DesktopLauncherManager.openAllFilesAccessSettings(context))
+                            }) {
+                                Icon(Icons.Filled.Security, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Izin Semua File", fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        if (onOpenFileExplorer != null) {
+                            TextButton(onClick = onOpenFileExplorer) {
+                                Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("File Explorer")
+                            }
                         }
                     }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        recentSearches.take(8).forEach { rec ->
-                            Surface(
-                                shape = RoundedCornerShape(18.dp),
-                                color = MaterialTheme.colorScheme.surfaceVariant,
-                                modifier = Modifier.clickable { query = rec.query }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Filled.History,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(14.dp),
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    Text(rec.query, fontSize = 12.sp)
-                                }
-                            }
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        text = googleWordmark,
+                        fontSize = 42.sp,
+                        letterSpacing = (-0.5).sp
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Telusuri Arsip, Buku, Video, Bookmark, serta File di Internal, SD Card & USB secara Offline",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = googleWordmark,
+                        fontSize = 20.sp,
+                        modifier = Modifier.clickable {
+                            query = ""
+                            if (isWindowFocused) runCatching { searchFocusRequester.requestFocus() }
+                        }
+                    )
+                    if (onOpenFileExplorer != null) {
+                        TextButton(onClick = onOpenFileExplorer) {
+                            Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("File Explorer", fontSize = 12.sp)
                         }
                     }
                 }
             }
         }
-    } else {
-        // Google SERP Results View
-        Column(
+
+        // Slot 1: Persistent Single BasicTextField (NEVER unmounted when typing 1st character!)
+        Box(
             modifier = Modifier
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
+                .fillMaxWidth()
+                .background(if (query.isBlank()) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.surface)
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+            contentAlignment = Alignment.Center
         ) {
-            Surface(color = MaterialTheme.colorScheme.surface) {
-                Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Text(
-                            text = googleWordmark,
-                            fontSize = 20.sp,
-                            modifier = Modifier.clickable { query = "" }
-                        )
-                        Surface(
-                            shape = RoundedCornerShape(24.dp),
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(44.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxSize().padding(horizontal = 14.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    Icons.Filled.Search,
-                                    contentDescription = null,
-                                    tint = Color(0xFF4285F4),
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(8.dp))
-                                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                                    BasicTextField(
-                                        value = query,
-                                        onValueChange = { query = it },
-                                        singleLine = true,
-                                        textStyle = TextStyle(
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            fontSize = 14.sp
-                                        ),
-                                        cursorBrush = SolidColor(Color(0xFF4285F4)),
-                                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                                        keyboardActions = KeyboardActions(onSearch = {
-                                            focusManager.clearFocus()
-                                            scope.launch { app.searchRepository.recordSearch(query) }
-                                        }),
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                }
-                                IconButton(
-                                    onClick = { query = "" },
-                                    modifier = Modifier.size(28.dp)
-                                ) {
-                                    Icon(Icons.Filled.Clear, contentDescription = "Hapus", modifier = Modifier.size(18.dp))
-                                }
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(10.dp))
-
-                    // Google-style horizontal category tabs
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        SearchScopeTab(
-                            label = "Semua",
-                            selected = selectedFilter == null,
-                            onClick = { selectedFilter = null }
-                        )
-                        SearchResultType.entries.forEach { type ->
-                            SearchScopeTab(
-                                label = type.label,
-                                selected = selectedFilter == type,
-                                onClick = { selectedFilter = type }
+            Surface(
+                shape = RoundedCornerShape(26.dp),
+                color = if (query.isBlank()) MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.surfaceVariant,
+                shadowElevation = if (query.isBlank()) 4.dp else 1.dp,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+                modifier = Modifier
+                    .widthIn(max = if (query.isBlank()) 660.dp else 1400.dp)
+                    .fillMaxWidth()
+                    .height(if (query.isBlank()) 52.dp else 46.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        Icons.Filled.Search,
+                        contentDescription = null,
+                        tint = Color(0xFF4285F4),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                        if (query.isEmpty()) {
+                            Text(
+                                "Ketik nama file, PDF, MP3, MP4, arsip web, atau kata kunci...",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 14.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+                        }
+                        BasicTextField(
+                            value = query,
+                            onValueChange = { query = it },
+                            singleLine = true,
+                            textStyle = TextStyle(
+                                color = MaterialTheme.colorScheme.onSurface,
+                                fontSize = 15.sp
+                            ),
+                            cursorBrush = SolidColor(Color(0xFF4285F4)),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                            keyboardActions = KeyboardActions(onSearch = {
+                                focusManager.clearFocus()
+                                scope.launch { app.searchRepository.recordSearch(query) }
+                            }),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(searchFocusRequester)
+                                .onFocusChanged { onTextInputFocusChanged(it.isFocused) }
+                        )
+                    }
+                    if (query.isNotEmpty()) {
+                        IconButton(
+                            onClick = {
+                                query = ""
+                                if (isWindowFocused) runCatching { searchFocusRequester.requestFocus() }
+                            },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.Filled.Clear, contentDescription = "Hapus", modifier = Modifier.size(18.dp))
                         }
                     }
                 }
             }
-            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+        }
 
+        // Slot 2: Scope Filter Chips
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(if (query.isBlank()) MaterialTheme.colorScheme.background else MaterialTheme.colorScheme.surface)
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            contentAlignment = if (query.isBlank()) Alignment.Center else Alignment.CenterStart
+        ) {
+            Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                SearchScopeTab(
+                    label = "Semua",
+                    selected = selectedFilter == null,
+                    onClick = { selectedFilter = null }
+                )
+                SearchResultType.entries.forEach { type ->
+                    SearchScopeTab(
+                        label = type.label,
+                        selected = selectedFilter == type,
+                        onClick = { selectedFilter = type }
+                    )
+                }
+            }
+        }
+
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = if (query.isBlank()) 0.15f else 0.35f))
+
+        // Slot 3: Recent Searches (when blank) or Search Results (when active)
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
+                query.isBlank() -> {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .widthIn(max = 660.dp)
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp, vertical = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (recentSearches.isNotEmpty()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "Pencarian Terakhir",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                TextButton(onClick = { scope.launch { app.searchRepository.clearRecentSearches() } }) {
+                                    Text("Hapus", fontSize = 12.sp)
+                                }
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                recentSearches.take(8).forEach { rec ->
+                                    Surface(
+                                        shape = RoundedCornerShape(18.dp),
+                                        color = MaterialTheme.colorScheme.surfaceVariant,
+                                        modifier = Modifier.clickable {
+                                            query = rec.query
+                                            if (isWindowFocused) runCatching { searchFocusRequester.requestFocus() }
+                                        }
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.History,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(14.dp),
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Text(rec.query, fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            Text(
+                                "Mulai ketik untuk mencari seluruh berkas offline di perangkat Anda.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
                 isSearching -> {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Row(

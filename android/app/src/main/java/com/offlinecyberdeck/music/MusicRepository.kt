@@ -17,6 +17,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
 
@@ -35,8 +37,180 @@ class MusicRepository(
 
     val tracksFlow: Flow<List<MusicTrackEntity>> = musicDao.observeAll()
 
-    fun isTrackAccessible(track: MusicTrackEntity): Boolean =
-        driveManager.isUriOrFileAccessible(track.fileUri)
+    fun isTrackAccessible(track: MusicTrackEntity): Boolean {
+        val ref = track.fileUri
+        if (ref.isBlank()) return false
+        if (ref.startsWith("content://")) {
+            return driveManager.isUriOrFileAccessible(ref) || findMediaStoreUriForTrack(track) != null
+        }
+        val path = if (ref.startsWith("file://")) Uri.parse(ref).path.orEmpty() else ref
+        val file = File(path)
+        return isDirectFileReadable(file) || findMediaStoreUriForTrack(track) != null
+    }
+
+    private fun isDirectFileReadable(file: File): Boolean {
+        if (!file.exists() || !file.isFile || !file.canRead()) return false
+        return runCatching {
+            FileInputStream(file).use { fis ->
+                fis.read()
+                true
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun findMediaStoreUriForTrack(track: MusicTrackEntity): Uri? {
+        val candidates = buildList {
+            add(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                runCatching { MediaStore.getExternalVolumeNames(context) }.getOrNull().orEmpty().forEach { vol ->
+                    val volUri = MediaStore.Audio.Media.getContentUri(vol)
+                    if (volUri != MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) add(volUri)
+                }
+            }
+        }
+        val proj = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.SIZE, MediaStore.Audio.Media.DISPLAY_NAME)
+        val sel = "${MediaStore.Audio.Media.DISPLAY_NAME} = ?"
+        val args = arrayOf(track.fileName)
+        for (collection in candidates) {
+            val match = runCatching {
+                context.contentResolver.query(collection, proj, sel, args, null)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
+                    val sizeIdx = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
+                    var fallbackId: Long? = null
+                    while (cursor.moveToNext()) {
+                        if (idIdx < 0) continue
+                        val id = cursor.getLong(idIdx)
+                        val sz = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
+                        if (track.sizeBytes > 0L && sz == track.sizeBytes) {
+                            return@use ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+                                .takeIf { driveManager.isUriOrFileAccessible(it.toString()) }
+                                ?: ContentUris.withAppendedId(collection, id)
+                        }
+                        if (fallbackId == null) fallbackId = id
+                    }
+                    fallbackId?.let { id ->
+                        ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+                            .takeIf { driveManager.isUriOrFileAccessible(it.toString()) }
+                            ?: ContentUris.withAppendedId(collection, id)
+                    }
+                }
+            }.getOrNull()
+            if (match != null && driveManager.isUriOrFileAccessible(match.toString())) {
+                return match
+            }
+        }
+        return null
+    }
+
+    private fun findSafUriInTree(treeUri: Uri, fileName: String, sizeBytes: Long): Uri? {
+        val root = runCatching { DocumentFile.fromTreeUri(context, treeUri) }.getOrNull() ?: return null
+        val queue = ArrayDeque<DocumentFile>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 400) {
+            val dir = queue.removeFirst()
+            visited++
+            val children = runCatching { dir.listFiles() }.getOrNull() ?: continue
+            for (child in children) {
+                val name = child.name ?: continue
+                if (name.startsWith(".")) continue
+                if (child.isDirectory) {
+                    if (name.lowercase(Locale.US) !in setOf("android", "cache", "lost.dir")) {
+                        queue.add(child)
+                    }
+                } else if (child.isFile && name.equals(fileName, ignoreCase = true)) {
+                    if (sizeBytes <= 0L || child.length() == sizeBytes) {
+                        return child.uri
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    suspend fun resolvePlayableUri(
+        track: MusicTrackEntity,
+        deckDriveTreeUri: String?,
+        extraSafUris: List<String>
+    ): Result<Uri> = withContext(Dispatchers.IO) {
+        runCatching {
+            val raw = track.fileUri
+            // Tier 1: Direct readable File path (verified by opening bytes, not just File.canRead())
+            if (!raw.startsWith("content://")) {
+                val path = if (raw.startsWith("file://")) Uri.parse(raw).path.orEmpty() else raw
+                val file = File(path)
+                if (isDirectFileReadable(file)) {
+                    return@runCatching Uri.fromFile(file)
+                }
+            }
+
+            // Tier 2: Existing content:// URI — normalize MediaStore UUID URI to canonical external URI if accessible
+            if (raw.startsWith("content://")) {
+                val parsed = Uri.parse(raw)
+                if (parsed.authority == MediaStore.AUTHORITY) {
+                    val id = runCatching { ContentUris.parseId(parsed) }.getOrDefault(-1L)
+                    if (id > 0L) {
+                        val canonical = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+                        if (driveManager.isUriOrFileAccessible(canonical.toString())) {
+                            if (canonical.toString() != raw) {
+                                musicDao.upsert(track.copy(fileUri = canonical.toString()))
+                            }
+                            return@runCatching canonical
+                        }
+                    }
+                }
+                if (driveManager.isUriOrFileAccessible(raw)) {
+                    return@runCatching parsed
+                }
+            }
+
+            // Tier 3: Re-locate via MediaStore.Audio by filename + size
+            findMediaStoreUriForTrack(track)?.let { resolved ->
+                musicDao.upsert(track.copy(fileUri = resolved.toString()))
+                return@runCatching resolved
+            }
+
+            // Tier 4: Re-locate inside configured SAF trees (SD Card / USB Deck Drive)
+            val trees = (listOfNotNull(deckDriveTreeUri) + extraSafUris)
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+            for (treeStr in trees) {
+                val safUri = findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
+                if (safUri != null && driveManager.isUriOrFileAccessible(safUri.toString())) {
+                    musicDao.upsert(track.copy(fileUri = safUri.toString()))
+                    return@runCatching safUri
+                }
+            }
+
+            error("File audio '${track.fileName}' tidak dapat dibuka. Pastikan izin Audio / Folder SD aktif.")
+        }
+    }
+
+    suspend fun cacheContentUriForPlayback(track: MusicTrackEntity, sourceUri: Uri): Uri? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val cacheDir = File(context.cacheDir, "music_play_cache").apply { mkdirs() }
+                val ext = track.fileName.substringAfterLast('.', "mp3")
+                    .lowercase(Locale.US)
+                    .ifBlank { "mp3" }
+                val outFile = File(cacheDir, "${track.id}.$ext")
+                if (!outFile.exists() || outFile.length() <= 0L) {
+                    // Evict older cached audio files so cache stays tiny (~6 recent tracks max)
+                    val existing = cacheDir.listFiles()?.sortedBy { it.lastModified() }.orEmpty()
+                    if (existing.size >= 6) {
+                        existing.take(existing.size - 5).forEach { runCatching { it.delete() } }
+                    }
+                    context.contentResolver.openInputStream(sourceUri)?.use { input ->
+                        FileOutputStream(outFile).use { output ->
+                            input.copyTo(output, bufferSize = 64 * 1024)
+                            output.flush()
+                        }
+                    } ?: return@runCatching null
+                }
+                if (outFile.exists() && outFile.length() > 0L) Uri.fromFile(outFile) else null
+            }.getOrNull()
+        }
 
     suspend fun toggleFavorite(track: MusicTrackEntity) {
         musicDao.upsert(track.copy(isFavorite = !track.isFavorite))
@@ -145,9 +319,21 @@ class MusicRepository(
         runCatching {
             var removed = 0
             for (track in musicDao.getAllSnapshot()) {
-                if (!driveManager.isUriOrFileAccessible(track.fileUri)) {
-                    musicDao.delete(track)
-                    removed++
+                val raw = track.fileUri
+                val directOk = if (!raw.startsWith("content://")) {
+                    val path = if (raw.startsWith("file://")) Uri.parse(raw).path.orEmpty() else raw
+                    isDirectFileReadable(File(path))
+                } else {
+                    driveManager.isUriOrFileAccessible(raw)
+                }
+                if (!directOk) {
+                    val relinked = findMediaStoreUriForTrack(track)
+                    if (relinked != null) {
+                        musicDao.upsert(track.copy(fileUri = relinked.toString()))
+                    } else {
+                        musicDao.delete(track)
+                        removed++
+                    }
                 }
             }
 
@@ -244,15 +430,17 @@ class MusicRepository(
             add(MediaStore.Audio.Media.DATA)
         }.toTypedArray()
 
-        val targetUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val vols = runCatching { MediaStore.getExternalVolumeNames(context) }.getOrNull().orEmpty()
-            if (vols.isEmpty()) {
-                listOf("external" to MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
-            } else {
-                vols.map { vol -> vol to MediaStore.Audio.Media.getContentUri(vol) }
+        val targetUris = buildList {
+            add("external" to MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val vols = runCatching { MediaStore.getExternalVolumeNames(context) }.getOrNull().orEmpty()
+                for (vol in vols) {
+                    val volUri = MediaStore.Audio.Media.getContentUri(vol)
+                    if (volUri != MediaStore.Audio.Media.EXTERNAL_CONTENT_URI) {
+                        add(vol to volUri)
+                    }
+                }
             }
-        } else {
-            listOf("external" to MediaStore.Audio.Media.EXTERNAL_CONTENT_URI)
         }
 
         for ((volumeTag, collectionUri) in targetUris) {
@@ -294,8 +482,14 @@ class MusicRepository(
                         if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
 
                         val directFile = filePath.takeIf { it.startsWith("/") }?.let { File(it) }
-                        val canUseDirectPath = directFile != null && directFile.exists() && directFile.canRead()
-                        val contentUri = ContentUris.withAppendedId(collectionUri, id)
+                        val canUseDirectPath = directFile != null && isDirectFileReadable(directFile)
+                        val canonicalUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+                        val volumeUri = ContentUris.withAppendedId(collectionUri, id)
+                        val contentUri = if (canonicalUri != volumeUri && driveManager.isUriOrFileAccessible(canonicalUri.toString())) {
+                            canonicalUri
+                        } else {
+                            volumeUri
+                        }
                         val preferredUriStr = if (canUseDirectPath) directFile!!.absolutePath else contentUri.toString()
 
                         val key = dedupKey(fileName, sizeBytes)
@@ -376,9 +570,10 @@ class MusicRepository(
                 } else if (child.isFile) {
                     val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
                     if (ext in audioExtensions) {
-                        val pathStr = child.absolutePath
                         val sizeBytes = child.length().coerceAtLeast(0L)
                         if (sizeBytes in 1..24_000L && ext != "mp3") continue
+                        if (!isDirectFileReadable(child)) continue
+                        val pathStr = child.absolutePath
                         val key = dedupKey(name, sizeBytes)
                         if (seenUris.contains(pathStr) || seenKeys.contains(key)) {
                             onSkipped()

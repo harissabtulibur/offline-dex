@@ -31,8 +31,6 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material3.Button
@@ -46,7 +44,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
@@ -116,7 +113,6 @@ fun TaskManagerScreen(
     var deviceDetails by remember { mutableStateOf(DesktopLauncherManager.readDeviceSystemDetails(context)) }
 
     var processes by remember { mutableStateOf<List<TaskProcessItem>>(emptyList()) }
-    var searchQuery by remember { mutableStateOf("") }
     var onlyActiveOrRecent by remember { mutableStateOf(true) }
     var showSystemProcesses by remember { mutableStateOf(false) }
     var usageStatsGranted by remember { mutableStateOf(DesktopLauncherManager.hasUsageStatsAccess(context)) }
@@ -262,7 +258,7 @@ fun TaskManagerScreen(
 
         when (selectedTab) {
             TaskManagerTab.PROCESSES -> {
-                val filteredProcs = remember(processes, searchQuery, showSystemProcesses, onlyActiveOrRecent) {
+                val filteredProcs = remember(processes, showSystemProcesses, onlyActiveOrRecent) {
                     processes.filter { item ->
                         val activeOrRecentOk = !onlyActiveOrRecent ||
                             item.isCurrentApp ||
@@ -270,11 +266,12 @@ fun TaskManagerScreen(
                             item.isRecentlyOpened ||
                             item.ramPssMb != null
                         val sysOk = showSystemProcesses || !item.isSystemApp || item.isRunningProcess || item.isRecentlyOpened || item.isCurrentApp
-                        val qOk = searchQuery.isBlank() ||
-                            item.label.contains(searchQuery, true) ||
-                            item.packageName.contains(searchQuery, true)
-                        activeOrRecentOk && sysOk && qOk
+                        activeOrRecentOk && sysOk
                     }
+                }
+                val killableRecentPkgs = remember(filteredProcs) {
+                    filteredProcs.filter { !it.isCurrentApp && (it.isRunningProcess || it.isRecentlyOpened) }
+                        .map { it.packageName }
                 }
 
                 Column(
@@ -387,16 +384,8 @@ fun TaskManagerScreen(
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        OutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            singleLine = true,
-                            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                            placeholder = { Text("Cari aplikasi...") },
-                            modifier = Modifier.weight(1f)
-                        )
                         FilterChip(
                             selected = onlyActiveOrRecent,
                             onClick = { onlyActiveOrRecent = !onlyActiveOrRecent },
@@ -407,6 +396,26 @@ fun TaskManagerScreen(
                             onClick = { showSystemProcesses = !showSystemProcesses },
                             label = { Text("Sistem") }
                         )
+                        Spacer(Modifier.weight(1f))
+                        if (killableRecentPkgs.isNotEmpty()) {
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        val msg = DesktopLauncherManager.killAllRecentApps(context, killableRecentPkgs)
+                                        processes = processes.filterNot { it.packageName in killableRecentPkgs }
+                                        sysUsage = DesktopLauncherManager.readSystemUsage(context)
+                                        refreshProcessesNow()
+                                        onShowMessage(msg)
+                                    }
+                                },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = DeckRed),
+                                border = BorderStroke(1.dp, DeckRed.copy(alpha = 0.55f))
+                            ) {
+                                Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(15.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Kill Semua (${killableRecentPkgs.size})", fontSize = 12.sp, maxLines = 1)
+                            }
+                        }
                     }
 
                     // Table header
@@ -419,7 +428,7 @@ fun TaskManagerScreen(
                     ) {
                         Text("Aplikasi (${filteredProcs.size})", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(2f))
                         Text("RAM / Status", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1.2f))
-                        Text("Tutup / Aksi", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.width(114.dp))
+                        Text("Kill Langsung", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.width(96.dp))
                     }
 
                     LazyColumn(
@@ -432,20 +441,17 @@ fun TaskManagerScreen(
                                 onKill = {
                                     DesktopLauncherManager.killAppProcess(context, item.packageName)
                                         .onSuccess { msg ->
+                                            processes = processes.map {
+                                                if (it.packageName == item.packageName) {
+                                                    it.copy(isRunningProcess = false, isRecentlyOpened = false, ramPssMb = null, lastUsedMs = 0L)
+                                                } else it
+                                            }
                                             onShowMessage(msg)
                                             scope.launch { refreshProcessesNow() }
                                         }
                                         .onFailure { err ->
-                                            onShowMessage(err.message ?: "Gagal menghentikan proses")
+                                            onShowMessage(err.message ?: "Gagal meng-kill proses")
                                         }
-                                },
-                                onAppInfo = {
-                                    val pmIntent = android.content.Intent(
-                                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                        android.net.Uri.parse("package:${item.packageName}")
-                                    ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                                    runCatching { context.startActivity(pmIntent) }
-                                        .onSuccess { onShowMessage("Ketuk 'Paksa Berhenti / Force Stop' bila perlu menghentikan paksa aplikasi.") }
                                 }
                             )
                         }
@@ -705,8 +711,7 @@ fun TaskManagerScreen(
 @Composable
 private fun ProcessRowCard(
     item: TaskProcessItem,
-    onKill: () -> Unit,
-    onAppInfo: () -> Unit
+    onKill: () -> Unit
 ) {
     val context = LocalContext.current
     var iconBmp by remember(item.packageName) { mutableStateOf<ImageBitmap?>(null) }
@@ -762,7 +767,7 @@ private fun ProcessRowCard(
                 Text(
                     text = item.ramPssMb?.let { "$it MB RAM" }
                         ?: if (item.isRunningProcess) "Aktif"
-                        else if (item.isRecentlyOpened || item.lastUsedMs > 0L) "Baru dibuka"
+                        else if (item.isRecentlyOpened || item.lastUsedMs > 0L) "Recent"
                         else "Terinstall",
                     style = MaterialTheme.typography.labelMedium,
                     color = when {
@@ -783,21 +788,20 @@ private fun ProcessRowCard(
             }
 
             Row(
-                modifier = Modifier.width(114.dp),
+                modifier = Modifier.width(96.dp),
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (!item.isCurrentApp) {
-                    TextButton(
+                    OutlinedButton(
                         onClick = onKill,
-                        colors = ButtonDefaults.textButtonColors(contentColor = DeckRed)
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = DeckRed),
+                        border = BorderStroke(1.dp, DeckRed.copy(alpha = 0.5f)),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                     ) {
                         Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(14.dp))
-                        Spacer(Modifier.width(2.dp))
-                        Text("Tutup", fontSize = 12.sp)
-                    }
-                    IconButton(onClick = onAppInfo, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Force Stop / Info", modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(3.dp))
+                        Text("Kill", fontSize = 12.sp)
                     }
                 } else {
                     Text("Aktif", style = MaterialTheme.typography.labelSmall, color = DeckGreen)

@@ -176,6 +176,7 @@ fun FileManagerScreen(
     onShowMessage: (String) -> Unit,
     onOpenZimPathOrUri: ((String) -> Unit)? = null,
     onRegisterGoBackHandler: ((() -> Boolean) -> Unit)? = null,
+    isWindowFocused: Boolean = true,
     onTextInputFocusChanged: ((Boolean) -> Unit)? = null
 ) {
     val context = LocalContext.current
@@ -229,9 +230,9 @@ fun FileManagerScreen(
         } else false
     }
 
-    DisposableEffect(onRegisterGoBackHandler) {
+    DisposableEffect(onRegisterGoBackHandler, isWindowFocused) {
         onRegisterGoBackHandler?.invoke {
-            if (!isSearchFocused && !showNewFolderDialog && renamingEntry == null && textPreviewTitle == null) {
+            if (isWindowFocused && !isSearchFocused && !showNewFolderDialog && renamingEntry == null && textPreviewTitle == null) {
                 goBack()
             } else {
                 false
@@ -654,6 +655,7 @@ fun FileManagerScreen(
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
             .onPreviewKeyEvent { ev ->
+                if (!isWindowFocused) return@onPreviewKeyEvent true
                 if (
                     ev.type == KeyEventType.KeyDown &&
                     ev.key == Key.Backspace &&

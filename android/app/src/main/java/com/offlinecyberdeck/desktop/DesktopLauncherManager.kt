@@ -137,8 +137,13 @@ object DesktopLauncherManager {
     private val recentLaunchedPackages: MutableMap<String, Long> =
         Collections.synchronizedMap(LinkedHashMap<String, Long>())
 
+    // Tracks packages explicitly killed via Cyber Deck Task Manager so stale UsageStats don't resurrect them
+    private val killedPackagesAtMs: MutableMap<String, Long> =
+        Collections.synchronizedMap(HashMap<String, Long>())
+
     fun recordAppLaunched(packageName: String) {
         if (packageName.isNotBlank()) {
+            killedPackagesAtMs.remove(packageName)
             recentLaunchedPackages[packageName] = System.currentTimeMillis()
         }
     }
@@ -779,15 +784,23 @@ object DesktopLauncherManager {
                 ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt().coerceAtLeast(1)
             } else null
 
-            val lastUsed = lastUsedByPkg[pkg] ?: 0L
-            val isRecent = pkg in recentLaunchedPackages || lastUsed >= recentCutoff
+            val rawLastUsed = lastUsedByPkg[pkg] ?: 0L
+            val killedAt = killedPackagesAtMs[pkg] ?: 0L
+            val isRunning = isSelf || pkg in runningSet
+            val wasKilledAfterUse = killedAt > 0L && rawLastUsed <= killedAt && !isRunning
+            val lastUsed = if (wasKilledAfterUse) 0L else rawLastUsed
+            val isRecent = if (wasKilledAfterUse) {
+                false
+            } else {
+                pkg in recentLaunchedPackages || lastUsed >= recentCutoff
+            }
 
             result += TaskProcessItem(
                 packageName = pkg,
                 label = label,
                 isSystemApp = isSystem,
                 isCurrentApp = isSelf,
-                isRunningProcess = isSelf || pkg in runningSet,
+                isRunningProcess = isRunning,
                 isRecentlyOpened = isRecent,
                 ramPssMb = pss,
                 lastUsedMs = lastUsed,
@@ -806,6 +819,18 @@ object DesktopLauncherManager {
         )
     }
 
+    private fun terminatePackageBestEffort(am: ActivityManager, packageName: String) {
+        killedPackagesAtMs[packageName] = System.currentTimeMillis()
+        unmarkRecentLaunched(packageName)
+        runCatching { am.killBackgroundProcesses(packageName) }
+        @Suppress("DEPRECATION")
+        runCatching { am.restartPackage(packageName) }
+        runCatching {
+            val forceStop = ActivityManager::class.java.getMethod("forceStopPackage", String::class.java)
+            forceStop.invoke(am, packageName)
+        }
+    }
+
     fun killAppProcess(context: Context, packageName: String): Result<String> {
         return runCatching {
             if (packageName == context.packageName) {
@@ -813,11 +838,26 @@ object DesktopLauncherManager {
             }
             val am = context.getSystemService(ActivityManager::class.java)
                 ?: error("ActivityManager tidak tersedia.")
-            am.killBackgroundProcesses(packageName)
-            unmarkRecentLaunched(packageName)
-            "Aplikasi '$packageName' ditutup / proses latar dihentikan."
+            terminatePackageBestEffort(am, packageName)
+            System.gc()
+            "Aplikasi '$packageName' langsung di-kill & dihapus dari Recent Apps."
         }
     }
+
+    suspend fun killAllRecentApps(context: Context, packageNames: List<String>): String =
+        withContext(Dispatchers.IO) {
+            val am = context.getSystemService(ActivityManager::class.java)
+                ?: return@withContext "ActivityManager tidak tersedia."
+            var killed = 0
+            for (pkg in packageNames.distinct()) {
+                if (pkg != context.packageName) {
+                    terminatePackageBestEffort(am, pkg)
+                    killed++
+                }
+            }
+            System.gc()
+            "$killed recent / background app langsung di-kill."
+        }
 
     suspend fun boostSystemRam(context: Context, candidatePackages: List<String>): String = withContext(Dispatchers.IO) {
         val am = context.getSystemService(ActivityManager::class.java) ?: return@withContext "ActivityManager tidak tersedia."
@@ -827,7 +867,7 @@ object DesktopLauncherManager {
         for (pkg in candidatePackages) {
             if (pkg != context.packageName) {
                 runCatching {
-                    am.killBackgroundProcesses(pkg)
+                    terminatePackageBestEffort(am, pkg)
                     killed++
                 }
             }
@@ -837,9 +877,9 @@ object DesktopLauncherManager {
         am.getMemoryInfo(after)
         val freedMb = ((after.availMem - before.availMem) / (1024L * 1024L)).coerceAtLeast(0L)
         if (freedMb > 0L) {
-            "RAM Boost: ${freedMb} MB dibebaskan ($killed proses latar dihentikan)."
+            "RAM Boost: ${freedMb} MB dibebaskan ($killed proses & recent app di-kill)."
         } else {
-            "RAM Boost dijalankan pada $killed proses latar + GC."
+            "RAM Boost dijalankan pada $killed proses & recent app + GC."
         }
     }
 

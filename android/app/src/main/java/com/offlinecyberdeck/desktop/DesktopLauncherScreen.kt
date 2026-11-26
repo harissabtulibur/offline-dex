@@ -135,17 +135,22 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -245,11 +250,12 @@ fun DesktopLauncherScreen(
     settings: AppSettingsEntity,
     onShowPermissionsDialog: () -> Unit,
     onShowMessage: (String) -> Unit,
-    onRegisterToggleTerminal: ((() -> Unit) -> Unit) = {},
-    onRegisterActiveBackHandler: ((() -> Boolean) -> Unit) = {},
+    onRegisterToggleTerminal: ((() -> Unit)?) -> Unit = {},
+    onRegisterActiveBackHandler: ((() -> Boolean)?) -> Unit = {},
     onTextInputFocusChanged: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
     val isOnline by browserViewModel.isOnline.collectAsStateWithLifecycle()
@@ -573,13 +579,26 @@ fun DesktopLauncherScreen(
         }
     }
 
+    val topFrontWinId = windows.filter { !it.isMinimized }.maxByOrNull { it.zIndex }?.id
+    val desktopOverlayBlocking = appDrawerOpen ||
+        notifPanelOpen ||
+        activeTrayPopup != null ||
+        showOfflineHubDialog ||
+        showSavedHubDialog ||
+        showWallpaperDialog
+
+    LaunchedEffect(topFrontWinId, desktopOverlayBlocking) {
+        focusManager.clearFocus(force = true)
+        onTextInputFocusChanged(false)
+    }
+
     LaunchedEffect(appDrawerOpen) {
         if (!appDrawerOpen) {
             onTextInputFocusChanged(false)
         }
     }
 
-    LaunchedEffect(Unit) {
+    DisposableEffect(Unit) {
         onRegisterToggleTerminal {
             val termWin = windows.firstOrNull { it.kind == DesktopWindowKind.TERMINAL }
             if (termWin != null && !termWin.isMinimized) {
@@ -590,23 +609,22 @@ fun DesktopLauncherScreen(
                 appDrawerOpen = false
                 showOfflineHubDialog = false
                 showSavedHubDialog = false
+                showWallpaperDialog = false
                 openOrFocusWindow(DesktopWindowKind.TERMINAL)
             }
         }
         onRegisterActiveBackHandler {
             val topWin = windows.filter { !it.isMinimized }.maxByOrNull { it.zIndex }
-            if (topWin?.kind == DesktopWindowKind.FILES &&
-                !appDrawerOpen &&
-                !notifPanelOpen &&
-                activeTrayPopup == null &&
-                !showOfflineHubDialog &&
-                !showSavedHubDialog &&
-                !showWallpaperDialog
-            ) {
+            if (topWin?.kind == DesktopWindowKind.FILES && !desktopOverlayBlocking) {
                 filesGoBackHandler?.invoke() ?: false
             } else {
                 false
             }
+        }
+        onDispose {
+            onRegisterToggleTerminal(null)
+            onRegisterActiveBackHandler(null)
+            onTextInputFocusChanged(false)
         }
     }
 
@@ -810,7 +828,10 @@ fun DesktopLauncherScreen(
                         columns = GridCells.Adaptive(minSize = (iconBoxSize + 50).dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusProperties { canFocus = (topFrontWinId == null && !desktopOverlayBlocking) }
+                            .onPreviewKeyEvent { topFrontWinId != null || desktopOverlayBlocking }
                     ) {
                         items(builtInShortcuts, key = { it.first.name }) { (kind, label, icon) ->
                             DesktopShortcutTile(
@@ -931,12 +952,13 @@ fun DesktopLauncherScreen(
             sortedWindows.forEach { win ->
                 if (!win.isMinimized) {
                     key(win.id) {
+                        val isTopFront = win.id == topFrontWinId && !desktopOverlayBlocking
                         val clampedW = win.widthDp.coerceIn(300f, deskWidthDp.coerceAtLeast(320f))
                         val clampedH = win.heightDp.coerceIn(240f, deskHeightDp.coerceAtLeast(260f))
                         val clampedX = win.xDp.coerceIn(0f, (deskWidthDp - clampedW).coerceAtLeast(0f))
                         val clampedY = win.yDp.coerceIn(0f, (deskHeightDp - clampedH).coerceAtLeast(0f))
 
-                        val windowModifier = if (win.isMaximized) {
+                        val baseWindowModifier = if (win.isMaximized) {
                             Modifier
                                 .fillMaxSize()
                                 .zIndex(win.zIndex.toFloat())
@@ -951,14 +973,24 @@ fun DesktopLauncherScreen(
                                 .height(clampedH.dp)
                                 .zIndex(win.zIndex.toFloat())
                         }
+                        val windowModifier = baseWindowModifier.pointerInput(win.id) {
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                    if (ev.type == PointerEventType.Press) {
+                                        bringToFront(win.id)
+                                    }
+                                }
+                            }
+                        }
 
                         Surface(
                             shape = if (win.isMaximized) RoundedCornerShape(0.dp) else RoundedCornerShape(12.dp),
                             color = MaterialTheme.colorScheme.background,
-                            shadowElevation = if (win.isMaximized) 0.dp else 12.dp,
+                            shadowElevation = if (win.isMaximized) 0.dp else if (isTopFront) 16.dp else 6.dp,
                             border = if (win.isMaximized) null else BorderStroke(
-                                1.dp,
-                                MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+                                if (isTopFront) 1.5.dp else 1.dp,
+                                MaterialTheme.colorScheme.primary.copy(alpha = if (isTopFront) 0.9f else 0.25f)
                             ),
                             modifier = windowModifier
                         ) {
@@ -1051,11 +1083,13 @@ fun DesktopLauncherScreen(
 
                                     HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
 
-                                    // Window Content
+                                    // Window Content (keyboard input & focus strictly restricted to frontmost window)
                                     Box(
                                         modifier = Modifier
                                             .weight(1f)
                                             .fillMaxWidth()
+                                            .focusProperties { canFocus = isTopFront }
+                                            .onPreviewKeyEvent { !isTopFront }
                                     ) {
                                         when (win.kind) {
                                             DesktopWindowKind.BROWSER -> {
@@ -1148,6 +1182,7 @@ fun DesktopLauncherScreen(
                                                         }
                                                     },
                                                     onRegisterGoBackHandler = { handler -> filesGoBackHandler = handler },
+                                                    isWindowFocused = isTopFront,
                                                     onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
@@ -1191,6 +1226,8 @@ fun DesktopLauncherScreen(
                                                     },
                                                     onOpenUrl = { url -> openUrlInDesktopBrowser(url, false) },
                                                     onOpenFileExplorer = { openOrFocusWindow(DesktopWindowKind.FILES) },
+                                                    isWindowFocused = isTopFront,
+                                                    onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
@@ -1210,6 +1247,7 @@ fun DesktopLauncherScreen(
                                                     onOpenWindow = { targetKind -> openOrFocusWindow(targetKind) },
                                                     onLaunchPackage = { pkg -> launchExternalPackage(pkg) },
                                                     onCloseTerminal = { closeWindow(win.id) },
+                                                    isWindowFocused = isTopFront,
                                                     onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
