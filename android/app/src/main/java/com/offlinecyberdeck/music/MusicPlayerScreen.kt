@@ -1,9 +1,16 @@
 package com.offlinecyberdeck.music
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -96,7 +103,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -142,8 +148,24 @@ fun MusicPlayerScreen(
     val tracks by app.musicRepository.tracksFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val settings by app.settingsRepository.settingsFlow.collectAsStateWithLifecycle(initialValue = AppSettingsEntity())
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
+    val requiredAudioPerm = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.READ_MEDIA_AUDIO
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+    }
+    var hasAudioPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, requiredAudioPerm) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val hasAllFilesAccess = remember(tracks, driveStatus) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) Environment.isExternalStorageManager() else true
+    }
+
     var accessibleIds by remember { mutableStateOf<Set<String>>(emptySet()) }
-    LaunchedEffect(tracks, driveStatus) {
+    LaunchedEffect(tracks, driveStatus, settings.extraMediaSafUris, hasAudioPermission) {
         accessibleIds = withContext(Dispatchers.IO) {
             tracks.filter { app.musicRepository.isTrackAccessible(it) }
                 .mapTo(HashSet()) { it.id }
@@ -202,10 +224,8 @@ fun MusicPlayerScreen(
                 Uri.parse(target.fileUri)
             }
             else -> {
-                val f = File(target.fileUri)
-                runCatching {
-                    FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
-                }.getOrElse { Uri.fromFile(f) }
+                // Direct File URI inside ExoPlayer works reliably across internal & removable SD Card volumes
+                Uri.fromFile(File(target.fileUri))
             }
         }
         exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
@@ -275,7 +295,18 @@ fun MusicPlayerScreen(
         }
     }
 
-    LaunchedEffect(settings.musicAutoImport, settings.deckDriveTreeUri) {
+    val audioPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasAudioPermission = granted
+        if (granted) {
+            runRefreshImport(manual = true)
+        } else {
+            onShowMessage("Izin audio ditolak. Anda masih bisa memilih Folder SD Card lewat ikon Folder (SAF).")
+        }
+    }
+
+    LaunchedEffect(settings.musicAutoImport, settings.deckDriveTreeUri, settings.extraMediaSafUris) {
         if (settings.musicAutoImport && !autoImportedOnce) {
             autoImportedOnce = true
             runRefreshImport(manual = false)
@@ -579,6 +610,67 @@ fun MusicPlayerScreen(
             }
         }
 
+        if (!hasAudioPermission || !hasAllFilesAccess) {
+            Surface(
+                color = Color(0xFF1F161D),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, YtmRed.copy(alpha = 0.45f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 4.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        if (!hasAudioPermission) {
+                            "Berikan izin Audio agar lagu dari SD Card & Internal otomatis terbaca."
+                        } else {
+                            "Untuk akses file SD Card langsung tanpa SAF, aktifkan All Files Access atau pilih folder SD Card."
+                        },
+                        color = YtmInk,
+                        fontSize = 11.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (!hasAudioPermission) {
+                        Button(
+                            onClick = { audioPermLauncher.launch(requiredAudioPerm) },
+                            colors = ButtonDefaults.buttonColors(containerColor = YtmRed, contentColor = Color.White),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text("Izinkan Audio", fontSize = 11.sp)
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(
+                                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                Uri.parse("package:${context.packageName}")
+                                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        )
+                                    }
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Izin SD/File", color = YtmInk, fontSize = 11.sp)
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { safFolderPicker.launch(null) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text("Folder SD", color = YtmInk, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
         // Main Content Area
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
@@ -591,18 +683,24 @@ fun MusicPlayerScreen(
                         Icon(Icons.Filled.MusicNote, contentDescription = null, tint = YtmRed, modifier = Modifier.size(54.dp))
                         Text("Perpustakaan Musik Masih Kosong", color = YtmInk, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                         Text(
-                            "Tekan Refresh Import untuk memindai seluruh file MP3 / audio di Internal, SD Card & USB tanpa duplikasi.",
+                            "Tekan Refresh Import untuk memindai seluruh file MP3 / audio di Internal, SD Card & USB, atau pilih Folder SD Card langsung.",
                             color = YtmMuted,
                             fontSize = 13.sp
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
-                                onClick = { runRefreshImport(manual = true) },
+                                onClick = {
+                                    if (!hasAudioPermission) {
+                                        audioPermLauncher.launch(requiredAudioPerm)
+                                    } else {
+                                        runRefreshImport(manual = true)
+                                    }
+                                },
                                 colors = ButtonDefaults.buttonColors(containerColor = YtmRed, contentColor = Color.White)
                             ) {
                                 Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(6.dp))
-                                Text("Scan & Import Semua MP3")
+                                Text(if (!hasAudioPermission) "Izinkan & Scan MP3" else "Scan & Import Semua MP3")
                             }
                             OutlinedButton(onClick = { safFolderPicker.launch(null) }) {
                                 Text("Pilih Folder SD / USB", color = YtmInk)

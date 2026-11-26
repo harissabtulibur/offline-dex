@@ -55,12 +55,17 @@ class MusicRepository(
         musicDao.delete(track)
     }
 
+    private fun dedupKey(fileName: String, sizeBytes: Long): String {
+        val norm = fileName.lowercase(Locale.US)
+        return if (sizeBytes > 0L) "$norm|$sizeBytes" else norm
+    }
+
     suspend fun importPickedAudioFiles(uris: List<Uri>): Result<MusicRefreshSummary> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val existing = musicDao.getAllSnapshot()
                 val seenUris = existing.mapTo(HashSet()) { it.fileUri }
-                val seenNames = existing.mapTo(HashSet()) { it.fileName.lowercase(Locale.US) }
+                val seenKeys = existing.mapTo(HashSet()) { dedupKey(it.fileName, it.sizeBytes) }
 
                 val toInsert = mutableListOf<MusicTrackEntity>()
                 var skipped = 0
@@ -74,16 +79,20 @@ class MusicRepository(
                     }
                     val uriStr = uri.toString()
                     val (fileName, sizeBytes) = driveManager.queryDisplayNameAndSize(uri)
-                    val normName = fileName.lowercase(Locale.US)
-                    if (seenUris.contains(uriStr) || seenNames.contains(normName)) {
+                    val key = dedupKey(fileName, sizeBytes)
+                    if (seenUris.contains(uriStr) || seenKeys.contains(key)) {
                         skipped++
                         continue
                     }
-                    val target = if (uriStr.contains("external", true)) StorageTarget.DECK_DRIVE else StorageTarget.INTERNAL
-                    val volumeLabel = if (target == StorageTarget.DECK_DRIVE) "External" else "Internal"
+                    val target = if (uriStr.contains("external", true) || uriStr.contains("primary", true).not()) {
+                        StorageTarget.DECK_DRIVE
+                    } else {
+                        StorageTarget.INTERNAL
+                    }
+                    val volumeLabel = if (target == StorageTarget.DECK_DRIVE) "External / SD" else "Internal"
                     val track = extractTrackFromUri(uri, uriStr, fileName, sizeBytes, target, volumeLabel)
                     seenUris += uriStr
-                    seenNames += normName
+                    seenKeys += key
                     toInsert += track
                 }
 
@@ -105,16 +114,19 @@ class MusicRepository(
                 }
                 val existing = musicDao.getAllSnapshot()
                 val seenUris = existing.mapTo(HashSet()) { it.fileUri }
-                val seenNames = existing.mapTo(HashSet()) { it.fileName.lowercase(Locale.US) }
+                val seenKeys = existing.mapTo(HashSet()) { dedupKey(it.fileName, it.sizeBytes) }
                 val toInsert = mutableListOf<MusicTrackEntity>()
                 var skipped = 0
+
+                val docName = runCatching { DocumentFile.fromTreeUri(context, treeUri)?.name }.getOrNull()
+                    ?.takeIf { it.isNotBlank() } ?: "SD / External"
 
                 scanSafTreeInternal(
                     treeUri = treeUri,
                     seenUris = seenUris,
-                    seenNames = seenNames,
+                    seenKeys = seenKeys,
                     target = StorageTarget.DECK_DRIVE,
-                    volumeLabel = "External Drive",
+                    volumeLabel = docName,
                     out = toInsert,
                     onSkipped = { skipped++ }
                 )
@@ -141,30 +153,30 @@ class MusicRepository(
 
             val existing = musicDao.getAllSnapshot()
             val seenUris = existing.mapTo(HashSet()) { it.fileUri }
-            val seenNames = existing.mapTo(HashSet()) { it.fileName.lowercase(Locale.US) }
+            val seenKeys = existing.mapTo(HashSet()) { dedupKey(it.fileName, it.sizeBytes) }
             val toInsert = mutableListOf<MusicTrackEntity>()
             var skipped = 0
 
-            // 1. MediaStore.Audio (Internal Shared Storage + SD Card volumes indexed by Android)
+            // 1. MediaStore.Audio (Internal Shared Storage + SD Card / OTG volumes indexed by Android)
             scanMediaStoreAudio(
                 seenUris = seenUris,
-                seenNames = seenNames,
+                seenKeys = seenKeys,
                 out = toInsert,
                 onSkipped = { skipped++ }
             )
 
             // 2. Direct filesystem scan on Internal Shared Storage, App Downloads, and Removable SD/USB mount paths
             val directDirs = linkedMapOf<File, Pair<StorageTarget, String>>()
-            directDirs[driveManager.internalDownloadsDir] = StorageTarget.INTERNAL to "App Downloads"
-            runCatching { Environment.getExternalStorageDirectory() }.getOrNull()?.let { extDir ->
-                if (extDir.exists() && extDir.canRead()) {
-                    directDirs[extDir] = StorageTarget.INTERNAL to "Internal"
-                }
-            }
             driveManager.detectRemovableExternalVolumes().forEach { vol ->
                 val mp = vol.mountPath?.let { File(it) }
                 if (mp != null && mp.exists() && mp.canRead()) {
                     directDirs[mp] = StorageTarget.DECK_DRIVE to vol.label
+                }
+            }
+            directDirs[driveManager.internalDownloadsDir] = StorageTarget.INTERNAL to "App Downloads"
+            runCatching { Environment.getExternalStorageDirectory() }.getOrNull()?.let { extDir ->
+                if (extDir.exists() && extDir.canRead()) {
+                    directDirs[extDir] = StorageTarget.INTERNAL to "Internal"
                 }
             }
 
@@ -174,7 +186,7 @@ class MusicRepository(
                     target = meta.first,
                     volumeLabel = meta.second,
                     seenUris = seenUris,
-                    seenNames = seenNames,
+                    seenKeys = seenKeys,
                     out = toInsert,
                     onSkipped = { skipped++ }
                 )
@@ -193,9 +205,9 @@ class MusicRepository(
                         scanSafTreeInternal(
                             treeUri = uri,
                             seenUris = seenUris,
-                            seenNames = seenNames,
+                            seenKeys = seenKeys,
                             target = StorageTarget.DECK_DRIVE,
-                            volumeLabel = doc.name ?: "External Drive",
+                            volumeLabel = doc.name ?: "SD / External",
                             out = toInsert,
                             onSkipped = { skipped++ }
                         )
@@ -212,7 +224,7 @@ class MusicRepository(
 
     private fun scanMediaStoreAudio(
         seenUris: MutableSet<String>,
-        seenNames: MutableSet<String>,
+        seenKeys: MutableSet<String>,
         out: MutableList<MusicTrackEntity>,
         onSkipped: () -> Unit
     ) {
@@ -226,10 +238,10 @@ class MusicRepository(
             add(MediaStore.Audio.Media.SIZE)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 add(MediaStore.Audio.Media.VOLUME_NAME)
-            } else {
-                @Suppress("DEPRECATION")
-                add(MediaStore.Audio.Media.DATA)
+                add(MediaStore.Audio.Media.RELATIVE_PATH)
             }
+            @Suppress("DEPRECATION")
+            add(MediaStore.Audio.Media.DATA)
         }.toTypedArray()
 
         val targetUris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -262,58 +274,69 @@ class MusicRepository(
                     val volIdx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         cursor.getColumnIndex(MediaStore.Audio.Media.VOLUME_NAME)
                     } else -1
-                    val dataIdx = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-                        @Suppress("DEPRECATION")
-                        cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
+                    val relIdx = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        cursor.getColumnIndex(MediaStore.Audio.Media.RELATIVE_PATH)
                     } else -1
+                    @Suppress("DEPRECATION")
+                    val dataIdx = cursor.getColumnIndex(MediaStore.Audio.Media.DATA)
 
                     while (cursor.moveToNext()) {
                         val id = cursor.getLong(idIdx)
+                        val filePath = if (dataIdx >= 0) cursor.getString(dataIdx)?.trim().orEmpty() else ""
                         val fileName = (if (nameIdx >= 0) cursor.getString(nameIdx) else null)
-                            ?.takeIf { it.isNotBlank() } ?: continue
+                            ?.takeIf { it.isNotBlank() }
+                            ?: filePath.substringAfterLast('/').takeIf { it.isNotBlank() }
+                            ?: continue
                         val ext = fileName.substringAfterLast('.', "").lowercase(Locale.US)
                         if (ext !in audioExtensions) continue
 
+                        val sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
+                        if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
+
+                        val directFile = filePath.takeIf { it.startsWith("/") }?.let { File(it) }
+                        val canUseDirectPath = directFile != null && directFile.exists() && directFile.canRead()
                         val contentUri = ContentUris.withAppendedId(collectionUri, id)
-                        val uriStr = contentUri.toString()
-                        val normName = fileName.lowercase(Locale.US)
-                        if (seenUris.contains(uriStr) || seenNames.contains(normName)) {
+                        val preferredUriStr = if (canUseDirectPath) directFile!!.absolutePath else contentUri.toString()
+
+                        val key = dedupKey(fileName, sizeBytes)
+                        if (seenUris.contains(preferredUriStr) || seenUris.contains(contentUri.toString()) || seenKeys.contains(key)) {
                             onSkipped()
                             continue
                         }
-                        if (!driveManager.isUriOrFileAccessible(uriStr)) {
-                            continue
-                        }
 
-                        val sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
                         val durMs = if (durIdx >= 0 && !cursor.isNull(durIdx)) cursor.getLong(durIdx) else 0L
-                        if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
-
                         val rawTitle = if (titleIdx >= 0) cursor.getString(titleIdx)?.trim() else null
                         val rawArtist = if (artistIdx >= 0) cursor.getString(artistIdx)?.trim() else null
                         val rawAlbum = if (albumIdx >= 0) cursor.getString(albumIdx)?.trim() else null
+                        val relFolder = if (relIdx >= 0) {
+                            cursor.getString(relIdx)?.trim('/')?.substringAfterLast('/')
+                        } else {
+                            directFile?.parentFile?.name
+                        }
 
                         val volName = if (volIdx >= 0) cursor.getString(volIdx).orEmpty().ifBlank { volumeTag } else {
-                            val path = if (dataIdx >= 0) cursor.getString(dataIdx).orEmpty() else ""
-                            if (path.contains("/storage/emulated")) "external_primary" else volumeTag
+                            if (filePath.contains("/storage/emulated")) "external_primary" else volumeTag
                         }
                         val isPrimary = volName.equals("external_primary", ignoreCase = true) ||
                             volName.equals("external", ignoreCase = true) ||
                             volName.isBlank()
 
-                        seenUris += uriStr
-                        seenNames += normName
+                        seenUris += preferredUriStr
+                        seenUris += contentUri.toString()
+                        seenKeys += key
                         out += MusicTrackEntity(
                             id = UUID.randomUUID().toString(),
                             title = rawTitle?.takeIf { it.isNotBlank() } ?: cleanAudioTitle(fileName),
                             artist = rawArtist?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Unknown Artist",
-                            album = rawAlbum?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Local Music",
+                            album = rawAlbum?.takeIf { it.isNotBlank() && it != "<unknown>" }
+                                ?: relFolder?.takeIf { it.isNotBlank() }
+                                ?: "Local Music",
                             fileName = fileName,
-                            fileUri = uriStr,
+                            fileUri = preferredUriStr,
                             durationMs = durMs.coerceAtLeast(0L),
                             sizeBytes = sizeBytes.coerceAtLeast(0L),
                             storageTarget = if (isPrimary) StorageTarget.INTERNAL else StorageTarget.DECK_DRIVE,
-                            volumeLabel = if (isPrimary) "Internal" else "SD / USB ($volName)"
+                            volumeLabel = if (isPrimary) "Internal" else "SD Card ($volName)"
                         )
                     }
                 }
@@ -326,36 +349,44 @@ class MusicRepository(
         target: StorageTarget,
         volumeLabel: String,
         seenUris: MutableSet<String>,
-        seenNames: MutableSet<String>,
+        seenKeys: MutableSet<String>,
         out: MutableList<MusicTrackEntity>,
         onSkipped: () -> Unit
     ) {
+        val priorityDirs = setOf("music", "audio", "mp3", "songs", "lagu", "download", "downloads", "podcasts", "audiobooks")
+        val skipDirs = setOf("android", "notifications", "ringtones", "alarms", "cache", "thumbnails", ".thumbnails")
         val queue = ArrayDeque<Pair<File, Int>>()
         queue.add(rootDir to 0)
         var visitedDirs = 0
-        while (queue.isNotEmpty() && visitedDirs < 260) {
+        while (queue.isNotEmpty() && visitedDirs < 1200) {
             val (dir, depth) = queue.removeFirst()
             visitedDirs++
             val children = runCatching { dir.listFiles() }.getOrNull() ?: continue
-            for (child in children) {
+            val sortedChildren = children.sortedWith(
+                compareByDescending<File> { it.isDirectory && it.name.lowercase(Locale.US) in priorityDirs }
+                    .thenBy { it.name.lowercase(Locale.US) }
+            )
+            for (child in sortedChildren) {
                 val name = child.name
                 if (name.startsWith(".")) continue
                 if (child.isDirectory) {
-                    if (depth < 6 && name !in setOf("Android", "Notifications", "Ringtones", "Alarms", "cache")) {
+                    if (depth < 7 && name.lowercase(Locale.US) !in skipDirs) {
                         queue.add(child to depth + 1)
                     }
                 } else if (child.isFile) {
                     val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
                     if (ext in audioExtensions) {
                         val pathStr = child.absolutePath
-                        val normName = name.lowercase(Locale.US)
-                        if (seenUris.contains(pathStr) || seenNames.contains(normName)) {
+                        val sizeBytes = child.length().coerceAtLeast(0L)
+                        if (sizeBytes in 1..24_000L && ext != "mp3") continue
+                        val key = dedupKey(name, sizeBytes)
+                        if (seenUris.contains(pathStr) || seenKeys.contains(key)) {
                             onSkipped()
                             continue
                         }
                         val track = extractTrackFromFile(child, target, volumeLabel)
                         seenUris += pathStr
-                        seenNames += normName
+                        seenKeys += key
                         out += track
                     }
                 }
@@ -366,7 +397,7 @@ class MusicRepository(
     private fun scanSafTreeInternal(
         treeUri: Uri,
         seenUris: MutableSet<String>,
-        seenNames: MutableSet<String>,
+        seenKeys: MutableSet<String>,
         target: StorageTarget,
         volumeLabel: String,
         out: MutableList<MusicTrackEntity>,
@@ -376,7 +407,7 @@ class MusicRepository(
         val queue = ArrayDeque<DocumentFile>()
         queue.add(root)
         var visitedDirs = 0
-        while (queue.isNotEmpty() && visitedDirs < 180) {
+        while (queue.isNotEmpty() && visitedDirs < 400) {
             val dir = queue.removeFirst()
             visitedDirs++
             val children = runCatching { dir.listFiles() }.getOrNull() ?: continue
@@ -384,13 +415,17 @@ class MusicRepository(
                 val name = child.name ?: continue
                 if (name.startsWith(".")) continue
                 if (child.isDirectory) {
-                    queue.add(child)
+                    if (name.lowercase(Locale.US) !in setOf("android", "cache", "lost.dir")) {
+                        queue.add(child)
+                    }
                 } else if (child.isFile) {
                     val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
                     if (ext in audioExtensions) {
                         val uriStr = child.uri.toString()
-                        val normName = name.lowercase(Locale.US)
-                        if (seenUris.contains(uriStr) || seenNames.contains(normName)) {
+                        val sizeBytes = child.length().coerceAtLeast(0L)
+                        if (sizeBytes in 1..24_000L && ext != "mp3") continue
+                        val key = dedupKey(name, sizeBytes)
+                        if (seenUris.contains(uriStr) || seenKeys.contains(key)) {
                             onSkipped()
                             continue
                         }
@@ -398,12 +433,12 @@ class MusicRepository(
                             uri = child.uri,
                             uriStr = uriStr,
                             fileName = name,
-                            sizeBytes = child.length(),
+                            sizeBytes = sizeBytes,
                             target = target,
                             volumeLabel = volumeLabel
                         )
                         seenUris += uriStr
-                        seenNames += normName
+                        seenKeys += key
                         out += track
                     }
                 }

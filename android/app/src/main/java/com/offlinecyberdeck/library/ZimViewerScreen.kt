@@ -250,7 +250,8 @@ fun ZimViewerScreen(
             runCatching {
                 val pfd = app.driveManager.openReadFileDescriptor(loaded.fileUri)
                     ?: error("Tidak bisa mengakses file ZIM (${loaded.fileName}). Pastikan izin penyimpanan / Deck Drive aktif.")
-                val opened = ZimArchiveReader(pfd)
+                val seekablePfd = ensureSeekableZimPfd(context, loaded.fileUri, loaded.fileName, pfd)
+                val opened = ZimArchiveReader(seekablePfd)
                 val startKey = opened.getMainPageKey()?.trimStart('/')?.takeIf { it.isNotBlank() } ?: "__index__"
                 opened to startKey
             }.onSuccess { (opened, startKey) ->
@@ -881,10 +882,11 @@ private suspend fun prepareZimPage(
                 val finalTitle = extractedTitle?.takeIf { it.isNotBlank() }
                     ?: loaded.title.takeIf { it.isNotBlank() }
                     ?: archiveTitle
-                val styledHtml = prepareStyledWikipediaHtml(rawHtml, dark)
+                val baseHref = buildZimUrl(loaded.finalKey)
+                val styledHtml = prepareStyledWikipediaHtml(rawHtml, dark, baseHref)
                 return@withContext PreparedZimPage(
                     key = loaded.finalKey,
-                    baseUrl = buildZimUrl(loaded.finalKey),
+                    baseUrl = baseHref,
                     title = finalTitle,
                     html = styledHtml
                 )
@@ -1047,9 +1049,10 @@ private fun resolveRelativeZimPath(currentKey: String, rawTarget: String): Strin
     return stack.joinToString("/")
 }
 
-private fun prepareStyledWikipediaHtml(rawHtml: String, dark: Boolean): String {
+private fun prepareStyledWikipediaHtml(rawHtml: String, dark: Boolean, baseHref: String = "$ZIM_ORIGIN/"): String {
     val withoutCsp = CSP_META_REGEX.replace(rawHtml, "")
     val injectBlock = """
+        <base href="${escapeHtml(baseHref)}" />
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width,initial-scale=1" />
         <style id="cd-wiki-style">${buildWikipediaCss(dark)}</style>
@@ -1067,6 +1070,41 @@ private fun prepareStyledWikipediaHtml(rawHtml: String, dark: Boolean): String {
         return withoutCsp.substring(0, pos) + "\n<head>$injectBlock</head>\n" + withoutCsp.substring(pos)
     }
     return "<!doctype html><html><head>$injectBlock</head><body>$withoutCsp</body></html>"
+}
+
+private fun ensureSeekableZimPfd(
+    context: android.content.Context,
+    uriOrPath: String,
+    fileName: String,
+    originalPfd: android.os.ParcelFileDescriptor
+): android.os.ParcelFileDescriptor {
+    val testHeader = ByteArray(4)
+    val preadOk = runCatching {
+        android.system.Os.pread(originalPfd.fileDescriptor, testHeader, 0, 4, 0L) >= 4
+    }.getOrDefault(false)
+    if (preadOk) return originalPfd
+
+    // Some DocumentsProviders return non-seekable pipe FDs; copy small/medium ZIM streams cleanly into app cache
+    runCatching { originalPfd.close() }
+    val cacheFile = java.io.File(context.cacheDir, "zim_stream_cache_${fileName.hashCode()}.zim")
+    context.contentResolver.openInputStream(Uri.parse(uriOrPath))?.use { input ->
+        cacheFile.outputStream().use { out ->
+            val buf = ByteArray(65536)
+            var total = 0L
+            val maxCacheBytes = 256L * 1024L * 1024L
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > maxCacheBytes) {
+                    error("File ZIM > 256 MB melalui provider non-seekable. Aktifkan 'Izin Semua File' atau pilih lewat Folder SD/SSD agar langsung terbaca.")
+                }
+                out.write(buf, 0, n)
+            }
+            out.flush()
+        }
+    } ?: error("Tidak dapat membaca stream ZIM.")
+    return android.os.ParcelFileDescriptor.open(cacheFile, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
 }
 
 private fun okWebResponse(

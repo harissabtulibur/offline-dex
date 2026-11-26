@@ -1,10 +1,13 @@
 package com.offlinecyberdeck.desktop
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.ActivityOptions
 import android.app.AppOpsManager
 import android.app.role.RoleManager
 import android.app.usage.UsageStatsManager
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -31,6 +34,7 @@ import com.offlinecyberdeck.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.Collections
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -104,16 +108,125 @@ data class TaskProcessItem(
     val isSystemApp: Boolean,
     val isCurrentApp: Boolean,
     val isRunningProcess: Boolean,
+    val isRecentlyOpened: Boolean = false,
     val ramPssMb: Int?,
     val lastUsedMs: Long,
     val rxBytes: Long,
     val txBytes: Long
 )
 
+data class BluetoothDeviceEntry(
+    val name: String,
+    val address: String,
+    val isConnected: Boolean
+)
+
+data class BluetoothStatusInfo(
+    val supported: Boolean,
+    val enabled: Boolean,
+    val permissionGranted: Boolean,
+    val pairedDevices: List<BluetoothDeviceEntry> = emptyList()
+)
+
 object DesktopLauncherManager {
 
     // Capped at 64 app icons (~1.3 MB max) so App Drawer stays ultra-light on 4 GB RAM tablets
     private val iconCache = LruCache<String, ImageBitmap>(64)
+
+    // Tracks external Android apps launched from Cyber Deck during the active session
+    private val recentLaunchedPackages: MutableMap<String, Long> =
+        Collections.synchronizedMap(LinkedHashMap<String, Long>())
+
+    fun recordAppLaunched(packageName: String) {
+        if (packageName.isNotBlank()) {
+            recentLaunchedPackages[packageName] = System.currentTimeMillis()
+        }
+    }
+
+    fun unmarkRecentLaunched(packageName: String) {
+        recentLaunchedPackages.remove(packageName)
+    }
+
+    fun hasBluetoothConnectPermission(context: Context): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun readBluetoothStatus(context: Context): BluetoothStatusInfo {
+        val bm = context.getSystemService(BluetoothManager::class.java)
+        val adapter = bm?.adapter ?: return BluetoothStatusInfo(
+            supported = false,
+            enabled = false,
+            permissionGranted = hasBluetoothConnectPermission(context)
+        )
+        val permGranted = hasBluetoothConnectPermission(context)
+        val enabled = runCatching { adapter.isEnabled }.getOrDefault(false)
+        val paired = if (permGranted && enabled) {
+            runCatching {
+                adapter.bondedDevices.orEmpty().map { dev ->
+                    val connected = runCatching {
+                        dev.javaClass.getMethod("isConnected").invoke(dev) as? Boolean ?: false
+                    }.getOrDefault(false)
+                    BluetoothDeviceEntry(
+                        name = runCatching { dev.name }.getOrNull()?.takeIf { it.isNotBlank() } ?: dev.address,
+                        address = dev.address.orEmpty(),
+                        isConnected = connected
+                    )
+                }.sortedByDescending { it.isConnected }
+            }.getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+        return BluetoothStatusInfo(
+            supported = true,
+            enabled = enabled,
+            permissionGranted = permGranted,
+            pairedDevices = paired
+        )
+    }
+
+    fun openBluetoothSettings(context: Context): String = launchFirstWorkingSettings(
+        context,
+        listOf(
+            Intent(Settings.ACTION_BLUETOOTH_SETTINGS),
+            Intent(Settings.ACTION_WIRELESS_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        ),
+        "Membuka pengaturan Bluetooth Android."
+    )
+
+    fun openAndroidSystemShortcut(context: Context, rawKey: String): Result<String> = runCatching {
+        val key = rawKey.trim().lowercase(Locale.US)
+        val msg = when (key) {
+            "wifi", "net", "network" -> openWifiSettings(context)
+            "bluetooth", "bt" -> openBluetoothSettings(context)
+            "display", "layar", "screen" -> launchFirstWorkingSettings(
+                context,
+                listOf(Intent(Settings.ACTION_DISPLAY_SETTINGS), Intent(Settings.ACTION_SETTINGS)),
+                "Membuka pengaturan Tampilan & Layar Android."
+            )
+            "storage", "penyimpanan", "disk" -> launchFirstWorkingSettings(
+                context,
+                listOf(Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS), Intent(Settings.ACTION_SETTINGS)),
+                "Membuka pengaturan Penyimpanan Android."
+            )
+            "battery", "baterai", "power" -> openBatterySettings(context)
+            "dev", "developer", "opsi" -> openDeveloperOptionsSettings(context)
+            "usage", "usagestats" -> openUsageStatsSettings(context)
+            "nav", "navigation" -> openSystemNavigationSettings(context)
+            "apps", "home", "launcher" -> openHomeLauncherSettings(context)
+            "allfiles", "files" -> openAllFilesAccessSettings(context)
+            "datetime", "date", "time", "jam" -> openDateTimeSettings(context)
+            "labs", "multiwindow" -> openSystemMultiWindowSettings(context)
+            else -> error("Shortcut sistem '$rawKey' tidak dikenal. Coba: wifi, bluetooth, display, storage, battery, dev, usage, nav, apps, allfiles, datetime, labs")
+        }
+        msg
+    }
 
     fun inspectPermissions(context: Context): DesktopPermissionStatus {
         val pm = context.packageManager
@@ -615,6 +728,11 @@ object DesktopLauncherManager {
         }
 
         val lastUsedByPkg = HashMap<String, Long>()
+        val recentCutoff = System.currentTimeMillis() - 2L * 3600L * 1000L
+        recentLaunchedPackages.forEach { (pkg, ts) ->
+            lastUsedByPkg[pkg] = ts
+        }
+
         if (hasUsageStatsAccess(context)) {
             val usm = context.getSystemService(UsageStatsManager::class.java)
             val now = System.currentTimeMillis()
@@ -632,6 +750,7 @@ object DesktopLauncherManager {
         val allPkgs = LinkedHashSet<String>().apply {
             add(context.packageName)
             addAll(runningSet)
+            addAll(recentLaunchedPackages.keys)
             addAll(lastUsedByPkg.keys)
             addAll(installedByPkg.keys)
         }
@@ -660,14 +779,18 @@ object DesktopLauncherManager {
                 ((rt.totalMemory() - rt.freeMemory()) / (1024L * 1024L)).toInt().coerceAtLeast(1)
             } else null
 
+            val lastUsed = lastUsedByPkg[pkg] ?: 0L
+            val isRecent = pkg in recentLaunchedPackages || lastUsed >= recentCutoff
+
             result += TaskProcessItem(
                 packageName = pkg,
                 label = label,
                 isSystemApp = isSystem,
                 isCurrentApp = isSelf,
                 isRunningProcess = isSelf || pkg in runningSet,
+                isRecentlyOpened = isRecent,
                 ramPssMb = pss,
-                lastUsedMs = lastUsedByPkg[pkg] ?: 0L,
+                lastUsedMs = lastUsed,
                 rxBytes = rx,
                 txBytes = tx
             )
@@ -676,6 +799,7 @@ object DesktopLauncherManager {
         result.sortedWith(
             compareByDescending<TaskProcessItem> { it.isCurrentApp }
                 .thenByDescending { it.isRunningProcess }
+                .thenByDescending { it.isRecentlyOpened }
                 .thenByDescending { it.ramPssMb ?: 0 }
                 .thenByDescending { it.lastUsedMs }
                 .thenBy { it.label.lowercase(Locale.US) }
@@ -690,7 +814,8 @@ object DesktopLauncherManager {
             val am = context.getSystemService(ActivityManager::class.java)
                 ?: error("ActivityManager tidak tersedia.")
             am.killBackgroundProcesses(packageName)
-            "Proses latar '$packageName' dihentikan (untuk aplikasi foreground gunakan tombol Info/Force Stop)."
+            unmarkRecentLaunched(packageName)
+            "Aplikasi '$packageName' ditutup / proses latar dihentikan."
         }
     }
 

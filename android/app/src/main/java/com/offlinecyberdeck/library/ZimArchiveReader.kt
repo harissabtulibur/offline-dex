@@ -5,7 +5,7 @@ import android.os.ParcelFileDescriptor
 import android.system.Os
 import android.util.LruCache
 import com.github.luben.zstd.ZstdInputStream
-import org.tukaani.xz.SingleXZInputStream
+import org.tukaani.xz.XZInputStream
 import java.io.BufferedInputStream
 import java.io.Closeable
 import java.io.EOFException
@@ -169,7 +169,10 @@ class ZimArchiveReader(
             val resolved = resolveEntryIndex(header.mainPage.toInt())
             if (resolved != null) {
                 val mime = mimeTypes.getOrNull(resolved.mimeIndex).orEmpty()
-                if (mime.contains("html", ignoreCase = true) || mime.isBlank()) {
+                if (mime.contains("html", ignoreCase = true) ||
+                    mime.contains("xhtml", ignoreCase = true) ||
+                    mime.isBlank()
+                ) {
                     return resolved.fullKey
                 }
             }
@@ -287,6 +290,42 @@ class ZimArchiveReader(
                     }
                 }
                 t += step
+            }
+        }
+
+        // 1b. Modern OpenZIM v6.1 stores title-ordered index inside X/listing/titleOrdered/v1 when titlePtrPos == 0
+        if (out.isEmpty()) {
+            val titleBlob = runCatching {
+                val idx = binarySearchUrlTable('X', "listing/titleOrdered/v1")
+                if (idx >= 0) {
+                    resolveEntryIndex(idx)?.let { readBlob(it.clusterNumber, it.blobNumber) }
+                } else null
+            }.getOrNull()
+            if (titleBlob != null && titleBlob.size >= 4) {
+                val totalEntries = titleBlob.size / 4
+                val step = (totalEntries / limit.coerceAtLeast(1)).coerceAtLeast(1)
+                var pos = 0
+                var visited = 0
+                while (pos < totalEntries && out.size < limit && visited < limit * 6) {
+                    visited++
+                    val bb = ByteBuffer.wrap(titleBlob, pos * 4, 4).order(ByteOrder.LITTLE_ENDIAN)
+                    val entryIdx = (bb.getInt(0).toLong() and 0xFFFFFFFFL).toInt()
+                    if (entryIdx in 0 until header.entryCount) {
+                        val e = resolveEntryIndex(entryIdx)
+                        if (e != null && (e.namespace == 'C' || e.namespace == 'A') && !e.url.startsWith("-/")) {
+                            val mime = mimeTypes.getOrNull(e.mimeIndex).orEmpty()
+                            if ((mime.contains("html", ignoreCase = true) || mime.isBlank()) && seen.add(e.fullKey)) {
+                                out += ZimSearchHit(
+                                    entryIndex = e.index,
+                                    fullKey = e.fullKey,
+                                    title = e.title.ifBlank { e.url },
+                                    mimeType = mime
+                                )
+                            }
+                        }
+                    }
+                    pos += step
+                }
             }
         }
 
@@ -610,12 +649,14 @@ class ZimArchiveReader(
     private fun readEntryKeyBytes(entryIdx: Int): ByteArray {
         val dirPos = readLongAt(header.urlPtrPos + entryIdx.toLong() * 8L)
         val fixed = readBytesAt(dirPos, 16)
+        if (fixed.size < 4) return ByteArray(0)
         val mime = ((fixed[1].toInt() and 0xFF) shl 8) or (fixed[0].toInt() and 0xFF)
+        val paramLen = fixed[2].toInt() and 0xFF
         val nsByte = fixed[3]
         val urlStart = when (mime) {
-            0xFFFF -> dirPos + 12L
-            0xFFFE, 0xFFFD -> dirPos + 8L
-            else -> dirPos + 16L
+            0xFFFF -> dirPos + 12L + paramLen
+            0xFFFE, 0xFFFD -> dirPos + 8L + paramLen
+            else -> dirPos + 16L + paramLen
         }
         val urlBytes = readNullTerminatedBytes(urlStart, 1024)
         return ByteArray(1 + urlBytes.size).apply {
@@ -627,26 +668,29 @@ class ZimArchiveReader(
     private fun readDirectoryEntry(entryIdx: Int): ZimDirectoryEntry {
         val dirPos = readLongAt(header.urlPtrPos + entryIdx.toLong() * 8L)
         val fixed = readBytesAt(dirPos, 16)
+        if (fixed.size < 12) error("Truncated ZIM directory entry #$entryIdx at offset $dirPos")
         val bb = ByteBuffer.wrap(fixed).order(ByteOrder.LITTLE_ENDIAN)
         val mime = bb.getShort(0).toInt() and 0xFFFF
+        val paramLen = fixed[2].toInt() and 0xFF
         val ns = (fixed[3].toInt() and 0xFF).toChar()
 
         return when (mime) {
             0xFFFF -> {
                 val redirectIdx = (bb.getInt(8).toLong() and 0xFFFFFFFFL).toInt()
-                val (url, nextPos) = readUtf8WithNextPos(dirPos + 12L)
+                val (url, nextPos) = readUtf8WithNextPos(dirPos + 12L + paramLen)
                 val (title, _) = readUtf8WithNextPos(nextPos)
                 ZimDirectoryEntry.Redirect(entryIdx, ns, redirectIdx, url, title)
             }
             0xFFFE, 0xFFFD -> {
-                val (url, nextPos) = readUtf8WithNextPos(dirPos + 8L)
+                val (url, nextPos) = readUtf8WithNextPos(dirPos + 8L + paramLen)
                 val (title, _) = readUtf8WithNextPos(nextPos)
                 ZimDirectoryEntry.Meta(entryIdx, ns, url, title)
             }
             else -> {
+                if (fixed.size < 16) error("Truncated ZIM content directory entry #$entryIdx")
                 val clusterNum = (bb.getInt(8).toLong() and 0xFFFFFFFFL).toInt()
                 val blobNum = (bb.getInt(12).toLong() and 0xFFFFFFFFL).toInt()
-                val (url, nextPos) = readUtf8WithNextPos(dirPos + 16L)
+                val (url, nextPos) = readUtf8WithNextPos(dirPos + 16L + paramLen)
                 val (title, _) = readUtf8WithNextPos(nextPos)
                 ZimDirectoryEntry.Content(entryIdx, mime, ns, clusterNum, blobNum, url, title)
             }
@@ -750,8 +794,8 @@ class ZimArchiveReader(
         return when (compression) {
             0, 1 -> slice
             2 -> InflaterInputStream(slice)
-            4 -> SingleXZInputStream(slice)
-            5 -> ZstdInputStream(slice).apply { setContinuous(false) }
+            4 -> XZInputStream(slice)
+            5 -> ZstdInputStream(slice).apply { setContinuous(true) }
             else -> {
                 slice.close()
                 error("Unsupported ZIM compression type ($compression)")
@@ -801,22 +845,22 @@ class ZimArchiveReader(
     }
 
     private fun readBytesAt(pos: Long, len: Int): ByteArray {
-        if (len <= 0) return ByteArray(0)
+        if (len <= 0 || pos < 0L) return ByteArray(0)
         val out = ByteArray(len)
         val buf = ByteBuffer.wrap(out)
         var readCount = 0
         synchronized(ioLock) {
             var offset = pos
-            val channelOk = runCatching {
+            val channelRead = runCatching {
                 while (buf.hasRemaining()) {
                     val n = channel.read(buf, offset)
                     if (n <= 0) break
                     offset += n
                 }
-                true
-            }.getOrDefault(false)
-            if (channelOk && buf.position() > 0) {
-                readCount = buf.position()
+                buf.position()
+            }.getOrDefault(0)
+            if (channelRead > 0) {
+                readCount = channelRead
             } else {
                 var off = 0
                 var curPos = pos

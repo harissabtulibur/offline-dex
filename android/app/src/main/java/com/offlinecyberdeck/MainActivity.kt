@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.WindowManager
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
@@ -46,6 +47,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.VideoLibrary
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
@@ -135,10 +137,36 @@ private sealed interface OverlayReader {
 class MainActivity : ComponentActivity() {
 
     private var pendingExternalUrl by mutableStateOf<String?>(null)
+    private var hardwareEscapeHandler: (() -> Unit)? = null
+    private var hardwareBackspaceHandler: (() -> Boolean)? = null
+    private var isComposeTextInputFocused: Boolean = false
 
     private val startupPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ -> }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val fromPhysicalKeyboard = event.device?.let { !it.isVirtual } != false
+        if (fromPhysicalKeyboard && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_ESCAPE -> {
+                    hardwareEscapeHandler?.let { handler ->
+                        handler.invoke()
+                        return true
+                    }
+                }
+                KeyEvent.KEYCODE_DEL -> {
+                    val viewTextFocus = currentFocus is android.widget.EditText
+                    if (!viewTextFocus && !isComposeTextInputFocused) {
+                        if (hardwareBackspaceHandler?.invoke() == true) {
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -197,7 +225,10 @@ class MainActivity : ComponentActivity() {
                     CyberDeckRootShell(
                         app = app,
                         browserViewModel = browserVm,
-                        settings = settings
+                        settings = settings,
+                        onRegisterEscapeHandler = { hardwareEscapeHandler = it },
+                        onRegisterBackspaceHandler = { hardwareBackspaceHandler = it },
+                        onTextInputFocusChanged = { isComposeTextInputFocused = it }
                     )
                     if (settings.nightDimmerPercent > 0) {
                         val alpha = (settings.nightDimmerPercent.coerceIn(0, 65) / 100f) * 0.85f
@@ -282,7 +313,10 @@ class MainActivity : ComponentActivity() {
 private fun CyberDeckRootShell(
     app: CyberDeckApplication,
     browserViewModel: BrowserViewModel,
-    settings: AppSettingsEntity
+    settings: AppSettingsEntity,
+    onRegisterEscapeHandler: ((() -> Unit)?) -> Unit,
+    onRegisterBackspaceHandler: ((() -> Boolean)?) -> Unit,
+    onTextInputFocusChanged: (Boolean) -> Unit
 ) {
     var currentDest by remember { mutableStateOf(MainDestination.BROWSER) }
     var libraryInitialTab by remember { mutableIntStateOf(0) }
@@ -305,14 +339,26 @@ private fun CyberDeckRootShell(
     var notifiedExternalKey by remember { mutableStateOf<String?>(null) }
     var showExternalDetectedDialog by remember { mutableStateOf(false) }
     var showExternalRemovedDialog by remember { mutableStateOf(false) }
+    var showFirstOnlineSetupDialog by remember {
+        mutableStateOf(!app.settingsRepository.isFirstOnlineSetupShownSync())
+    }
     var showDexPermissionsDialog by remember { mutableStateOf(false) }
     var autoPromptChecked by remember { mutableStateOf(false) }
     var isGestureNavEnabled by remember {
         mutableStateOf(DesktopLauncherManager.isGestureNavigationEnabled(context))
     }
 
-    LaunchedEffect(settings.desktopLauncherMode, settings.dexSetupPromptDismissed) {
-        if (!autoPromptChecked && settings.desktopLauncherMode && !settings.dexSetupPromptDismissed) {
+    LaunchedEffect(
+        settings.desktopLauncherMode,
+        settings.dexSetupPromptDismissed,
+        showFirstOnlineSetupDialog
+    ) {
+        if (!showFirstOnlineSetupDialog &&
+            !autoPromptChecked &&
+            settings.desktopLauncherMode &&
+            !settings.dexSetupPromptDismissed &&
+            !app.settingsRepository.isDexSetupPromptDismissedSync()
+        ) {
             autoPromptChecked = true
             val perm = DesktopLauncherManager.inspectPermissions(context)
             if (!perm.allCoreReady) {
@@ -570,7 +616,10 @@ private fun CyberDeckRootShell(
                     browserViewModel = browserViewModel,
                     settings = settings,
                     onShowPermissionsDialog = { showDexPermissionsDialog = true },
-                    onShowMessage = showMessage
+                    onShowMessage = showMessage,
+                    onRegisterToggleTerminal = { handler -> onRegisterEscapeHandler(handler) },
+                    onRegisterActiveBackHandler = { handler -> onRegisterBackspaceHandler(handler) },
+                    onTextInputFocusChanged = onTextInputFocusChanged
                 )
             }
         } else {
@@ -706,6 +755,8 @@ private fun CyberDeckRootShell(
                                             .onFailure { err -> showMessage("Gagal membuka ZIM: ${err.message}") }
                                     }
                                 },
+                                onRegisterGoBackHandler = { handler -> onRegisterBackspaceHandler(handler) },
+                                onTextInputFocusChanged = onTextInputFocusChanged,
                                 onShowMessage = showMessage
                             )
                         }
@@ -817,25 +868,76 @@ private fun CyberDeckRootShell(
         }
     }
 
-    if (showDexPermissionsDialog) {
+    if (showFirstOnlineSetupDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                app.settingsRepository.markFirstOnlineSetupShown()
+                showFirstOnlineSetupDialog = false
+            },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Filled.Wifi, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Text("Notifikasi Setup Awal (Online)")
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Harap pastikan perangkat terhubung ke internet (Online) untuk proses setup pertama kali.",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        "Koneksi internet pertama dibutuhkan untuk memuat inisialisasi layanan web offline seperti Offline Wiki (Kiwix PWA) dan penyiapan cache awal sebelum digunakan secara penuh secara offline.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "Pemberitahuan ini hanya muncul 1 kali pada pengaturan pertama.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = DeckAmber
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    app.settingsRepository.markFirstOnlineSetupShown()
+                    showFirstOnlineSetupDialog = false
+                }) {
+                    Text("Mengerti & Lanjutkan")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    app.settingsRepository.markFirstOnlineSetupShown()
+                    showFirstOnlineSetupDialog = false
+                    showMessage(DesktopLauncherManager.openWifiSettings(context))
+                }) {
+                    Text("Cek Wi-Fi")
+                }
+            }
+        )
+    }
+
+    if (showDexPermissionsDialog && !showFirstOnlineSetupDialog) {
+        val markDexPromptClosedOnce: () -> Unit = {
+            app.settingsRepository.markDexSetupPromptDismissedSync()
+            showDexPermissionsDialog = false
+            scope.launch {
+                app.settingsRepository.updateSettings { it.copy(dexSetupPromptDismissed = true) }
+            }
+        }
         DexPermissionsSetupDialog(
-            onDismiss = {
-                showDexPermissionsDialog = false
-                scope.launch {
-                    app.settingsRepository.updateSettings { it.copy(dexSetupPromptDismissed = true) }
-                }
-            },
-            onDismissForever = {
-                showDexPermissionsDialog = false
-                scope.launch {
-                    app.settingsRepository.updateSettings { it.copy(dexSetupPromptDismissed = true) }
-                }
-            },
+            onDismiss = markDexPromptClosedOnce,
+            onDismissForever = markDexPromptClosedOnce,
             onShowMessage = showMessage
         )
     }
 
-    if (showExternalDetectedDialog) {
+    if (showExternalDetectedDialog && !showFirstOnlineSetupDialog) {
         val detectedName = removableVolumes.firstOrNull()?.label
             ?: driveStatus.displayName.takeIf { driveStatus.isConnected }
             ?: "External Storage"

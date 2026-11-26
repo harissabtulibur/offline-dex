@@ -247,7 +247,15 @@ class DeckDriveManager(private val context: Context) {
     fun openReadFileDescriptor(uriOrPath: String): ParcelFileDescriptor? {
         if (uriOrPath.isBlank()) return null
         return if (uriOrPath.startsWith("content://")) {
-            runCatching { context.contentResolver.openFileDescriptor(Uri.parse(uriOrPath), "r") }.getOrNull()
+            val uri = Uri.parse(uriOrPath)
+            // Try resolving direct local path from externalstorage DocumentsProvider when MANAGE_EXTERNAL_STORAGE is active
+            resolveDirectFileFromContentUri(uri)?.let { file ->
+                if (file.exists() && file.canRead()) {
+                    runCatching { ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY) }.getOrNull()
+                        ?.let { return it }
+                }
+            }
+            runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
         } else {
             val path = if (uriOrPath.startsWith("file://")) Uri.parse(uriOrPath).path.orEmpty() else uriOrPath
             val file = File(path)
@@ -255,6 +263,23 @@ class DeckDriveManager(private val context: Context) {
                 runCatching { ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY) }.getOrNull()
             } else null
         }
+    }
+
+    private fun resolveDirectFileFromContentUri(uri: Uri): File? {
+        return runCatching {
+            val docId = android.provider.DocumentsContract.getDocumentId(uri)
+            val splitIdx = docId.indexOf(':')
+            if (splitIdx <= 0) return@runCatching null
+            val volume = docId.substring(0, splitIdx)
+            val relPath = docId.substring(splitIdx + 1).trimStart('/')
+            val baseDir = if (volume.equals("primary", ignoreCase = true)) {
+                Environment.getExternalStorageDirectory()
+            } else {
+                File("/storage/$volume")
+            }
+            val candidate = if (relPath.isEmpty()) baseDir else File(baseDir, relPath)
+            if (candidate.exists() && candidate.canRead()) candidate else null
+        }.getOrNull()
     }
 
     private fun resolveVolumeDirectory(vol: StorageVolume): File? {

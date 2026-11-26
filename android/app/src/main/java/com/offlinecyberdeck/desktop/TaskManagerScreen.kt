@@ -101,6 +101,9 @@ fun TaskManagerScreen(
     app: CyberDeckApplication,
     activeDesktopWindowsCount: Int = 0,
     activeWebViewCount: Int = 0,
+    openWindows: List<DesktopWindowState> = emptyList(),
+    onFocusWindow: ((String) -> Unit)? = null,
+    onCloseWindow: ((String) -> Unit)? = null,
     onTrimAppRam: (() -> Unit)? = null,
     onShowMessage: (String) -> Unit
 ) {
@@ -114,6 +117,7 @@ fun TaskManagerScreen(
 
     var processes by remember { mutableStateOf<List<TaskProcessItem>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
+    var onlyActiveOrRecent by remember { mutableStateOf(true) }
     var showSystemProcesses by remember { mutableStateOf(false) }
     var usageStatsGranted by remember { mutableStateOf(DesktopLauncherManager.hasUsageStatsAccess(context)) }
     var isBoosting by remember { mutableStateOf(false) }
@@ -258,13 +262,18 @@ fun TaskManagerScreen(
 
         when (selectedTab) {
             TaskManagerTab.PROCESSES -> {
-                val filteredProcs = remember(processes, searchQuery, showSystemProcesses) {
+                val filteredProcs = remember(processes, searchQuery, showSystemProcesses, onlyActiveOrRecent) {
                     processes.filter { item ->
-                        val sysOk = showSystemProcesses || !item.isSystemApp || item.isRunningProcess || item.isCurrentApp
+                        val activeOrRecentOk = !onlyActiveOrRecent ||
+                            item.isCurrentApp ||
+                            item.isRunningProcess ||
+                            item.isRecentlyOpened ||
+                            item.ramPssMb != null
+                        val sysOk = showSystemProcesses || !item.isSystemApp || item.isRunningProcess || item.isRecentlyOpened || item.isCurrentApp
                         val qOk = searchQuery.isBlank() ||
                             item.label.contains(searchQuery, true) ||
                             item.packageName.contains(searchQuery, true)
-                        sysOk && qOk
+                        activeOrRecentOk && sysOk && qOk
                     }
                 }
 
@@ -277,29 +286,74 @@ fun TaskManagerScreen(
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Row(
+                        Column(
                             modifier = Modifier.fillMaxWidth().padding(10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        "Offline Cyber Deck (Proses Utama)",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        "RAM Terpakai System: ${sysUsage.ramUsedMb} / ${sysUsage.ramTotalMb} MB (${sysUsage.ramPercent}%) • Window DeX: $activeDesktopWindowsCount • WebView: $activeWebViewCount",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                if (onTrimAppRam != null) {
+                                    OutlinedButton(onClick = {
+                                        onTrimAppRam()
+                                        onShowMessage("Cache WebView dibersihkan untuk menghemat RAM.")
+                                    }) {
+                                        Text("Trim WebView", maxLines = 1)
+                                    }
+                                }
+                            }
+                            if (openWindows.isNotEmpty() && onCloseWindow != null) {
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
                                 Text(
-                                    "Offline Cyber Deck (Proses Utama)",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    "RAM Terpakai System: ${sysUsage.ramUsedMb} / ${sysUsage.ramTotalMb} MB (${sysUsage.ramPercent}%) • Window DeX: $activeDesktopWindowsCount • WebView: $activeWebViewCount",
-                                    style = MaterialTheme.typography.bodySmall,
+                                    "Jendela Aplikasi Cyber Deck Aktif (${openWindows.size})",
+                                    style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                            }
-                            if (onTrimAppRam != null) {
-                                OutlinedButton(onClick = {
-                                    onTrimAppRam()
-                                    onShowMessage("Cache WebView dibersihkan untuk menghemat RAM.")
-                                }) {
-                                    Text("Trim WebView", maxLines = 1)
+                                openWindows.forEach { win ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            win.title,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Medium,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (onFocusWindow != null) {
+                                            TextButton(onClick = { onFocusWindow(win.id) }) {
+                                                Text("Fokus", fontSize = 11.sp)
+                                            }
+                                        }
+                                        if (win.kind != DesktopWindowKind.TASK_MANAGER) {
+                                            TextButton(
+                                                onClick = {
+                                                    onCloseWindow(win.id)
+                                                    onShowMessage("Jendela '${win.title}' ditutup.")
+                                                },
+                                                colors = ButtonDefaults.textButtonColors(contentColor = DeckRed)
+                                            ) {
+                                                Text("Tutup", fontSize = 11.sp)
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -316,7 +370,7 @@ fun TaskManagerScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text(
-                                    "Aktifkan 'Akses Data Penggunaan' agar aplikasi yang aktif terbaru & pemakaiannya tampil lengkap.",
+                                    "Aktifkan 'Akses Data Penggunaan' agar aplikasi baru dibuka (Recent Apps) & pemakaian RAM tampil lengkap.",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = DeckAmber,
                                     modifier = Modifier.weight(1f)
@@ -333,20 +387,25 @@ fun TaskManagerScreen(
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         OutlinedTextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it },
                             singleLine = true,
                             leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                            placeholder = { Text("Cari aplikasi atau paket...") },
+                            placeholder = { Text("Cari aplikasi...") },
                             modifier = Modifier.weight(1f)
+                        )
+                        FilterChip(
+                            selected = onlyActiveOrRecent,
+                            onClick = { onlyActiveOrRecent = !onlyActiveOrRecent },
+                            label = { Text("Aktif & Recent") }
                         )
                         FilterChip(
                             selected = showSystemProcesses,
                             onClick = { showSystemProcesses = !showSystemProcesses },
-                            label = { Text("App Sistem") }
+                            label = { Text("Sistem") }
                         )
                     }
 
@@ -359,8 +418,8 @@ fun TaskManagerScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("Aplikasi (${filteredProcs.size})", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(2f))
-                        Text("RAM / Net", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1.2f))
-                        Text("Aksi", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.width(106.dp))
+                        Text("RAM / Status", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1.2f))
+                        Text("Tutup / Aksi", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.width(114.dp))
                     }
 
                     LazyColumn(
@@ -702,11 +761,13 @@ private fun ProcessRowCard(
             Column(modifier = Modifier.weight(1.2f)) {
                 Text(
                     text = item.ramPssMb?.let { "$it MB RAM" }
-                        ?: if (item.isRunningProcess) "Aktif" else if (item.lastUsedMs > 0L) "Baru dipakai" else "Terinstall",
+                        ?: if (item.isRunningProcess) "Aktif"
+                        else if (item.isRecentlyOpened || item.lastUsedMs > 0L) "Baru dibuka"
+                        else "Terinstall",
                     style = MaterialTheme.typography.labelMedium,
                     color = when {
                         (item.ramPssMb ?: 0) >= 250 -> DeckRed
-                        item.isRunningProcess -> DeckGreen
+                        item.isRunningProcess || item.isRecentlyOpened -> DeckGreen
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                     fontFamily = FontFamily.Monospace
@@ -722,7 +783,7 @@ private fun ProcessRowCard(
             }
 
             Row(
-                modifier = Modifier.width(106.dp),
+                modifier = Modifier.width(114.dp),
                 horizontalArrangement = Arrangement.End,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -733,7 +794,7 @@ private fun ProcessRowCard(
                     ) {
                         Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(14.dp))
                         Spacer(Modifier.width(2.dp))
-                        Text("Kill", fontSize = 12.sp)
+                        Text("Tutup", fontSize = 12.sp)
                     }
                     IconButton(onClick = onAppInfo, modifier = Modifier.size(28.dp)) {
                         Icon(Icons.Filled.Settings, contentDescription = "Force Stop / Info", modifier = Modifier.size(16.dp))

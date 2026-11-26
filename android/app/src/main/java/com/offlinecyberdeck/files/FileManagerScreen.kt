@@ -86,6 +86,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -97,9 +98,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -120,7 +127,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
 import java.util.Locale
+import kotlin.math.roundToInt
 
 private val WinBlue = Color(0xFF0078D4)
 private val WinFolderGold = Color(0xFFFFC107)
@@ -149,12 +159,24 @@ private data class FileClipboardItem(
     val isCut: Boolean
 )
 
+private data class PasteProgressState(
+    val active: Boolean = false,
+    val isCut: Boolean = false,
+    val currentFileName: String = "",
+    val completedFiles: Int = 0,
+    val totalFiles: Int = 0,
+    val copiedBytes: Long = 0L,
+    val totalBytes: Long = 0L
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun FileManagerScreen(
     app: CyberDeckApplication,
     onShowMessage: (String) -> Unit,
-    onOpenZimPathOrUri: ((String) -> Unit)? = null
+    onOpenZimPathOrUri: ((String) -> Unit)? = null,
+    onRegisterGoBackHandler: ((() -> Boolean) -> Unit)? = null,
+    onTextInputFocusChanged: ((Boolean) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -169,12 +191,14 @@ fun FileManagerScreen(
     var entries by remember { mutableStateOf<List<ExplorerEntry>>(emptyList()) }
     var isLoading by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
+    var isSearchFocused by remember { mutableStateOf(false) }
     var gridView by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableIntStateOf(0) }
 
     var selectedKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     val inSelectionMode = selectedKeys.isNotEmpty()
     var clipboardItem by remember { mutableStateOf<FileClipboardItem?>(null) }
+    var pasteProgress by remember { mutableStateOf(PasteProgressState()) }
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var renamingEntry by remember { mutableStateOf<ExplorerEntry?>(null) }
     var deletingEntries by remember { mutableStateOf<List<ExplorerEntry>>(emptyList()) }
@@ -203,6 +227,19 @@ fun FileManagerScreen(
             searchQuery = ""
             true
         } else false
+    }
+
+    DisposableEffect(onRegisterGoBackHandler) {
+        onRegisterGoBackHandler?.invoke {
+            if (!isSearchFocused && !showNewFolderDialog && renamingEntry == null && textPreviewTitle == null) {
+                goBack()
+            } else {
+                false
+            }
+        }
+        onDispose {
+            onTextInputFocusChanged?.invoke(false)
+        }
     }
 
     fun goForward() {
@@ -359,9 +396,80 @@ fun FileManagerScreen(
 
     fun pasteClipboardHere() {
         val clip = clipboardItem ?: return
+        if (pasteProgress.active) return
         if (currentLocation == ExplorerLocation.ThisPc) {
             onShowMessage("Buka folder tujuan terlebih dahulu sebelum menempel.")
             return
+        }
+
+        fun countFilesAndBytes(list: List<ExplorerEntry>): Pair<Int, Long> {
+            var count = 0
+            var bytes = 0L
+            fun walkLocal(f: File) {
+                if (f.isDirectory) {
+                    f.listFiles().orEmpty().forEach { walkLocal(it) }
+                } else {
+                    count++
+                    bytes += f.length().coerceAtLeast(0L)
+                }
+            }
+            fun walkSaf(uriStr: String) {
+                val doc = DocumentFile.fromTreeUri(context, Uri.parse(uriStr))
+                    ?: DocumentFile.fromSingleUri(context, Uri.parse(uriStr))
+                    ?: return
+                if (doc.isDirectory) {
+                    doc.listFiles().forEach { walkSaf(it.uri.toString()) }
+                } else {
+                    count++
+                    bytes += doc.length().coerceAtLeast(0L)
+                }
+            }
+            for (e in list) {
+                if (e.localPath != null) walkLocal(File(e.localPath))
+                else if (e.safUri != null) walkSaf(e.safUri)
+            }
+            return count.coerceAtLeast(1) to bytes
+        }
+
+        var copiedBytesAcc = 0L
+        var completedFilesAcc = 0
+        var totalFilesExpected = 1
+        var totalBytesExpected = 0L
+
+        fun reportProgress(fileName: String) {
+            val pctSnap = copiedBytesAcc
+            val filesSnap = completedFilesAcc
+            scope.launch {
+                pasteProgress = PasteProgressState(
+                    active = true,
+                    isCut = clip.isCut,
+                    currentFileName = fileName,
+                    completedFiles = filesSnap,
+                    totalFiles = totalFilesExpected,
+                    copiedBytes = pctSnap,
+                    totalBytes = totalBytesExpected
+                )
+            }
+        }
+
+        fun copyStreamWithProgress(fileName: String, input: InputStream, output: OutputStream) {
+            val buf = ByteArray(64 * 1024)
+            var sinceLastReport = 0L
+            reportProgress(fileName)
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                output.write(buf, 0, n)
+                copiedBytesAcc += n
+                sinceLastReport += n
+                if (sinceLastReport >= 256 * 1024L) {
+                    sinceLastReport = 0L
+                    reportProgress(fileName)
+                }
+            }
+            output.flush()
+            completedFilesAcc++
+            reportProgress(fileName)
         }
 
         fun copyLocalRecursiveToLocal(src: File, dstParent: File) {
@@ -371,7 +479,9 @@ fun FileManagerScreen(
             } else {
                 val targetFile = app.driveManager.createUniqueInternalFile(dstParent, src.name)
                 src.inputStream().use { input ->
-                    targetFile.outputStream().use { output -> input.copyTo(output) }
+                    targetFile.outputStream().use { output ->
+                        copyStreamWithProgress(src.name, input, output)
+                    }
                 }
             }
         }
@@ -403,7 +513,9 @@ fun FileManagerScreen(
                 } else {
                     val targetFile = app.driveManager.createUniqueInternalFile(dstParent, entry.name)
                     app.driveManager.openInputStream(entry.safUri)?.use { input ->
-                        targetFile.outputStream().use { output -> input.copyTo(output) }
+                        targetFile.outputStream().use { output ->
+                            copyStreamWithProgress(entry.name, input, output)
+                        }
                     } ?: error("Gagal membaca sumber SAF: ${entry.name}")
                 }
             }
@@ -455,15 +567,29 @@ fun FileManagerScreen(
                 ) ?: error("Gagal membuat file di drive eksternal")
                 app.driveManager.openInputStream(srcRef)?.use { input ->
                     context.contentResolver.openOutputStream(created.uri)?.use { output ->
-                        input.copyTo(output)
+                        copyStreamWithProgress(entry.name, input, output)
                     }
                 } ?: error("Gagal menyalin data file ${entry.name}")
             }
         }
 
         scope.launch {
+            pasteProgress = PasteProgressState(
+                active = true,
+                isCut = clip.isCut,
+                currentFileName = clip.entries.firstOrNull()?.name ?: "Menghitung file...",
+                completedFiles = 0,
+                totalFiles = clip.entries.size.coerceAtLeast(1),
+                copiedBytes = 0L,
+                totalBytes = 0L
+            )
             val res = withContext(Dispatchers.IO) {
                 runCatching {
+                    val (tFiles, tBytes) = countFilesAndBytes(clip.entries)
+                    totalFilesExpected = tFiles
+                    totalBytesExpected = tBytes
+                    reportProgress(clip.entries.firstOrNull()?.name ?: "Menyalin...")
+
                     var count = 0
                     for (entry in clip.entries) {
                         when (val loc = currentLocation) {
@@ -487,10 +613,11 @@ fun FileManagerScreen(
                     count
                 }
             }
+            pasteProgress = PasteProgressState()
             res.onSuccess { count ->
                 if (clip.isCut) clipboardItem = null
                 refreshTick++
-                onShowMessage("Berhasil menempel $count item.")
+                onShowMessage("Berhasil ${if (clip.isCut) "memindahkan" else "menempel"} $count item.")
             }.onFailure {
                 onShowMessage("Gagal menempel item: ${it.message}")
             }
@@ -526,6 +653,21 @@ fun FileManagerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
+            .onPreviewKeyEvent { ev ->
+                if (
+                    ev.type == KeyEventType.KeyDown &&
+                    ev.key == Key.Backspace &&
+                    !isSearchFocused &&
+                    !showNewFolderDialog &&
+                    renamingEntry == null &&
+                    textPreviewTitle == null &&
+                    navIndex > 0
+                ) {
+                    goBack()
+                } else {
+                    false
+                }
+            }
     ) {
         // Windows Explorer Top Command Ribbon & Address Bar
         Surface(color = MaterialTheme.colorScheme.surface) {
@@ -623,7 +765,12 @@ fun FileManagerScreen(
                                         singleLine = true,
                                         textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 12.sp),
                                         cursorBrush = SolidColor(WinBlue),
-                                        modifier = Modifier.fillMaxWidth()
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .onFocusChanged {
+                                                isSearchFocused = it.isFocused
+                                                onTextInputFocusChanged?.invoke(it.isFocused)
+                                            }
                                     )
                                 }
                                 if (searchQuery.isNotEmpty()) {
@@ -1204,7 +1351,8 @@ fun FileManagerScreen(
                     value = folderName,
                     onValueChange = { folderName = it },
                     label = { Text("Nama Folder") },
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.onFocusChanged { onTextInputFocusChanged?.invoke(it.isFocused) }
                 )
             },
             confirmButton = {
@@ -1243,7 +1391,8 @@ fun FileManagerScreen(
                     value = newName,
                     onValueChange = { newName = it },
                     label = { Text("Nama Baru") },
-                    singleLine = true
+                    singleLine = true,
+                    modifier = Modifier.onFocusChanged { onTextInputFocusChanged?.invoke(it.isFocused) }
                 )
             },
             confirmButton = {
@@ -1351,6 +1500,65 @@ fun FileManagerScreen(
                     textPreviewContent = null
                 }) { Text("Tutup") }
             }
+        )
+    }
+
+    if (pasteProgress.active) {
+        val frac = when {
+            pasteProgress.totalBytes > 0L ->
+                (pasteProgress.copiedBytes.toFloat() / pasteProgress.totalBytes.toFloat()).coerceIn(0f, 1f)
+            pasteProgress.totalFiles > 0 ->
+                (pasteProgress.completedFiles.toFloat() / pasteProgress.totalFiles.toFloat()).coerceIn(0f, 1f)
+            else -> 0f
+        }
+        val pct = (frac * 100f).roundToInt().coerceIn(0, 100)
+        AlertDialog(
+            onDismissRequest = {},
+            title = {
+                Text(if (pasteProgress.isCut) "Memindahkan File..." else "Menyalin File...")
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        pasteProgress.currentFileName,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    LinearProgressIndicator(
+                        progress = { frac },
+                        color = WinBlue,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(10.dp)
+                            .clip(RoundedCornerShape(5.dp))
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            "${pasteProgress.completedFiles} / ${pasteProgress.totalFiles} file",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            "$pct%",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold,
+                            color = WinBlue
+                        )
+                    }
+                    if (pasteProgress.totalBytes > 0L) {
+                        Text(
+                            "${Formatters.formatBytes(pasteProgress.copiedBytes)} / ${Formatters.formatBytes(pasteProgress.totalBytes)}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            },
+            confirmButton = {}
         )
     }
 }

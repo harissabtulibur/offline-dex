@@ -79,7 +79,10 @@ import com.offlinecyberdeck.core.model.SearchEngineOption
 import com.offlinecyberdeck.core.model.StorageDashboardStats
 import com.offlinecyberdeck.core.model.StorageTarget
 import com.offlinecyberdeck.core.model.ThemeMode
+import com.offlinecyberdeck.core.settings.TerminalCustomTargetType
 import com.offlinecyberdeck.desktop.DesktopLauncherManager
+import com.offlinecyberdeck.desktop.DesktopWindowKind
+import com.offlinecyberdeck.desktop.InstalledAppInfo
 import com.offlinecyberdeck.ui.theme.DeckAmber
 import com.offlinecyberdeck.ui.theme.DeckGreen
 import com.offlinecyberdeck.ui.theme.DeckRed
@@ -104,6 +107,14 @@ fun SettingsScreen(
         .collectAsStateWithLifecycle(initialValue = emptyList())
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+
+    val desktopIconSizeDp by app.settingsRepository.desktopIconSizeDpFlow
+        .collectAsStateWithLifecycle()
+    val terminalCustomCommands by app.settingsRepository.terminalCustomCommandsFlow
+        .collectAsStateWithLifecycle()
+
+    var showCustomCommandDialog by remember { mutableStateOf(false) }
+    var installedAppsForCustomCmd by remember { mutableStateOf<List<InstalledAppInfo>>(emptyList()) }
 
     var dashboard by remember { mutableStateOf(StorageDashboardStats()) }
     var customTemplateDraft by remember(settings.customSearchTemplate) {
@@ -857,10 +868,125 @@ fun SettingsScreen(
                                     activeCustomWallpaperIndex = -1
                                 )
                             }
+                            app.settingsRepository.setDesktopIconSizeDp(46)
                             onShowMessage("Display & developer options reset to defaults (95% UI scale)")
                         }
                     }) {
                         Text("Reset Display")
+                    }
+                }
+            }
+        }
+
+        // DESKTOP ICON SIZE & TERMINAL CUSTOM COMMANDS (GUI)
+        item {
+            SectionCard("Desktop Icon Size & Terminal Custom Commands (GUI)") {
+                Text(
+                    "Ukuran Ikon Desktop: $desktopIconSizeDp dp",
+                    style = MaterialTheme.typography.titleSmall
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("Kecil" to 38, "Normal" to 46, "Besar" to 58, "Extra" to 66).forEach { (label, dpVal) ->
+                        FilterChip(
+                            selected = desktopIconSizeDp == dpVal,
+                            onClick = { app.settingsRepository.setDesktopIconSizeDp(dpVal) },
+                            label = { Text("$label (${dpVal}dp)") }
+                        )
+                    }
+                }
+                Slider(
+                    value = desktopIconSizeDp.toFloat(),
+                    onValueChange = { v ->
+                        app.settingsRepository.setDesktopIconSizeDp(v.roundToInt().coerceIn(36, 68))
+                    },
+                    valueRange = 36f..68f
+                )
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Terminal Custom Commands (${terminalCustomCommands.size})",
+                            style = MaterialTheme.typography.titleSmall
+                        )
+                        Text(
+                            "Buat perintah singkat di PowerShell Terminal untuk membuka aplikasi Cyber Deck atau aplikasi Android terinstall.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                if (installedAppsForCustomCmd.isEmpty()) {
+                                    installedAppsForCustomCmd = DesktopLauncherManager.loadInstalledApps(context)
+                                }
+                                showCustomCommandDialog = true
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Tambah")
+                    }
+                }
+
+                if (terminalCustomCommands.isEmpty()) {
+                    Text(
+                        "Belum ada custom command terdaftar. Tambahkan lewat tombol 'Tambah' di atas.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        terminalCustomCommands.forEach { cmd ->
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            cmd.command,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Text(
+                                            "${cmd.label} • ${cmd.targetType.label} (${cmd.targetValue})",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            app.settingsRepository.deleteTerminalCustomCommand(cmd.id)
+                                            onShowMessage("Custom command '${cmd.command}' dihapus.")
+                                        }
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Delete,
+                                            contentDescription = "Hapus Custom Command",
+                                            tint = DeckRed
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1170,6 +1296,153 @@ fun SettingsScreen(
             },
             confirmButton = {
                 Button(onClick = { showSafeEjectDialog = false }) { Text("OK") }
+            }
+        )
+    }
+
+    if (showCustomCommandDialog) {
+        var cmdKeyword by remember { mutableStateOf("") }
+        var targetType by remember { mutableStateOf(TerminalCustomTargetType.IN_APP) }
+        var selectedInAppKind by remember { mutableStateOf(DesktopWindowKind.BROWSER) }
+        var selectedInstalledPkg by remember(installedAppsForCustomCmd) {
+            mutableStateOf(installedAppsForCustomCmd.firstOrNull()?.packageName.orEmpty())
+        }
+        var selectedInstalledLabel by remember(installedAppsForCustomCmd) {
+            mutableStateOf(installedAppsForCustomCmd.firstOrNull()?.label.orEmpty())
+        }
+        var appFilter by remember { mutableStateOf("") }
+
+        val inAppOptions = remember {
+            listOf(
+                DesktopWindowKind.BROWSER,
+                DesktopWindowKind.SEARCH,
+                DesktopWindowKind.OFFLINE_WIKI,
+                DesktopWindowKind.MEDIA,
+                DesktopWindowKind.MUSIC,
+                DesktopWindowKind.FILES,
+                DesktopWindowKind.LIBRARY,
+                DesktopWindowKind.TASK_MANAGER,
+                DesktopWindowKind.DOWNLOADS,
+                DesktopWindowKind.SETTINGS
+            )
+        }
+
+        AlertDialog(
+            onDismissRequest = { showCustomCommandDialog = false },
+            title = { Text("Tambah Custom Command Terminal") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = cmdKeyword,
+                        onValueChange = { cmdKeyword = it.replace(" ", "_") },
+                        label = { Text("Nama Command (cth: wiki, yt, wa, musik)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TerminalCustomTargetType.entries.forEach { t ->
+                            FilterChip(
+                                selected = targetType == t,
+                                onClick = { targetType = t },
+                                label = { Text(t.label) }
+                            )
+                        }
+                    }
+                    if (targetType == TerminalCustomTargetType.IN_APP) {
+                        Text("Pilih Fitur Cyber Deck:", style = MaterialTheme.typography.labelMedium)
+                        Column(
+                            modifier = Modifier.fillMaxWidth().height(180.dp)
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                .padding(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            LazyColumn {
+                                items(inAppOptions.size) { idx ->
+                                    val k = inAppOptions[idx]
+                                    val chosen = k == selectedInAppKind
+                                    Surface(
+                                        color = if (chosen) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.fillMaxWidth().clickable { selectedInAppKind = k }
+                                    ) {
+                                        Text(
+                                            k.defaultTitle,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                            fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        OutlinedTextField(
+                            value = appFilter,
+                            onValueChange = { appFilter = it },
+                            label = { Text("Cari aplikasi terinstall...") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        val filteredApps = remember(installedAppsForCustomCmd, appFilter) {
+                            val q = appFilter.trim().lowercase(Locale.US)
+                            installedAppsForCustomCmd.filter {
+                                q.isBlank() || it.label.lowercase(Locale.US).contains(q) || it.packageName.lowercase(Locale.US).contains(q)
+                            }.take(40)
+                        }
+                        Box(
+                            modifier = Modifier.fillMaxWidth().height(180.dp)
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                .padding(6.dp)
+                        ) {
+                            LazyColumn {
+                                items(filteredApps.size) { idx ->
+                                    val appItem = filteredApps[idx]
+                                    val chosen = appItem.packageName == selectedInstalledPkg
+                                    Surface(
+                                        color = if (chosen) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.fillMaxWidth().clickable {
+                                            selectedInstalledPkg = appItem.packageName
+                                            selectedInstalledLabel = appItem.label
+                                        }
+                                    ) {
+                                        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                                            Text(appItem.label, fontWeight = if (chosen) FontWeight.Bold else FontWeight.Normal)
+                                            Text(
+                                                appItem.packageName,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = cmdKeyword.trim().isNotBlank() &&
+                        (targetType == TerminalCustomTargetType.IN_APP || selectedInstalledPkg.isNotBlank()),
+                    onClick = {
+                        val (value, label) = if (targetType == TerminalCustomTargetType.IN_APP) {
+                            selectedInAppKind.name to selectedInAppKind.defaultTitle
+                        } else {
+                            selectedInstalledPkg to selectedInstalledLabel.ifBlank { selectedInstalledPkg }
+                        }
+                        app.settingsRepository.addOrUpdateTerminalCustomCommand(
+                            command = cmdKeyword.trim(),
+                            label = label,
+                            targetType = targetType,
+                            targetValue = value
+                        )
+                        onShowMessage("Custom command '${cmdKeyword.trim().lowercase(Locale.US)}' disimpan.")
+                        showCustomCommandDialog = false
+                    }
+                ) { Text("Simpan") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomCommandDialog = false }) { Text("Batal") }
             }
         )
     }

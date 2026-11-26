@@ -1,7 +1,9 @@
 package com.offlinecyberdeck.desktop
 
+import android.Manifest
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.os.Build
 import android.text.format.DateFormat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -37,6 +39,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
@@ -51,11 +54,15 @@ import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.BatteryAlert
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BatteryFull
+import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.BluetoothConnected
+import androidx.compose.material.icons.filled.BluetoothDisabled
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Delete
@@ -85,6 +92,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Usb
 import androidx.compose.material.icons.filled.VideoLibrary
@@ -127,6 +135,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
@@ -166,6 +175,7 @@ import com.offlinecyberdeck.core.storage.ExternalVolumeInfo
 import com.offlinecyberdeck.downloads.DownloadsScreen
 import com.offlinecyberdeck.files.FileManagerScreen
 import com.offlinecyberdeck.library.LibraryScreen
+import com.offlinecyberdeck.library.OfflineWikiScreen
 import com.offlinecyberdeck.library.PdfViewerScreen
 import com.offlinecyberdeck.library.TextDocumentReaderScreen
 import com.offlinecyberdeck.library.ZimViewerScreen
@@ -199,6 +209,8 @@ enum class DesktopWindowKind(val defaultTitle: String) {
     BOOKMARKS("Bookmarks"),
     HISTORY("History"),
     SEARCH("Offline Search"),
+    OFFLINE_WIKI("Offline Wiki"),
+    TERMINAL("PowerShell Terminal"),
     SETTINGS("Settings"),
     ARCHIVE_READER("Archive Reader"),
     PDF_READER("PDF Viewer"),
@@ -208,7 +220,7 @@ enum class DesktopWindowKind(val defaultTitle: String) {
 }
 
 private enum class TaskbarTrayPopup {
-    NETWORK, BATTERY, CLOCK, STORAGE
+    NETWORK, BLUETOOTH, BATTERY, CLOCK, STORAGE
 }
 
 data class DesktopWindowState(
@@ -232,7 +244,10 @@ fun DesktopLauncherScreen(
     browserViewModel: BrowserViewModel,
     settings: AppSettingsEntity,
     onShowPermissionsDialog: () -> Unit,
-    onShowMessage: (String) -> Unit
+    onShowMessage: (String) -> Unit,
+    onRegisterToggleTerminal: ((() -> Unit) -> Unit) = {},
+    onRegisterActiveBackHandler: ((() -> Boolean) -> Unit) = {},
+    onTextInputFocusChanged: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -250,6 +265,7 @@ fun DesktopLauncherScreen(
     var appSearchQuery by remember { mutableStateOf("") }
     var showSystemApps by remember { mutableStateOf(false) }
     var permStatus by remember { mutableStateOf(DesktopLauncherManager.inspectPermissions(context)) }
+    var bluetoothStatus by remember { mutableStateOf(DesktopLauncherManager.readBluetoothStatus(context)) }
     var clockText by remember { mutableStateOf("") }
     var clockSecondsText by remember { mutableStateOf("") }
     var dateText by remember { mutableStateOf("") }
@@ -259,6 +275,8 @@ fun DesktopLauncherScreen(
     val systemNotifications by NotificationCenterStore.notifications.collectAsStateWithLifecycle()
     val downloads by app.database.downloadDao().observeAll().collectAsStateWithLifecycle(initialValue = emptyList())
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
+    val desktopIconSizeDp by app.settingsRepository.desktopIconSizeDpFlow.collectAsStateWithLifecycle(initialValue = 46)
+    val terminalCustomCommands by app.settingsRepository.terminalCustomCommandsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
 
     var mountedPartitions by remember { mutableStateOf(app.driveManager.detectAllMountedRemovablePartitions()) }
     var isGestureNavEnabled by remember { mutableStateOf(DesktopLauncherManager.isGestureNavigationEnabled(context)) }
@@ -268,10 +286,18 @@ fun DesktopLauncherScreen(
     var activeTrayPopup by remember { mutableStateOf<TaskbarTrayPopup?>(null) }
     var windowMenuId by remember { mutableStateOf<String?>(null) }
     var showSavedHubDialog by remember { mutableStateOf(false) }
+    var showOfflineHubDialog by remember { mutableStateOf(false) }
     var showWallpaperDialog by remember { mutableStateOf(false) }
     var pendingWallpaperSlot by remember { mutableIntStateOf(0) }
     var floatingNotif by remember { mutableStateOf<DeckNotificationItem?>(null) }
+    var filesGoBackHandler by remember { mutableStateOf<(() -> Boolean)?>(null) }
     val notifSoundEnabledState by rememberUpdatedState(settings.notificationSoundEnabled)
+
+    val btPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        bluetoothStatus = DesktopLauncherManager.readBluetoothStatus(context)
+    }
 
     LaunchedEffect(driveStatus) {
         mountedPartitions = app.driveManager.detectAllMountedRemovablePartitions()
@@ -391,6 +417,7 @@ fun DesktopLauncherScreen(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 permStatus = DesktopLauncherManager.inspectPermissions(context)
+                bluetoothStatus = DesktopLauncherManager.readBluetoothStatus(context)
                 batteryStatus = DesktopLauncherManager.readBatteryStatus(context)
                 systemUsage = DesktopLauncherManager.readSystemUsage(context)
                 mountedPartitions = app.driveManager.detectAllMountedRemovablePartitions()
@@ -538,10 +565,48 @@ fun DesktopLauncherScreen(
             floating = launchExternalFloating,
             cascadeIndex = externalCascadeIndex++
         ).onSuccess { msg ->
+            DesktopLauncherManager.recordAppLaunched(pkg)
             appDrawerOpen = false
             onShowMessage(msg)
         }.onFailure { err ->
             onShowMessage("Gagal membuka app: ${err.message}")
+        }
+    }
+
+    LaunchedEffect(appDrawerOpen) {
+        if (!appDrawerOpen) {
+            onTextInputFocusChanged(false)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        onRegisterToggleTerminal {
+            val termWin = windows.firstOrNull { it.kind == DesktopWindowKind.TERMINAL }
+            if (termWin != null && !termWin.isMinimized) {
+                closeWindow(termWin.id)
+            } else {
+                activeTrayPopup = null
+                notifPanelOpen = false
+                appDrawerOpen = false
+                showOfflineHubDialog = false
+                showSavedHubDialog = false
+                openOrFocusWindow(DesktopWindowKind.TERMINAL)
+            }
+        }
+        onRegisterActiveBackHandler {
+            val topWin = windows.filter { !it.isMinimized }.maxByOrNull { it.zIndex }
+            if (topWin?.kind == DesktopWindowKind.FILES &&
+                !appDrawerOpen &&
+                !notifPanelOpen &&
+                activeTrayPopup == null &&
+                !showOfflineHubDialog &&
+                !showSavedHubDialog &&
+                !showWallpaperDialog
+            ) {
+                filesGoBackHandler?.invoke() ?: false
+            } else {
+                false
+            }
         }
     }
 
@@ -641,11 +706,10 @@ fun DesktopLauncherScreen(
                 val builtInShortcuts = listOf(
                     Triple(DesktopWindowKind.BROWSER, "Cyber Browser", Icons.Filled.Public),
                     Triple(DesktopWindowKind.LIBRARY, "Knowledge Vault", Icons.Filled.MenuBook),
-                    Triple(DesktopWindowKind.MEDIA, "OfflineTube", Icons.Filled.VideoLibrary),
                     Triple(DesktopWindowKind.MUSIC, "Cyber Music", Icons.Filled.LibraryMusic),
                     Triple(DesktopWindowKind.FILES, "File Explorer", Icons.Filled.Folder),
                     Triple(DesktopWindowKind.TASK_MANAGER, "Task Manager", Icons.Filled.Speed),
-                    Triple(DesktopWindowKind.SEARCH, "Offline Search", Icons.Filled.Search),
+                    Triple(DesktopWindowKind.TERMINAL, "Terminal", Icons.Filled.Terminal),
                     Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings)
                 )
 
@@ -739,8 +803,11 @@ fun DesktopLauncherScreen(
 
                     Spacer(Modifier.height(12.dp))
 
+                    val iconBoxSize = desktopIconSizeDp.coerceIn(36, 68)
+                    val innerIconSize = (iconBoxSize * 0.56f).roundToInt().coerceIn(20, 40)
+
                     LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 96.dp),
+                        columns = GridCells.Adaptive(minSize = (iconBoxSize + 50).dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                         modifier = Modifier.fillMaxSize()
@@ -753,7 +820,7 @@ fun DesktopLauncherScreen(
                                 iconContent = {
                                     Box(
                                         modifier = Modifier
-                                            .size(46.dp)
+                                            .size(iconBoxSize.dp)
                                             .clip(RoundedCornerShape(12.dp))
                                             .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
                                         contentAlignment = Alignment.Center
@@ -762,7 +829,32 @@ fun DesktopLauncherScreen(
                                             icon,
                                             contentDescription = label,
                                             tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(26.dp)
+                                            modifier = Modifier.size(innerIconSize.dp)
+                                        )
+                                    }
+                                }
+                            )
+                        }
+
+                        // Unified Offline Hub (Offline Wiki / Kiwix PWA + OfflineTube + Offline Search)
+                        item(key = "unified_offline_hub") {
+                            DesktopShortcutTile(
+                                label = "Offline",
+                                labelColor = desktopTextColor,
+                                onClick = { showOfflineHubDialog = true },
+                                iconContent = {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(iconBoxSize.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color(0xFF0EA5E9).copy(alpha = 0.22f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.CloudOff,
+                                            contentDescription = "Offline Wiki, OfflineTube & Offline Search",
+                                            tint = Color(0xFF38BDF8),
+                                            modifier = Modifier.size(innerIconSize.dp)
                                         )
                                     }
                                 }
@@ -778,7 +870,7 @@ fun DesktopLauncherScreen(
                                 iconContent = {
                                     Box(
                                         modifier = Modifier
-                                            .size(46.dp)
+                                            .size(iconBoxSize.dp)
                                             .clip(RoundedCornerShape(12.dp))
                                             .background(DeckGreen.copy(alpha = 0.2f)),
                                         contentAlignment = Alignment.Center
@@ -787,7 +879,7 @@ fun DesktopLauncherScreen(
                                             Icons.Filled.Bookmarks,
                                             contentDescription = "Bookmarks, History & Downloads",
                                             tint = DeckGreen,
-                                            modifier = Modifier.size(26.dp)
+                                            modifier = Modifier.size(innerIconSize.dp)
                                         )
                                     }
                                 }
@@ -802,7 +894,7 @@ fun DesktopLauncherScreen(
                                 iconContent = {
                                     Box(
                                         modifier = Modifier
-                                            .size(46.dp)
+                                            .size(iconBoxSize.dp)
                                             .clip(RoundedCornerShape(12.dp))
                                             .background(Color(0xFFA855F7).copy(alpha = 0.22f)),
                                         contentAlignment = Alignment.Center
@@ -811,31 +903,7 @@ fun DesktopLauncherScreen(
                                             Icons.Filled.Wallpaper,
                                             contentDescription = "Wallpaper & Latar",
                                             tint = Color(0xFFC084FC),
-                                            modifier = Modifier.size(26.dp)
-                                        )
-                                    }
-                                }
-                            )
-                        }
-
-                        item(key = "dex_permissions_shortcut") {
-                            DesktopShortcutTile(
-                                label = "Izin DeX & Floating",
-                                labelColor = desktopTextColor,
-                                onClick = onShowPermissionsDialog,
-                                iconContent = {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(46.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(DeckAmber.copy(alpha = 0.18f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.AdminPanelSettings,
-                                            contentDescription = "Izin DeX",
-                                            tint = DeckAmber,
-                                            modifier = Modifier.size(26.dp)
+                                            modifier = Modifier.size(innerIconSize.dp)
                                         )
                                     }
                                 }
@@ -850,7 +918,7 @@ fun DesktopLauncherScreen(
                                 iconContent = {
                                     InstalledAppIcon(
                                         packageName = extApp.packageName,
-                                        modifier = Modifier.size(46.dp)
+                                        modifier = Modifier.size(iconBoxSize.dp)
                                     )
                                 }
                             )
@@ -1059,6 +1127,9 @@ fun DesktopLauncherScreen(
                                                 )
                                             }
                                             DesktopWindowKind.FILES -> {
+                                                DisposableEffect(win.id) {
+                                                    onDispose { filesGoBackHandler = null }
+                                                }
                                                 FileManagerScreen(
                                                     app = app,
                                                     onOpenZimPathOrUri = { ref ->
@@ -1076,6 +1147,8 @@ fun DesktopLauncherScreen(
                                                                 }
                                                         }
                                                     },
+                                                    onRegisterGoBackHandler = { handler -> filesGoBackHandler = handler },
+                                                    onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
@@ -1084,6 +1157,9 @@ fun DesktopLauncherScreen(
                                                     app = app,
                                                     activeDesktopWindowsCount = windows.size,
                                                     activeWebViewCount = browserViewModel.webViewPool.getLiveCount(),
+                                                    openWindows = windows.toList(),
+                                                    onFocusWindow = { targetId -> bringToFront(targetId) },
+                                                    onCloseWindow = { targetId -> closeWindow(targetId) },
                                                     onTrimAppRam = { browserViewModel.webViewPool.clearAllWebViewCaches() },
                                                     onShowMessage = onShowMessage
                                                 )
@@ -1115,6 +1191,26 @@ fun DesktopLauncherScreen(
                                                     },
                                                     onOpenUrl = { url -> openUrlInDesktopBrowser(url, false) },
                                                     onOpenFileExplorer = { openOrFocusWindow(DesktopWindowKind.FILES) },
+                                                    onShowMessage = onShowMessage
+                                                )
+                                            }
+                                            DesktopWindowKind.OFFLINE_WIKI -> {
+                                                OfflineWikiScreen(
+                                                    app = app,
+                                                    onBack = { closeWindow(win.id) },
+                                                    onShowMessage = onShowMessage
+                                                )
+                                            }
+                                            DesktopWindowKind.TERMINAL -> {
+                                                PowerShellTerminalScreen(
+                                                    app = app,
+                                                    installedApps = installedApps,
+                                                    openWindowCount = windows.size,
+                                                    customCommands = terminalCustomCommands,
+                                                    onOpenWindow = { targetKind -> openOrFocusWindow(targetKind) },
+                                                    onLaunchPackage = { pkg -> launchExternalPackage(pkg) },
+                                                    onCloseTerminal = { closeWindow(win.id) },
+                                                    onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
@@ -1292,11 +1388,34 @@ fun DesktopLauncherScreen(
                                 onValueChange = { appSearchQuery = it },
                                 singleLine = true,
                                 leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-                                placeholder = { Text("Cari WhatsApp, YouTube, Files, atau aplikasi lain...") },
-                                modifier = Modifier.fillMaxWidth()
+                                placeholder = { Text("Cari Cyber Browser, OfflineTube, WhatsApp, atau aplikasi lain...") },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .onFocusChanged { onTextInputFocusChanged(it.isFocused) }
                             )
 
                             HorizontalDivider()
+
+                            val builtInDrawerApps = remember(appSearchQuery) {
+                                listOf(
+                                    Triple(DesktopWindowKind.BROWSER, "Cyber Browser", Icons.Filled.Public),
+                                    Triple(DesktopWindowKind.MEDIA, "OfflineTube", Icons.Filled.VideoLibrary),
+                                    Triple(DesktopWindowKind.OFFLINE_WIKI, "Offline Wiki", Icons.Filled.CloudOff),
+                                    Triple(DesktopWindowKind.SEARCH, "Offline Search", Icons.Filled.Search),
+                                    Triple(DesktopWindowKind.MUSIC, "Cyber Music", Icons.Filled.LibraryMusic),
+                                    Triple(DesktopWindowKind.LIBRARY, "Knowledge Vault", Icons.Filled.MenuBook),
+                                    Triple(DesktopWindowKind.FILES, "File Explorer", Icons.Filled.Folder),
+                                    Triple(DesktopWindowKind.TASK_MANAGER, "Task Manager", Icons.Filled.Speed),
+                                    Triple(DesktopWindowKind.TERMINAL, "Terminal PowerShell", Icons.Filled.Terminal),
+                                    Triple(DesktopWindowKind.DOWNLOADS, "Unduhan", Icons.Filled.Download),
+                                    Triple(DesktopWindowKind.BOOKMARKS, "Bookmarks", Icons.Filled.Bookmark),
+                                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings)
+                                ).filter { (kind, label, _) ->
+                                    appSearchQuery.isBlank() ||
+                                        label.contains(appSearchQuery, true) ||
+                                        kind.name.contains(appSearchQuery, true)
+                                }
+                            }
 
                             val filteredApps = remember(installedApps, appSearchQuery, showSystemApps) {
                                 installedApps.filter { appInfo ->
@@ -1313,18 +1432,76 @@ fun DesktopLauncherScreen(
                                 }
                             }
 
-                            Text(
-                                "Aplikasi Android Terinstall (${filteredApps.size})",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-
                             LazyVerticalGrid(
                                 columns = GridCells.Adaptive(minSize = 112.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
+                                if (builtInDrawerApps.isNotEmpty()) {
+                                    item(
+                                        key = "header_builtin_drawer",
+                                        span = { GridItemSpan(maxLineSpan) }
+                                    ) {
+                                        Text(
+                                            "Aplikasi Cyber Deck (${builtInDrawerApps.size})",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                    items(builtInDrawerApps, key = { "builtin_${it.first.name}" }) { (kind, label, icon) ->
+                                        Card(
+                                            colors = CardDefaults.cardColors(
+                                                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f)
+                                            ),
+                                            modifier = Modifier.clickable {
+                                                appDrawerOpen = false
+                                                openOrFocusWindow(kind)
+                                            }
+                                        ) {
+                                            Column(
+                                                horizontalAlignment = Alignment.CenterHorizontally,
+                                                modifier = Modifier.fillMaxWidth().padding(10.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(40.dp)
+                                                        .clip(RoundedCornerShape(10.dp))
+                                                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Icon(
+                                                        icon,
+                                                        contentDescription = label,
+                                                        tint = MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.size(24.dp)
+                                                    )
+                                                }
+                                                Spacer(Modifier.height(6.dp))
+                                                Text(
+                                                    text = label,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    maxLines = 2,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    textAlign = TextAlign.Center
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+
+                                item(
+                                    key = "header_installed_drawer",
+                                    span = { GridItemSpan(maxLineSpan) }
+                                ) {
+                                    Text(
+                                        "Aplikasi Android Terinstall (${filteredApps.size})",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(top = 6.dp)
+                                    )
+                                }
+
                                 items(filteredApps, key = { it.packageName }) { extApp ->
                                     val isPinned = extApp.packageName in pinnedPackages
                                     Card(
@@ -1715,6 +1892,149 @@ fun DesktopLauncherScreen(
                                             modifier = Modifier.weight(1f)
                                         ) {
                                             Text("Setelan Wi-Fi", maxLines = 1)
+                                        }
+                                    }
+                                }
+
+                                TaskbarTrayPopup.BLUETOOTH -> {
+                                    val btConnectedCount = bluetoothStatus.pairedDevices.count { it.isConnected }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = when {
+                                                    !bluetoothStatus.enabled -> Icons.Filled.BluetoothDisabled
+                                                    btConnectedCount > 0 -> Icons.Filled.BluetoothConnected
+                                                    else -> Icons.Filled.Bluetooth
+                                                },
+                                                contentDescription = null,
+                                                tint = when {
+                                                    btConnectedCount > 0 -> DeckGreen
+                                                    bluetoothStatus.enabled -> MaterialTheme.colorScheme.primary
+                                                    else -> DeckAmber
+                                                }
+                                            )
+                                            Text("Bluetooth & Perangkat", style = MaterialTheme.typography.titleMedium)
+                                        }
+                                        IconButton(
+                                            onClick = { activeTrayPopup = null },
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(Icons.Filled.Close, contentDescription = "Tutup", modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+
+                                    Card(
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = if (bluetoothStatus.enabled) DeckGreen.copy(alpha = 0.14f)
+                                            else DeckAmber.copy(alpha = 0.14f)
+                                        ),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                            Text(
+                                                text = when {
+                                                    !bluetoothStatus.supported -> "Adapter Bluetooth tidak tersedia"
+                                                    btConnectedCount > 0 -> "Bluetooth Aktif • $btConnectedCount terhubung"
+                                                    bluetoothStatus.enabled -> "Bluetooth Aktif (Siaga)"
+                                                    else -> "Bluetooth Nonaktif"
+                                                },
+                                                style = MaterialTheme.typography.titleSmall,
+                                                color = if (bluetoothStatus.enabled) DeckGreen else DeckAmber
+                                            )
+                                            Text(
+                                                text = if (!bluetoothStatus.permissionGranted) {
+                                                    "Izin Perangkat Terdekat diperlukan untuk membaca keyboard/mouse Bluetooth terpasang."
+                                                } else if (bluetoothStatus.pairedDevices.isEmpty()) {
+                                                    "Belum ada perangkat terpasang atau Bluetooth sedang mati."
+                                                } else {
+                                                    "${bluetoothStatus.pairedDevices.size} perangkat terpasang di sistem."
+                                                },
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                    }
+
+                                    if (!bluetoothStatus.permissionGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                        Button(
+                                            onClick = { btPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT) },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Izinkan Akses Bluetooth (Perangkat Terdekat)")
+                                        }
+                                    }
+
+                                    if (bluetoothStatus.pairedDevices.isNotEmpty()) {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(max = 200.dp)
+                                                .verticalScroll(rememberScrollState()),
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            bluetoothStatus.pairedDevices.forEach { dev ->
+                                                Card(
+                                                    colors = CardDefaults.cardColors(
+                                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                                                    ),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(10.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.SpaceBetween
+                                                    ) {
+                                                        Column(modifier = Modifier.weight(1f)) {
+                                                            Text(
+                                                                text = dev.name,
+                                                                style = MaterialTheme.typography.labelLarge,
+                                                                maxLines = 1,
+                                                                overflow = TextOverflow.Ellipsis
+                                                            )
+                                                            if (dev.address.isNotBlank()) {
+                                                                Text(
+                                                                    text = dev.address,
+                                                                    style = MaterialTheme.typography.bodySmall,
+                                                                    fontFamily = FontFamily.Monospace,
+                                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                                )
+                                                            }
+                                                        }
+                                                        Text(
+                                                            text = if (dev.isConnected) "Terhubung" else "Terpasang",
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = if (dev.isConnected) DeckGreen else MaterialTheme.colorScheme.onSurfaceVariant
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            onClick = { bluetoothStatus = DesktopLauncherManager.readBluetoothStatus(context) },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("Refresh", maxLines = 1)
+                                        }
+                                        Button(
+                                            onClick = {
+                                                activeTrayPopup = null
+                                                onShowMessage(DesktopLauncherManager.openBluetoothSettings(context))
+                                            },
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Setelan Bluetooth", maxLines = 1)
                                         }
                                     }
                                 }
@@ -2572,7 +2892,39 @@ fun DesktopLauncherScreen(
                             )
                         }
 
-                        // Clickable Net Pill
+                        // Clickable Bluetooth Pill
+                        val btConnected = bluetoothStatus.pairedDevices.any { it.isConnected }
+                        val btTint = when {
+                            btConnected -> DeckGreen
+                            bluetoothStatus.enabled -> MaterialTheme.colorScheme.primary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+                        Surface(
+                            color = if (activeTrayPopup == TaskbarTrayPopup.BLUETOOTH) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
+                            else Color.Transparent,
+                            shape = RoundedCornerShape(7.dp),
+                            modifier = Modifier.clickable {
+                                appDrawerOpen = false
+                                notifPanelOpen = false
+                                bluetoothStatus = DesktopLauncherManager.readBluetoothStatus(context)
+                                activeTrayPopup = if (activeTrayPopup == TaskbarTrayPopup.BLUETOOTH) null else TaskbarTrayPopup.BLUETOOTH
+                            }
+                        ) {
+                            Icon(
+                                imageVector = when {
+                                    !bluetoothStatus.enabled -> Icons.Filled.BluetoothDisabled
+                                    btConnected -> Icons.Filled.BluetoothConnected
+                                    else -> Icons.Filled.Bluetooth
+                                },
+                                contentDescription = "Bluetooth",
+                                tint = btTint,
+                                modifier = Modifier
+                                    .padding(horizontal = 5.dp, vertical = 5.dp)
+                                    .size(16.dp)
+                            )
+                        }
+
+                        // Clickable CONN (Network) Pill
                         Surface(
                             color = if (activeTrayPopup == TaskbarTrayPopup.NETWORK) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
                             else Color.Transparent,
@@ -2584,7 +2936,7 @@ fun DesktopLauncherScreen(
                             }
                         ) {
                             Text(
-                                text = if (isOnline) "NET" else "OFF",
+                                text = "CONN",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = if (isOnline) DeckGreen else DeckAmber,
                                 fontFamily = FontFamily.Monospace,
@@ -2691,6 +3043,94 @@ fun DesktopLauncherScreen(
                 }
             }
         }
+    }
+
+    // UNIFIED OFFLINE HUB CHOOSER DIALOG (Offline Wiki beside OfflineTube + Offline Search)
+    if (showOfflineHubDialog) {
+        AlertDialog(
+            onDismissRequest = { showOfflineHubDialog = false },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(Icons.Filled.CloudOff, contentDescription = null, tint = Color(0xFF38BDF8))
+                    Text("Offline")
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "Akses ensiklopedia, media video, dan pencarian offline:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    // Offline Wiki right beside OfflineTube
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    showOfflineHubDialog = false
+                                    openOrFocusWindow(DesktopWindowKind.OFFLINE_WIKI)
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(Icons.Filled.MenuBook, contentDescription = null, tint = Color(0xFF38BDF8))
+                                Text("Offline Wiki", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "Kiwix PWA & simpan halaman wiki offline",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    showOfflineHubDialog = false
+                                    openOrFocusWindow(DesktopWindowKind.MEDIA)
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(Icons.Filled.VideoLibrary, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                Text("OfflineTube", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "Putar video & media lokal SD/SSD",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+
+                    SavedHubOptionCard(
+                        icon = Icons.Filled.Search,
+                        title = "Offline Search",
+                        subtitle = "Cari arsip halaman, buku ZIM, dokumen, video & musik",
+                        onClick = {
+                            showOfflineHubDialog = false
+                            openOrFocusWindow(DesktopWindowKind.SEARCH)
+                        }
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showOfflineHubDialog = false }) { Text("Tutup") }
+            }
+        )
     }
 
     // UNIFIED SAVED & DOWNLOADS CHOOSER DIALOG
@@ -3297,6 +3737,8 @@ private fun windowIconForKind(kind: DesktopWindowKind): ImageVector = when (kind
     DesktopWindowKind.BOOKMARKS -> Icons.Filled.Bookmark
     DesktopWindowKind.HISTORY -> Icons.Filled.History
     DesktopWindowKind.SEARCH -> Icons.Filled.Search
+    DesktopWindowKind.OFFLINE_WIKI -> Icons.Filled.CloudOff
+    DesktopWindowKind.TERMINAL -> Icons.Filled.Terminal
     DesktopWindowKind.SETTINGS -> Icons.Filled.Settings
 }
 
