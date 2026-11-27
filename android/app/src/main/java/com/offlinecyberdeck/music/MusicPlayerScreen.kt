@@ -3,6 +3,8 @@ package com.offlinecyberdeck.music
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes as AndroidAudioAttributes
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -10,6 +12,7 @@ import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -114,7 +117,10 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
 import com.offlinecyberdeck.CyberDeckApplication
 import com.offlinecyberdeck.core.database.entity.AppSettingsEntity
 import com.offlinecyberdeck.core.database.entity.MusicTrackEntity
@@ -143,6 +149,7 @@ private enum class MusicTab(val label: String) {
 
 private enum class MusicRepeatMode { OFF, ALL, ONE }
 
+@OptIn(UnstableApi::class)
 @Composable
 fun MusicPlayerScreen(
     app: CyberDeckApplication,
@@ -205,9 +212,15 @@ fun MusicPlayerScreen(
     var showSpeedMenu by remember { mutableStateOf(false) }
     var playRequestToken by remember { mutableLongStateOf(0L) }
     var cacheFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
+    var mediaPlayerFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
+    var fallbackPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+    var usingFallbackPlayer by remember { mutableStateOf(false) }
 
     val exoPlayer = remember {
+        val extractorsFactory = DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
         ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(context, extractorsFactory))
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -216,6 +229,59 @@ fun MusicPlayerScreen(
                 true
             )
             .build()
+    }
+
+    fun releaseFallbackPlayer() {
+        val mp = fallbackPlayer
+        fallbackPlayer = null
+        usingFallbackPlayer = false
+        if (mp != null) {
+            runCatching { mp.stop() }
+            runCatching { mp.reset() }
+            runCatching { mp.release() }
+        }
+    }
+
+    fun seekAudioTo(targetMs: Long) {
+        val clamped = targetMs.coerceAtLeast(0L)
+        if (usingFallbackPlayer) {
+            runCatching { fallbackPlayer?.seekTo(clamped.toInt()) }
+            positionMs = clamped
+        } else {
+            exoPlayer.seekTo(clamped)
+        }
+    }
+
+    fun setAudioPlaybackSpeed(speed: Float) {
+        playbackSpeed = speed
+        if (usingFallbackPlayer) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                runCatching {
+                    fallbackPlayer?.let { mp ->
+                        mp.playbackParams = mp.playbackParams.setSpeed(speed)
+                    }
+                }
+            }
+        } else {
+            exoPlayer.setPlaybackSpeed(speed)
+        }
+    }
+
+    fun toggleAudioPlayPause() {
+        if (usingFallbackPlayer) {
+            val mp = fallbackPlayer ?: return
+            runCatching {
+                if (mp.isPlaying) {
+                    mp.pause()
+                    isPlaying = false
+                } else {
+                    mp.start()
+                    isPlaying = true
+                }
+            }
+        } else {
+            if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+        }
     }
 
     val currentTrack = queue.getOrNull(currentIndex)
@@ -229,6 +295,9 @@ fun MusicPlayerScreen(
         positionMs = 0L
         durationMs = target.durationMs.coerceAtLeast(0L)
         cacheFallbackTriedTrackId = null
+        mediaPlayerFallbackTriedTrackId = null
+        releaseFallbackPlayer()
+        runCatching { exoPlayer.stop() }
         if (openPopup) {
             showNowPlayingPopup = true
         }
@@ -244,6 +313,7 @@ fun MusicPlayerScreen(
             if (token != playRequestToken) return@launch
 
             resolvedRes.onSuccess { playUri ->
+                usingFallbackPlayer = false
                 exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
                 exoPlayer.prepare()
                 exoPlayer.setPlaybackSpeed(playbackSpeed)
@@ -258,8 +328,13 @@ fun MusicPlayerScreen(
     fun playNextTrack(autoTriggered: Boolean) {
         if (queue.isEmpty()) return
         if (autoTriggered && repeatMode == MusicRepeatMode.ONE && currentIndex in queue.indices) {
-            exoPlayer.seekTo(0L)
-            exoPlayer.playWhenReady = true
+            seekAudioTo(0L)
+            if (usingFallbackPlayer) {
+                runCatching { fallbackPlayer?.start() }
+                isPlaying = true
+            } else {
+                exoPlayer.playWhenReady = true
+            }
             return
         }
         val nextIdx = if (shuffleEnabled && queue.size > 1) {
@@ -274,18 +349,70 @@ fun MusicPlayerScreen(
         if (nextIdx in queue.indices) {
             playFromList(queue, nextIdx, openPopup = false)
         } else {
-            exoPlayer.pause()
+            if (usingFallbackPlayer) {
+                runCatching { fallbackPlayer?.pause() }
+                isPlaying = false
+            } else {
+                exoPlayer.pause()
+            }
         }
     }
 
     fun playPrevTrack() {
         if (queue.isEmpty()) return
-        if (exoPlayer.currentPosition > 3500L) {
-            exoPlayer.seekTo(0L)
+        val curPos = if (usingFallbackPlayer) {
+            runCatching { fallbackPlayer?.currentPosition?.toLong() ?: 0L }.getOrDefault(0L)
+        } else {
+            exoPlayer.currentPosition
+        }
+        if (curPos > 3500L) {
+            seekAudioTo(0L)
             return
         }
         val prevIdx = if (currentIndex - 1 >= 0) currentIndex - 1 else queue.lastIndex
         playFromList(queue, prevIdx, openPopup = false)
+    }
+
+    fun startAndroidMediaPlayerFallback(track: MusicTrackEntity, uri: Uri): Boolean {
+        releaseFallbackPlayer()
+        val mp = MediaPlayer()
+        return runCatching {
+            mp.setAudioAttributes(
+                AndroidAudioAttributes.Builder()
+                    .setUsage(AndroidAudioAttributes.USAGE_MEDIA)
+                    .setContentType(AndroidAudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            if (uri.scheme == "file" || uri.scheme.isNullOrBlank()) {
+                val p = uri.path ?: uri.toString()
+                mp.setDataSource(p)
+            } else {
+                mp.setDataSource(context, uri)
+            }
+            mp.prepare()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && playbackSpeed != 1.0f) {
+                runCatching { mp.playbackParams = mp.playbackParams.setSpeed(playbackSpeed) }
+            }
+            mp.setOnCompletionListener {
+                playNextTrack(autoTriggered = true)
+            }
+            mp.setOnErrorListener { _, _, _ ->
+                isPlaying = false
+                releaseFallbackPlayer()
+                onShowMessage("Format audio '${track.fileName}' tidak dapat diputar oleh dekoder sistem.")
+                true
+            }
+            mp.start()
+            fallbackPlayer = mp
+            usingFallbackPlayer = true
+            isPlaying = true
+            val d = runCatching { mp.duration.toLong() }.getOrDefault(0L)
+            if (d > 0L) durationMs = d
+            true
+        }.getOrElse {
+            runCatching { mp.release() }
+            false
+        }
     }
 
     fun runRefreshImport(manual: Boolean) {
@@ -352,10 +479,13 @@ fun MusicPlayerScreen(
     DisposableEffect(exoPlayer) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
+                if (!usingFallbackPlayer) {
+                    isPlaying = playing
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (usingFallbackPlayer) return
                 if (playbackState == Player.STATE_READY) {
                     durationMs = exoPlayer.duration.coerceAtLeast(0L)
                 } else if (playbackState == Player.STATE_ENDED) {
@@ -364,29 +494,41 @@ fun MusicPlayerScreen(
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                if (usingFallbackPlayer) return
                 val track = queue.getOrNull(currentIndex)
                 val failedUri = exoPlayer.currentMediaItem?.localConfiguration?.uri
                 if (track != null && failedUri != null && cacheFallbackTriedTrackId != track.id) {
                     cacheFallbackTriedTrackId = track.id
                     scope.launch {
-                        val cachedUri = if (failedUri.scheme == "content") {
-                            app.musicRepository.cacheContentUriForPlayback(track, failedUri)
-                        } else null
-                        val retryUri = cachedUri ?: app.musicRepository.resolvePlayableUri(
+                        val extraSaf = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                        val cachedUri = app.musicRepository.cacheUriOrFileForPlayback(track, failedUri)
+                        val resolvedUri = cachedUri ?: app.musicRepository.resolvePlayableUri(
                             track = track,
                             deckDriveTreeUri = settings.deckDriveTreeUri,
-                            extraSafUris = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                            extraSafUris = extraSaf
                         ).getOrNull()?.let { resolved ->
-                            if (resolved.scheme == "content") {
-                                app.musicRepository.cacheContentUriForPlayback(track, resolved) ?: resolved
-                            } else resolved
+                            app.musicRepository.cacheUriOrFileForPlayback(track, resolved) ?: resolved
                         }
-                        if (retryUri != null && retryUri != failedUri) {
-                            exoPlayer.setMediaItem(MediaItem.fromUri(retryUri))
+
+                        if (resolvedUri != null && resolvedUri != failedUri) {
+                            exoPlayer.setMediaItem(MediaItem.fromUri(resolvedUri))
                             exoPlayer.prepare()
                             exoPlayer.setPlaybackSpeed(playbackSpeed)
                             exoPlayer.playWhenReady = true
+                        } else if (resolvedUri != null && mediaPlayerFallbackTriedTrackId != track.id) {
+                            mediaPlayerFallbackTriedTrackId = track.id
+                            if (!startAndroidMediaPlayerFallback(track, resolvedUri)) {
+                                onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                            }
                         } else {
+                            onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                        }
+                    }
+                } else if (track != null && failedUri != null && mediaPlayerFallbackTriedTrackId != track.id) {
+                    mediaPlayerFallbackTriedTrackId = track.id
+                    scope.launch {
+                        val mpUri = app.musicRepository.cacheUriOrFileForPlayback(track, failedUri) ?: failedUri
+                        if (!startAndroidMediaPlayerFallback(track, mpUri)) {
                             onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
                         }
                     }
@@ -399,14 +541,27 @@ fun MusicPlayerScreen(
         onDispose {
             exoPlayer.removeListener(listener)
             exoPlayer.release()
+            releaseFallbackPlayer()
         }
     }
 
-    LaunchedEffect(isPlaying, currentTrack?.id) {
+    LaunchedEffect(isPlaying, currentTrack?.id, usingFallbackPlayer) {
         while (true) {
-            positionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
-            val d = exoPlayer.duration
-            if (d > 0L) durationMs = d
+            if (usingFallbackPlayer) {
+                val mp = fallbackPlayer
+                if (mp != null) {
+                    runCatching {
+                        positionMs = mp.currentPosition.toLong().coerceAtLeast(0L)
+                        val d = mp.duration.toLong()
+                        if (d > 0L) durationMs = d
+                        isPlaying = mp.isPlaying
+                    }
+                }
+            } else {
+                positionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+                val d = exoPlayer.duration
+                if (d > 0L) durationMs = d
+            }
             delay(400L)
         }
     }
@@ -481,15 +636,12 @@ fun MusicPlayerScreen(
             showSpeedMenu = showSpeedMenu,
             onToggleSpeedMenu = { showSpeedMenu = !showSpeedMenu },
             onSelectSpeed = { sp ->
-                playbackSpeed = sp
-                exoPlayer.setPlaybackSpeed(sp)
+                setAudioPlaybackSpeed(sp)
                 showSpeedMenu = false
             },
             onCollapse = { fullPlayerExpanded = false },
-            onSeek = { targetMs -> exoPlayer.seekTo(targetMs) },
-            onTogglePlayPause = {
-                if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
-            },
+            onSeek = { targetMs -> seekAudioTo(targetMs) },
+            onTogglePlayPause = { toggleAudioPlayPause() },
             onNext = { playNextTrack(autoTriggered = false) },
             onPrev = { playPrevTrack() },
             onToggleShuffle = { shuffleEnabled = !shuffleEnabled },
@@ -977,7 +1129,7 @@ fun MusicPlayerScreen(
                     val safePos = positionMs.coerceIn(0L, dur)
                     Slider(
                         value = safePos.toFloat() / dur.toFloat(),
-                        onValueChange = { frac -> exoPlayer.seekTo((frac * dur).toLong()) },
+                        onValueChange = { frac -> seekAudioTo((frac * dur).toLong()) },
                         colors = SliderDefaults.colors(
                             thumbColor = Color.White,
                             activeTrackColor = YtmRed,
@@ -1033,7 +1185,7 @@ fun MusicPlayerScreen(
                             Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White)
                         }
                         IconButton(
-                            onClick = { if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play() },
+                            onClick = { toggleAudioPlayPause() },
                             modifier = Modifier.size(38.dp)
                         ) {
                             Icon(
@@ -1101,8 +1253,7 @@ fun MusicPlayerScreen(
                                         DropdownMenuItem(
                                             text = { Text("${sp}x") },
                                             onClick = {
-                                                playbackSpeed = sp
-                                                exoPlayer.setPlaybackSpeed(sp)
+                                                setAudioPlaybackSpeed(sp)
                                                 showSpeedMenu = false
                                             }
                                         )
@@ -1187,7 +1338,7 @@ fun MusicPlayerScreen(
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Slider(
                             value = safePos.toFloat() / safeDur.toFloat(),
-                            onValueChange = { frac -> exoPlayer.seekTo((frac * safeDur).toLong()) },
+                            onValueChange = { frac -> seekAudioTo((frac * safeDur).toLong()) },
                             colors = SliderDefaults.colors(
                                 thumbColor = Color.White,
                                 activeTrackColor = YtmRed,
@@ -1225,9 +1376,7 @@ fun MusicPlayerScreen(
                                 .size(56.dp)
                                 .clip(CircleShape)
                                 .background(Color.White)
-                                .clickable {
-                                    if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
-                                },
+                                .clickable { toggleAudioPlayPause() },
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(

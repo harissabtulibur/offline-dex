@@ -102,12 +102,39 @@ class MusicRepository(
         return null
     }
 
+    private fun isSeekableContentUri(uri: Uri): Boolean {
+        val afdOk = runCatching {
+            context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                afd.length != 0L
+            } ?: false
+        }.getOrDefault(false)
+        if (afdOk) return true
+        return runCatching {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                pfd.statSize != 0L
+            } ?: false
+        }.getOrDefault(false)
+    }
+
+    private fun resolveContentUriOrCache(track: MusicTrackEntity, uri: Uri): Uri? {
+        driveManager.resolveDirectFileFromContentUri(uri)?.takeIf { isDirectFileReadable(it) }?.let { file ->
+            return Uri.fromFile(file)
+        }
+        if (isSeekableContentUri(uri)) {
+            return uri
+        }
+        if (driveManager.isUriOrFileAccessible(uri.toString())) {
+            return cacheUriOrFileForPlaybackSync(track, uri) ?: uri
+        }
+        return null
+    }
+
     private fun findSafUriInTree(treeUri: Uri, fileName: String, sizeBytes: Long): Uri? {
         val root = runCatching { DocumentFile.fromTreeUri(context, treeUri) }.getOrNull() ?: return null
         val queue = ArrayDeque<DocumentFile>()
         queue.add(root)
         var visited = 0
-        while (queue.isNotEmpty() && visited < 400) {
+        while (queue.isNotEmpty() && visited < 1500) {
             val dir = queue.removeFirst()
             visited++
             val children = runCatching { dir.listFiles() }.getOrNull() ?: continue
@@ -135,7 +162,7 @@ class MusicRepository(
     ): Result<Uri> = withContext(Dispatchers.IO) {
         runCatching {
             val raw = track.fileUri
-            // Tier 1: Direct readable File path (verified by opening bytes, not just File.canRead())
+            // Tier 1: Direct readable File path (verified by opening bytes)
             if (!raw.startsWith("content://")) {
                 val path = if (raw.startsWith("file://")) Uri.parse(raw).path.orEmpty() else raw
                 val file = File(path)
@@ -144,9 +171,12 @@ class MusicRepository(
                 }
             }
 
-            // Tier 2: Existing content:// URI — normalize MediaStore UUID URI to canonical external URI if accessible
+            // Tier 2: Existing content:// URI — prefer direct POSIX file, canonical MediaStore, or seekable SAF / cached file
             if (raw.startsWith("content://")) {
                 val parsed = Uri.parse(raw)
+                driveManager.resolveDirectFileFromContentUri(parsed)?.takeIf { isDirectFileReadable(it) }?.let { file ->
+                    return@runCatching Uri.fromFile(file)
+                }
                 if (parsed.authority == MediaStore.AUTHORITY) {
                     val id = runCatching { ContentUris.parseId(parsed) }.getOrDefault(-1L)
                     if (id > 0L) {
@@ -155,23 +185,24 @@ class MusicRepository(
                             if (canonical.toString() != raw) {
                                 musicDao.upsert(track.copy(fileUri = canonical.toString()))
                             }
-                            return@runCatching canonical
+                            resolveContentUriOrCache(track, canonical)?.let { return@runCatching it }
                         }
                     }
                 }
-                if (driveManager.isUriOrFileAccessible(raw)) {
-                    return@runCatching parsed
-                }
+                resolveContentUriOrCache(track, parsed)?.let { return@runCatching it }
             }
 
             // Tier 3: Re-locate via MediaStore.Audio by filename + size
             findMediaStoreUriForTrack(track)?.let { resolved ->
                 musicDao.upsert(track.copy(fileUri = resolved.toString()))
-                return@runCatching resolved
+                resolveContentUriOrCache(track, resolved)?.let { return@runCatching it }
             }
 
-            // Tier 4: Re-locate inside configured SAF trees (SD Card / USB Deck Drive)
-            val trees = (listOfNotNull(deckDriveTreeUri) + extraSafUris)
+            // Tier 4: Re-locate inside configured SAF trees + any persisted SAF folder permissions
+            val persistedTreeUris = context.contentResolver.persistedUriPermissions
+                .filter { it.isReadPermission }
+                .map { it.uri.toString() }
+            val trees = (listOfNotNull(deckDriveTreeUri) + extraSafUris + persistedTreeUris)
                 .map { it.trim() }
                 .filter { it.isNotBlank() }
                 .distinct()
@@ -179,7 +210,7 @@ class MusicRepository(
                 val safUri = findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
                 if (safUri != null && driveManager.isUriOrFileAccessible(safUri.toString())) {
                     musicDao.upsert(track.copy(fileUri = safUri.toString()))
-                    return@runCatching safUri
+                    resolveContentUriOrCache(track, safUri)?.let { return@runCatching it }
                 }
             }
 
@@ -187,30 +218,55 @@ class MusicRepository(
         }
     }
 
-    suspend fun cacheContentUriForPlayback(track: MusicTrackEntity, sourceUri: Uri): Uri? =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val cacheDir = File(context.cacheDir, "music_play_cache").apply { mkdirs() }
-                val ext = track.fileName.substringAfterLast('.', "mp3")
-                    .lowercase(Locale.US)
-                    .ifBlank { "mp3" }
-                val outFile = File(cacheDir, "${track.id}.$ext")
-                if (!outFile.exists() || outFile.length() <= 0L) {
-                    // Evict older cached audio files so cache stays tiny (~6 recent tracks max)
-                    val existing = cacheDir.listFiles()?.sortedBy { it.lastModified() }.orEmpty()
-                    if (existing.size >= 6) {
-                        existing.take(existing.size - 5).forEach { runCatching { it.delete() } }
-                    }
-                    context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                        FileOutputStream(outFile).use { output ->
-                            input.copyTo(output, bufferSize = 64 * 1024)
-                            output.flush()
-                        }
-                    } ?: return@runCatching null
+    private fun cacheUriOrFileForPlaybackSync(track: MusicTrackEntity, sourceUri: Uri): Uri? {
+        return runCatching {
+            val cacheDir = File(context.cacheDir, "music_play_cache").apply { mkdirs() }
+            val ext = track.fileName.substringAfterLast('.', "mp3")
+                .lowercase(Locale.US)
+                .ifBlank { "mp3" }
+            val outFile = File(cacheDir, "${track.id}.$ext")
+            if (!outFile.exists() || outFile.length() <= 0L) {
+                val existing = cacheDir.listFiles()?.sortedBy { it.lastModified() }.orEmpty()
+                if (existing.size >= 6) {
+                    existing.take(existing.size - 5).forEach { runCatching { it.delete() } }
                 }
-                if (outFile.exists() && outFile.length() > 0L) Uri.fromFile(outFile) else null
-            }.getOrNull()
+                val tmpFile = File(cacheDir, "${track.id}.$ext.tmp")
+                runCatching { tmpFile.delete() }
+                val inputStream = if (sourceUri.scheme == "content") {
+                    context.contentResolver.openInputStream(sourceUri)
+                } else {
+                    val path = if (sourceUri.scheme == "file") sourceUri.path.orEmpty() else sourceUri.toString()
+                    val f = File(path)
+                    if (f.exists() && f.isFile && f.canRead()) f.inputStream() else null
+                } ?: return@runCatching null
+
+                inputStream.use { input ->
+                    FileOutputStream(tmpFile).use { output ->
+                        val copied = input.copyTo(output, bufferSize = 64 * 1024)
+                        output.flush()
+                        if (copied <= 0L) {
+                            runCatching { tmpFile.delete() }
+                            return@runCatching null
+                        }
+                    }
+                }
+                if (outFile.exists()) outFile.delete()
+                if (!tmpFile.renameTo(outFile)) {
+                    tmpFile.copyTo(outFile, overwrite = true)
+                    runCatching { tmpFile.delete() }
+                }
+            }
+            if (outFile.exists() && outFile.length() > 0L) Uri.fromFile(outFile) else null
+        }.getOrNull()
+    }
+
+    suspend fun cacheUriOrFileForPlayback(track: MusicTrackEntity, sourceUri: Uri): Uri? =
+        withContext(Dispatchers.IO) {
+            cacheUriOrFileForPlaybackSync(track, sourceUri)
         }
+
+    suspend fun cacheContentUriForPlayback(track: MusicTrackEntity, sourceUri: Uri): Uri? =
+        cacheUriOrFileForPlayback(track, sourceUri)
 
     suspend fun toggleFavorite(track: MusicTrackEntity) {
         musicDao.upsert(track.copy(isFavorite = !track.isFavorite))

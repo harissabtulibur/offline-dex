@@ -40,6 +40,12 @@ data class TerminalCustomCommand(
     val targetValue: String
 )
 
+data class DesktopIconPosition(
+    val id: String,
+    val xDp: Float,
+    val yDp: Float
+)
+
 data class CyberDeckBackupPayload(
     val formatVersion: Int = 1,
     val exportedAt: Long = System.currentTimeMillis(),
@@ -72,6 +78,15 @@ class SettingsRepository(
     )
     val desktopIconSizeDpFlow: StateFlow<Int> = _desktopIconSizeDp.asStateFlow()
 
+    private val _desktopIconPositions = MutableStateFlow(loadDesktopIconPositionsFromPrefs())
+    val desktopIconPositionsFlow: StateFlow<Map<String, DesktopIconPosition>> =
+        _desktopIconPositions.asStateFlow()
+
+    private val _desktopSnapToGrid = MutableStateFlow(
+        uiPrefs.getBoolean(KEY_DESKTOP_SNAP_TO_GRID, true)
+    )
+    val desktopSnapToGridFlow: StateFlow<Boolean> = _desktopSnapToGrid.asStateFlow()
+
     private val _terminalCustomCommands = MutableStateFlow(loadTerminalCommandsFromPrefs())
     val terminalCustomCommandsFlow: StateFlow<List<TerminalCustomCommand>> = _terminalCustomCommands.asStateFlow()
 
@@ -98,6 +113,41 @@ class SettingsRepository(
         val clamped = sizeDp.coerceIn(36, 68)
         uiPrefs.edit().putInt(KEY_DESKTOP_ICON_SIZE_DP, clamped).apply()
         _desktopIconSizeDp.value = clamped
+    }
+
+    fun setDesktopSnapToGrid(enabled: Boolean) {
+        uiPrefs.edit().putBoolean(KEY_DESKTOP_SNAP_TO_GRID, enabled).apply()
+        _desktopSnapToGrid.value = enabled
+    }
+
+    fun saveDesktopIconPosition(id: String, xDp: Float, yDp: Float) {
+        val next = _desktopIconPositions.value.toMutableMap()
+        next[id] = DesktopIconPosition(id = id, xDp = xDp, yDp = yDp)
+        saveDesktopIconPositionsToPrefs(next)
+        _desktopIconPositions.value = next
+    }
+
+    fun saveAllDesktopIconPositions(positions: Map<String, DesktopIconPosition>) {
+        saveDesktopIconPositionsToPrefs(positions)
+        _desktopIconPositions.value = positions
+    }
+
+    fun resetDesktopIconPositions() {
+        uiPrefs.edit().remove(KEY_DESKTOP_ICON_POSITIONS).apply()
+        _desktopIconPositions.value = emptyMap()
+    }
+
+    private fun loadDesktopIconPositionsFromPrefs(): Map<String, DesktopIconPosition> {
+        val json = uiPrefs.getString(KEY_DESKTOP_ICON_POSITIONS, null) ?: return emptyMap()
+        return runCatching {
+            gson.fromJson(json, Array<DesktopIconPosition>::class.java)
+                ?.associateBy { it.id }
+                .orEmpty()
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun saveDesktopIconPositionsToPrefs(map: Map<String, DesktopIconPosition>) {
+        uiPrefs.edit().putString(KEY_DESKTOP_ICON_POSITIONS, gson.toJson(map.values.toList())).apply()
     }
 
     fun addOrUpdateTerminalCustomCommand(
@@ -159,6 +209,8 @@ class SettingsRepository(
         private const val KEY_FIRST_ONLINE_SETUP_SHOWN = "first_online_setup_shown_v1"
         private const val KEY_DEX_SETUP_PROMPT_DISMISSED = "dex_setup_prompt_dismissed_v1"
         private const val KEY_DESKTOP_ICON_SIZE_DP = "desktop_icon_size_dp"
+        private const val KEY_DESKTOP_ICON_POSITIONS = "desktop_icon_positions_json"
+        private const val KEY_DESKTOP_SNAP_TO_GRID = "desktop_snap_to_grid"
         private const val KEY_TERMINAL_CUSTOM_COMMANDS = "terminal_custom_commands_json"
     }
 

@@ -265,7 +265,7 @@ class DeckDriveManager(private val context: Context) {
         }
     }
 
-    private fun resolveDirectFileFromContentUri(uri: Uri): File? {
+    fun resolveDirectFileFromContentUri(uri: Uri): File? {
         return runCatching {
             val docId = android.provider.DocumentsContract.getDocumentId(uri)
             val splitIdx = docId.indexOf(':')

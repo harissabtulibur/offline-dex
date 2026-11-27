@@ -2,6 +2,7 @@ package com.offlinecyberdeck.desktop
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.graphics.BitmapFactory
 import android.os.Build
 import android.text.format.DateFormat
@@ -17,9 +18,11 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -68,6 +71,7 @@ import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Eject
 import androidx.compose.material.icons.filled.FilterNone
 import androidx.compose.material.icons.filled.Folder
@@ -90,6 +94,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Terminal
@@ -127,6 +132,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -165,6 +171,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.offlinecyberdeck.CyberDeckApplication
+import com.offlinecyberdeck.ai.AiChatActivity
 import com.offlinecyberdeck.archive.ArchiveReaderScreen
 import com.offlinecyberdeck.bookmarks.BookmarksScreen
 import com.offlinecyberdeck.bookmarks.HistoryScreen
@@ -282,8 +289,11 @@ fun DesktopLauncherScreen(
     val downloads by app.database.downloadDao().observeAll().collectAsStateWithLifecycle(initialValue = emptyList())
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
     val desktopIconSizeDp by app.settingsRepository.desktopIconSizeDpFlow.collectAsStateWithLifecycle(initialValue = 46)
+    val desktopIconPositions by app.settingsRepository.desktopIconPositionsFlow.collectAsStateWithLifecycle(initialValue = emptyMap())
+    val desktopSnapToGrid by app.settingsRepository.desktopSnapToGridFlow.collectAsStateWithLifecycle(initialValue = true)
     val terminalCustomCommands by app.settingsRepository.terminalCustomCommandsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
 
+    var isEditingDesktopIcons by remember { mutableStateOf(false) }
     var mountedPartitions by remember { mutableStateOf(app.driveManager.detectAllMountedRemovablePartitions()) }
     var isGestureNavEnabled by remember { mutableStateOf(DesktopLauncherManager.isGestureNavigationEnabled(context)) }
     var isBlinkingNetIndicator by remember { mutableStateOf(false) }
@@ -298,6 +308,13 @@ fun DesktopLauncherScreen(
     var floatingNotif by remember { mutableStateOf<DeckNotificationItem?>(null) }
     var filesGoBackHandler by remember { mutableStateOf<(() -> Boolean)?>(null) }
     val notifSoundEnabledState by rememberUpdatedState(settings.notificationSoundEnabled)
+    val launchAiOfflineActivity: () -> Unit = {
+        runCatching {
+            context.startActivity(Intent(context, AiChatActivity::class.java))
+        }.onFailure { err ->
+            onShowMessage("Gagal membuka AI Offline: ${err.message}")
+        }
+    }
 
     val btPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -779,42 +796,142 @@ fun DesktopLauncherScreen(
                             )
                         }
 
-                        // Live RAM, CPU & Temp Usage Pill -> opens Windows-style Task Manager
-                        val tempSuffix = systemUsage.cpuTempC?.let {
-                            String.format(Locale.US, " • %.0f°C", it)
-                        }.orEmpty()
-                        Surface(
-                            color = Color(0xFF0B1220).copy(alpha = 0.82f),
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(
-                                1.dp,
-                                when {
-                                    systemUsage.ramPercent >= 85 -> Color(0xFFEF4444).copy(alpha = 0.7f)
-                                    systemUsage.ramPercent >= 70 -> DeckAmber.copy(alpha = 0.65f)
-                                    else -> MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
-                                }
-                            ),
-                            modifier = Modifier.clickable { openOrFocusWindow(DesktopWindowKind.TASK_MANAGER) }
+                        // Live RAM, CPU & Temp Usage Pill + Desktop Icon Customization Toggle
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            if (isEditingDesktopIcons) {
+                                Surface(
+                                    color = Color(0xFF0B1220).copy(alpha = 0.88f),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (desktopSnapToGrid) DeckGreen.copy(alpha = 0.7f) else Color(0xFF64748B)
+                                    ),
+                                    modifier = Modifier.clickable {
+                                        app.settingsRepository.setDesktopSnapToGrid(!desktopSnapToGrid)
+                                    }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.GridView,
+                                            contentDescription = "Snap Grid",
+                                            tint = if (desktopSnapToGrid) DeckGreen else Color(0xFF94A3B8),
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = if (desktopSnapToGrid) "Snap: ON" else "Bebas",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.White,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                                Surface(
+                                    color = Color(0xFF0B1220).copy(alpha = 0.88f),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, DeckAmber.copy(alpha = 0.65f)),
+                                    modifier = Modifier.clickable {
+                                        app.settingsRepository.resetDesktopIconPositions()
+                                        onShowMessage("Posisi ikon desktop dirapikan ke grid awal.")
+                                    }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Refresh,
+                                            contentDescription = "Rapikan Ikon",
+                                            tint = DeckAmber,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Text(
+                                            text = "Rapikan",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.White,
+                                            fontFamily = FontFamily.Monospace
+                                        )
+                                    }
+                                }
+                            }
+
+                            Surface(
+                                color = if (isEditingDesktopIcons) DeckGreen.copy(alpha = 0.24f) else Color(0xFF0B1220).copy(alpha = 0.78f),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (isEditingDesktopIcons) DeckGreen else MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                                ),
+                                modifier = Modifier.clickable {
+                                    isEditingDesktopIcons = !isEditingDesktopIcons
+                                    if (isEditingDesktopIcons) {
+                                        onShowMessage("Mode Atur Ikon aktif — geser ikon ke posisi yang diinginkan.")
+                                    }
+                                }
                             ) {
-                                Icon(
-                                    Icons.Filled.Memory,
-                                    contentDescription = "Task Manager",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Text(
-                                    text = "RAM ${systemUsage.ramPercent}% (${Formatters.formatBytes(systemUsage.ramUsedMb * 1024L * 1024L)}/${Formatters.formatBytes(systemUsage.ramTotalMb * 1024L * 1024L)}) • CPU ${systemUsage.cpuPercent}%$tempSuffix",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = Color.White,
-                                    fontFamily = FontFamily.Monospace,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        if (isEditingDesktopIcons) Icons.Filled.CheckCircle else Icons.Filled.Edit,
+                                        contentDescription = "Atur Ikon Desktop",
+                                        tint = if (isEditingDesktopIcons) DeckGreen else MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text(
+                                        text = if (isEditingDesktopIcons) "Selesai" else "Atur Ikon",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color.White,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+
+                            val tempSuffix = systemUsage.cpuTempC?.let {
+                                String.format(Locale.US, " • %.0f°C", it)
+                            }.orEmpty()
+                            Surface(
+                                color = Color(0xFF0B1220).copy(alpha = 0.82f),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    when {
+                                        systemUsage.ramPercent >= 85 -> Color(0xFFEF4444).copy(alpha = 0.7f)
+                                        systemUsage.ramPercent >= 70 -> DeckAmber.copy(alpha = 0.65f)
+                                        else -> MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+                                    }
+                                ),
+                                modifier = Modifier.clickable { openOrFocusWindow(DesktopWindowKind.TASK_MANAGER) }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Memory,
+                                        contentDescription = "Task Manager",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Text(
+                                        text = "RAM ${systemUsage.ramPercent}% (${Formatters.formatBytes(systemUsage.ramUsedMb * 1024L * 1024L)}/${Formatters.formatBytes(systemUsage.ramTotalMb * 1024L * 1024L)}) • CPU ${systemUsage.cpuPercent}%$tempSuffix",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = Color.White,
+                                        fontFamily = FontFamily.Monospace,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     }
@@ -823,47 +940,41 @@ fun DesktopLauncherScreen(
 
                     val iconBoxSize = desktopIconSizeDp.coerceIn(36, 68)
                     val innerIconSize = (iconBoxSize * 0.56f).roundToInt().coerceIn(20, 40)
+                    val tileWidthDp = (iconBoxSize + 44).toFloat()
+                    val tileHeightDp = (iconBoxSize + 48).toFloat()
+                    val cellStepX = tileWidthDp + 12f
+                    val cellStepY = tileHeightDp + 12f
 
-                    LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = (iconBoxSize + 50).dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .focusProperties { canFocus = (topFrontWinId == null && !desktopOverlayBlocking) }
-                            .onPreviewKeyEvent { topFrontWinId != null || desktopOverlayBlocking }
-                    ) {
-                        items(builtInShortcuts, key = { it.first.name }) { (kind, label, icon) ->
-                            DesktopShortcutTile(
-                                label = label,
-                                labelColor = desktopTextColor,
-                                onClick = { openOrFocusWindow(kind) },
-                                iconContent = {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(iconBoxSize.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            icon,
-                                            contentDescription = label,
-                                            tint = MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(innerIconSize.dp)
-                                        )
+                    val desktopEntries = buildList<Pair<String, Triple<String, () -> Unit, @Composable () -> Unit>>> {
+                        builtInShortcuts.forEach { (kind, label, icon) ->
+                            add(
+                                "builtin_${kind.name}" to Triple(
+                                    label,
+                                    { openOrFocusWindow(kind) },
+                                    {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(iconBoxSize.dp)
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                icon,
+                                                contentDescription = label,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(innerIconSize.dp)
+                                            )
+                                        }
                                     }
-                                }
+                                )
                             )
                         }
-
-                        // Unified Offline Hub (Offline Wiki / Kiwix PWA + OfflineTube + Offline Search)
-                        item(key = "unified_offline_hub") {
-                            DesktopShortcutTile(
-                                label = "Offline",
-                                labelColor = desktopTextColor,
-                                onClick = { showOfflineHubDialog = true },
-                                iconContent = {
+                        add(
+                            "unified_offline_hub" to Triple(
+                                "Offline",
+                                { showOfflineHubDialog = true },
+                                {
                                     Box(
                                         modifier = Modifier
                                             .size(iconBoxSize.dp)
@@ -873,22 +984,19 @@ fun DesktopLauncherScreen(
                                     ) {
                                         Icon(
                                             Icons.Filled.CloudOff,
-                                            contentDescription = "Offline Wiki, OfflineTube & Offline Search",
+                                            contentDescription = "Offline Wiki, OfflineTube, AI Offline & Offline Search",
                                             tint = Color(0xFF38BDF8),
                                             modifier = Modifier.size(innerIconSize.dp)
                                         )
                                     }
                                 }
                             )
-                        }
-
-                        // Unified Bookmarks + History + Downloads Desktop Shortcut
-                        item(key = "unified_saved_downloads") {
-                            DesktopShortcutTile(
-                                label = "Tersimpan & Unduhan",
-                                labelColor = desktopTextColor,
-                                onClick = { showSavedHubDialog = true },
-                                iconContent = {
+                        )
+                        add(
+                            "unified_saved_downloads" to Triple(
+                                "Tersimpan & Unduhan",
+                                { showSavedHubDialog = true },
+                                {
                                     Box(
                                         modifier = Modifier
                                             .size(iconBoxSize.dp)
@@ -905,14 +1013,12 @@ fun DesktopLauncherScreen(
                                     }
                                 }
                             )
-                        }
-
-                        item(key = "wallpaper_selector") {
-                            DesktopShortcutTile(
-                                label = "Wallpaper & Latar",
-                                labelColor = desktopTextColor,
-                                onClick = { showWallpaperDialog = true },
-                                iconContent = {
+                        )
+                        add(
+                            "wallpaper_selector" to Triple(
+                                "Wallpaper & Latar",
+                                { showWallpaperDialog = true },
+                                {
                                     Box(
                                         modifier = Modifier
                                             .size(iconBoxSize.dp)
@@ -929,20 +1035,170 @@ fun DesktopLauncherScreen(
                                     }
                                 }
                             )
+                        )
+                        pinnedInfos.forEach { extApp ->
+                            add(
+                                "pin_${extApp.packageName}" to Triple(
+                                    extApp.label,
+                                    { launchExternalPackage(extApp.packageName) },
+                                    {
+                                        InstalledAppIcon(
+                                            packageName = extApp.packageName,
+                                            modifier = Modifier.size(iconBoxSize.dp)
+                                        )
+                                    }
+                                )
+                            )
+                        }
+                    }
+
+                    BoxWithConstraints(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .focusProperties { canFocus = (topFrontWinId == null && !desktopOverlayBlocking) }
+                            .onPreviewKeyEvent { topFrontWinId != null || desktopOverlayBlocking }
+                    ) {
+                        val canvasWidthDp = maxWidth.value
+                        val canvasHeightDp = maxHeight.value
+                        val rowsPerCol = ((canvasHeightDp / cellStepY).toInt()).coerceAtLeast(1)
+                        val maxX = (canvasWidthDp - tileWidthDp).coerceAtLeast(0f)
+                        val maxY = (canvasHeightDp - tileHeightDp).coerceAtLeast(0f)
+
+                        val liveDragPos = remember { mutableStateMapOf<String, Pair<Float, Float>>() }
+                        var activeDragId by remember { mutableStateOf<String?>(null) }
+
+                        LaunchedEffect(desktopIconPositions) {
+                            liveDragPos.clear()
+                            desktopIconPositions.forEach { (id, pos) ->
+                                liveDragPos[id] = pos.xDp to pos.yDp
+                            }
                         }
 
-                        items(pinnedInfos, key = { "pin_${it.packageName}" }) { extApp ->
-                            DesktopShortcutTile(
-                                label = extApp.label,
-                                labelColor = desktopTextColor,
-                                onClick = { launchExternalPackage(extApp.packageName) },
-                                iconContent = {
-                                    InstalledAppIcon(
-                                        packageName = extApp.packageName,
-                                        modifier = Modifier.size(iconBoxSize.dp)
+                        desktopEntries.forEachIndexed { idx, (id, meta) ->
+                            val (label, onTileClick, iconContent) = meta
+                            val col = idx / rowsPerCol
+                            val row = idx % rowsPerCol
+                            val defaultX = (col * cellStepX).coerceIn(0f, maxX)
+                            val defaultY = (row * cellStepY).coerceIn(0f, maxY)
+                            val currentPos = liveDragPos[id]
+                                ?: desktopIconPositions[id]?.let { it.xDp to it.yDp }
+                                ?: (defaultX to defaultY)
+                            val posX = currentPos.first.coerceIn(0f, maxX)
+                            val posY = currentPos.second.coerceIn(0f, maxY)
+                            val isBeingDragged = activeDragId == id
+
+                            fun commitDraggedPosition(rawX: Float, rawY: Float) {
+                                val finalX = if (desktopSnapToGrid) {
+                                    ((rawX / cellStepX).roundToInt() * cellStepX).coerceIn(0f, maxX)
+                                } else {
+                                    rawX.coerceIn(0f, maxX)
+                                }
+                                val finalY = if (desktopSnapToGrid) {
+                                    ((rawY / cellStepY).roundToInt() * cellStepY).coerceIn(0f, maxY)
+                                } else {
+                                    rawY.coerceIn(0f, maxY)
+                                }
+                                liveDragPos[id] = finalX to finalY
+                                app.settingsRepository.saveDesktopIconPosition(id, finalX, finalY)
+                            }
+
+                            key(id) {
+                                val dragModifier = if (isEditingDesktopIcons) {
+                                    Modifier.pointerInput(id, desktopSnapToGrid, maxX, maxY) {
+                                        detectDragGestures(
+                                            onDragStart = {
+                                                activeDragId = id
+                                                if (!liveDragPos.containsKey(id)) {
+                                                    liveDragPos[id] = posX to posY
+                                                }
+                                            },
+                                            onDragEnd = {
+                                                val p = liveDragPos[id] ?: (posX to posY)
+                                                commitDraggedPosition(p.first, p.second)
+                                                activeDragId = null
+                                            },
+                                            onDragCancel = {
+                                                activeDragId = null
+                                            },
+                                            onDrag = { change, dragAmount ->
+                                                change.consume()
+                                                val cur = liveDragPos[id] ?: (posX to posY)
+                                                val nx = (cur.first + dragAmount.x / density.density).coerceIn(0f, maxX)
+                                                val ny = (cur.second + dragAmount.y / density.density).coerceIn(0f, maxY)
+                                                liveDragPos[id] = nx to ny
+                                            }
+                                        )
+                                    }
+                                } else {
+                                    Modifier.pointerInput(id, desktopSnapToGrid, maxX, maxY) {
+                                        detectDragGesturesAfterLongPress(
+                                            onDragStart = {
+                                                activeDragId = id
+                                                if (!liveDragPos.containsKey(id)) {
+                                                    liveDragPos[id] = posX to posY
+                                                }
+                                            },
+                                            onDragEnd = {
+                                                val p = liveDragPos[id] ?: (posX to posY)
+                                                commitDraggedPosition(p.first, p.second)
+                                                activeDragId = null
+                                            },
+                                            onDragCancel = {
+                                                activeDragId = null
+                                            },
+                                            onDrag = { change, dragAmount ->
+                                                change.consume()
+                                                val cur = liveDragPos[id] ?: (posX to posY)
+                                                val nx = (cur.first + dragAmount.x / density.density).coerceIn(0f, maxX)
+                                                val ny = (cur.second + dragAmount.y / density.density).coerceIn(0f, maxY)
+                                                liveDragPos[id] = nx to ny
+                                            }
+                                        )
+                                    }
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .offset {
+                                            with(density) {
+                                                IntOffset(posX.dp.roundToPx(), posY.dp.roundToPx())
+                                            }
+                                        }
+                                        .width(tileWidthDp.dp)
+                                        .zIndex(if (isBeingDragged) 10f else 1f)
+                                        .then(
+                                            if (isBeingDragged || isEditingDesktopIcons) {
+                                                Modifier
+                                                    .clip(RoundedCornerShape(10.dp))
+                                                    .border(
+                                                        width = if (isBeingDragged) 1.5.dp else 1.dp,
+                                                        color = if (isBeingDragged) DeckGreen
+                                                        else MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+                                                        shape = RoundedCornerShape(10.dp)
+                                                    )
+                                                    .background(
+                                                        Color.Black.copy(alpha = if (isBeingDragged) 0.45f else 0.18f)
+                                                    )
+                                            } else {
+                                                Modifier
+                                            }
+                                        )
+                                        .then(dragModifier)
+                                ) {
+                                    DesktopShortcutTile(
+                                        label = label,
+                                        labelColor = desktopTextColor,
+                                        onClick = {
+                                            if (isEditingDesktopIcons) {
+                                                onShowMessage("Tahan & geser '$label' untuk memindahkan posisinya.")
+                                            } else {
+                                                onTileClick()
+                                            }
+                                        },
+                                        iconContent = iconContent
                                     )
                                 }
-                            )
+                            }
                         }
                     }
                 }
@@ -1246,6 +1502,7 @@ fun DesktopLauncherScreen(
                                                     customCommands = terminalCustomCommands,
                                                     onOpenWindow = { targetKind -> openOrFocusWindow(targetKind) },
                                                     onLaunchPackage = { pkg -> launchExternalPackage(pkg) },
+                                                    onLaunchAiOffline = launchAiOfflineActivity,
                                                     onCloseTerminal = { closeWindow(win.id) },
                                                     isWindowFocused = isTopFront,
                                                     onTextInputFocusChanged = onTextInputFocusChanged,
@@ -1470,22 +1727,69 @@ fun DesktopLauncherScreen(
                                 }
                             }
 
+                            val showAiOfflineInDrawer = appSearchQuery.isBlank() ||
+                                "ai offline".contains(appSearchQuery, true) ||
+                                "qwen".contains(appSearchQuery, true) ||
+                                "llm".contains(appSearchQuery, true)
+                            val builtInCount = builtInDrawerApps.size + (if (showAiOfflineInDrawer) 1 else 0)
+
                             LazyVerticalGrid(
                                 columns = GridCells.Adaptive(minSize = 112.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                if (builtInDrawerApps.isNotEmpty()) {
+                                if (builtInCount > 0) {
                                     item(
                                         key = "header_builtin_drawer",
                                         span = { GridItemSpan(maxLineSpan) }
                                     ) {
                                         Text(
-                                            "Aplikasi Cyber Deck (${builtInDrawerApps.size})",
+                                            "Aplikasi Cyber Deck ($builtInCount)",
                                             style = MaterialTheme.typography.labelLarge,
                                             color = MaterialTheme.colorScheme.primary
                                         )
+                                    }
+                                    if (showAiOfflineInDrawer) {
+                                        item(key = "builtin_ai_offline") {
+                                            Card(
+                                                colors = CardDefaults.cardColors(
+                                                    containerColor = Color(0xFF00FF41).copy(alpha = 0.14f)
+                                                ),
+                                                modifier = Modifier.clickable {
+                                                    appDrawerOpen = false
+                                                    launchAiOfflineActivity()
+                                                }
+                                            ) {
+                                                Column(
+                                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                                    modifier = Modifier.fillMaxWidth().padding(10.dp)
+                                                ) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(40.dp)
+                                                            .clip(RoundedCornerShape(10.dp))
+                                                            .background(Color(0xFF00FF41).copy(alpha = 0.22f)),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        Icon(
+                                                            Icons.Filled.SmartToy,
+                                                            contentDescription = "AI Offline",
+                                                            tint = Color(0xFF00FF41),
+                                                            modifier = Modifier.size(24.dp)
+                                                        )
+                                                    }
+                                                    Spacer(Modifier.height(6.dp))
+                                                    Text(
+                                                        text = "AI Offline",
+                                                        style = MaterialTheme.typography.labelMedium,
+                                                        maxLines = 2,
+                                                        overflow = TextOverflow.Ellipsis,
+                                                        textAlign = TextAlign.Center
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                     items(builtInDrawerApps, key = { "builtin_${it.first.name}" }) { (kind, label, icon) ->
                                         Card(
@@ -3083,7 +3387,7 @@ fun DesktopLauncherScreen(
         }
     }
 
-    // UNIFIED OFFLINE HUB CHOOSER DIALOG (Offline Wiki beside OfflineTube + Offline Search)
+    // UNIFIED OFFLINE HUB CHOOSER DIALOG (Offline Wiki + OfflineTube + Offline Search + AI Offline)
     if (showOfflineHubDialog) {
         AlertDialog(
             onDismissRequest = { showOfflineHubDialog = false },
@@ -3099,7 +3403,7 @@ fun DesktopLauncherScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text(
-                        "Akses ensiklopedia, media video, dan pencarian offline:",
+                        "Akses ensiklopedia, media video, AI chat lokal, dan pencarian offline:",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -3154,15 +3458,56 @@ fun DesktopLauncherScreen(
                         }
                     }
 
-                    SavedHubOptionCard(
-                        icon = Icons.Filled.Search,
-                        title = "Offline Search",
-                        subtitle = "Cari arsip halaman, buku ZIM, dokumen, video & musik",
-                        onClick = {
-                            showOfflineHubDialog = false
-                            openOrFocusWindow(DesktopWindowKind.SEARCH)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    showOfflineHubDialog = false
+                                    openOrFocusWindow(DesktopWindowKind.SEARCH)
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(Icons.Filled.Search, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                Text("Offline Search", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "Cari arsip, buku ZIM, video & musik",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
-                    )
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF071A0C)),
+                            border = BorderStroke(1.dp, Color(0xFF00FF41).copy(alpha = 0.65f)),
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    showOfflineHubDialog = false
+                                    launchAiOfflineActivity()
+                                }
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(Icons.Filled.SmartToy, contentDescription = null, tint = Color(0xFF00FF41))
+                                Text("AI OFFLINE", style = MaterialTheme.typography.titleSmall, color = Color(0xFF00FF41))
+                                Text(
+                                    "Chat LLM lokal tanpa internet (SSD/AI_Models)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFFA7F3D0)
+                                )
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {

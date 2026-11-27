@@ -88,6 +88,15 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ai.AiChatActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard"
+            android:exported="false"
+            android:label="AI Offline"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.OfflineCyberDeck.AiChat"
+            android:windowSoftInputMode="adjustResize" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

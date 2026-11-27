@@ -86,6 +86,9 @@ dependencies {
     implementation(libs.gson)
     implementation("org.tukaani:xz:1.12")
     implementation("com.github.luben:zstd-jni:1.5.7-12@aar")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.recyclerview:recyclerview:1.3.2")
+    implementation("com.llamatik:core-android:2.5.1")
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation(libs.junit)

@@ -101,6 +101,7 @@ fun PowerShellTerminalScreen(
     customCommands: List<TerminalCustomCommand>,
     onOpenWindow: (DesktopWindowKind) -> Unit,
     onLaunchPackage: (String) -> Unit,
+    onLaunchAiOffline: () -> Unit = {},
     onCloseTerminal: () -> Unit,
     isWindowFocused: Boolean = true,
     onTextInputFocusChanged: (Boolean) -> Unit = {},
@@ -143,6 +144,7 @@ fun PowerShellTerminalScreen(
         appendLine("  open search           -> Buka Offline Search")
         appendLine("  open wiki             -> Buka Offline Wiki (Kiwix PWA)")
         appendLine("  open tube             -> Buka OfflineTube (Media Vault)")
+        appendLine("  open ai               -> Buka AI Offline (LLM Chat Lokal SSD)")
         appendLine("  open music            -> Buka Cyber Music")
         appendLine("  open files            -> Buka File Explorer")
         appendLine("  open vault            -> Buka Knowledge Vault")
@@ -268,8 +270,18 @@ fun PowerShellTerminalScreen(
                 }
             }
 
+            "ai", "aioffline", "aichat" -> {
+                onLaunchAiOffline()
+                appendLine("Membuka AI Offline (Cyber Deck LLM)...", TerminalTone.SUCCESS)
+            }
+
             "open", "start-app" -> {
                 val targetKey = arg.lowercase(Locale.US).replace(" ", "")
+                if (targetKey in setOf("ai", "aioffline", "aichat", "llm", "qwen")) {
+                    onLaunchAiOffline()
+                    appendLine("Membuka AI Offline (Cyber Deck LLM)...", TerminalTone.SUCCESS)
+                    return
+                }
                 val kind = when (targetKey) {
                     "browser", "web", "cyberbrowser" -> DesktopWindowKind.BROWSER
                     "search", "offlinesearch", "cari" -> DesktopWindowKind.SEARCH
@@ -290,7 +302,7 @@ fun PowerShellTerminalScreen(
                     onOpenWindow(kind)
                     appendLine("Membuka ${kind.defaultTitle}...", TerminalTone.SUCCESS)
                 } else {
-                    appendLine("Target tidak dikenal: '$arg'. Contoh: open browser | open search | open wiki | open tube | open files | open taskmgr | open settings", TerminalTone.ERROR)
+                    appendLine("Target tidak dikenal: '$arg'. Contoh: open browser | open search | open wiki | open tube | open ai | open files | open taskmgr | open settings", TerminalTone.ERROR)
                 }
             }
 
@@ -421,7 +433,7 @@ fun PowerShellTerminalScreen(
                 .padding(horizontal = 8.dp, vertical = 5.dp),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            val quickCmds = listOf("help", "sysinfo", "appinfo", "ram", "open browser", "open search", "open wiki", "apps", "sys wifi", "sys bluetooth", "cls")
+            val quickCmds = listOf("help", "sysinfo", "appinfo", "ram", "open ai", "open browser", "open search", "open wiki", "apps", "sys wifi", "sys bluetooth", "cls")
             quickCmds.forEach { qc ->
                 Surface(
                     color = Color(0xFF0A326D),
