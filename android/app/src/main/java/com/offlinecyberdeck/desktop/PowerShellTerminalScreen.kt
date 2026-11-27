@@ -145,7 +145,7 @@ fun PowerShellTerminalScreen(
         appendLine("  open wiki             -> Buka Offline Wiki (Kiwix PWA)")
         appendLine("  open tube             -> Buka OfflineTube (Media Vault)")
         appendLine("  open ai               -> Buka AI Offline (LLM Chat Lokal SSD)")
-        appendLine("  open music            -> Buka Cyber Music")
+        appendLine("  open music / mp3      -> Buka MP3 Player (Floating)")
         appendLine("  open files            -> Buka File Explorer")
         appendLine("  open vault            -> Buka Knowledge Vault")
         appendLine("  open taskmgr          -> Buka Task Manager")
@@ -187,8 +187,13 @@ fun PowerShellTerminalScreen(
         if (customMatch != null) {
             when (customMatch.targetType) {
                 TerminalCustomTargetType.IN_APP -> {
+                    val targetName = if (customMatch.targetValue.equals("MUSIC", ignoreCase = true)) {
+                        DesktopWindowKind.MP3_PLAYER.name
+                    } else {
+                        customMatch.targetValue
+                    }
                     val kind = DesktopWindowKind.entries.firstOrNull {
-                        it.name.equals(customMatch.targetValue, ignoreCase = true)
+                        it.name.equals(targetName, ignoreCase = true)
                     }
                     if (kind != null) {
                         onOpenWindow(kind)
@@ -293,7 +298,7 @@ fun PowerShellTerminalScreen(
                     "search", "offlinesearch", "cari" -> DesktopWindowKind.SEARCH
                     "wiki", "offlinewiki", "kiwix" -> DesktopWindowKind.OFFLINE_WIKI
                     "tube", "offlinetube", "media", "video" -> DesktopWindowKind.MEDIA
-                    "music", "cybermusic", "musik", "mp3" -> DesktopWindowKind.MUSIC
+                    "music", "cybermusic", "musik", "mp3", "mp3player" -> DesktopWindowKind.MP3_PLAYER
                     "files", "explorer", "fileexplorer", "file" -> DesktopWindowKind.FILES
                     "vault", "library", "knowledge" -> DesktopWindowKind.LIBRARY
                     "taskmgr", "taskmanager", "task", "ram" -> DesktopWindowKind.TASK_MANAGER

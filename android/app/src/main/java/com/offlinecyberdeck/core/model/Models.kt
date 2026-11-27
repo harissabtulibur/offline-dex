@@ -100,7 +100,6 @@ enum class MainDestination(val route: String, val label: String) {
     BROWSER("browser", "Browser"),
     LIBRARY("library", "Vault"),
     MEDIA("media", "Video"),
-    MUSIC("music", "Music"),
     FILES("files", "Explorer"),
     DOWNLOADS("downloads", "Downloads"),
     BOOKMARKS("bookmarks", "Bookmarks"),

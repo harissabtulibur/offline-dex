@@ -13,13 +13,14 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.OptIn
-import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -28,6 +29,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -43,9 +45,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.FilterNone
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -54,8 +58,8 @@ import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Search
@@ -77,6 +81,7 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
@@ -99,15 +104,20 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -130,14 +140,21 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
+import kotlin.math.roundToInt
 
-private val YtmRed = Color(0xFFFF0033)
-private val YtmBg = Color(0xFF030303)
-private val YtmSurface = Color(0xFF141418)
-private val YtmCard = Color(0xFF1D1D24)
-private val YtmInk = Color(0xFFF5F5F7)
-private val YtmMuted = Color(0xFFA3A3B2)
+enum class FloatingMp3WindowMode {
+    FLOATING,
+    MINIMIZED,
+    MAXIMIZED
+}
+
+private val Mp3Accent = Color(0xFFFF0033)
+private val Mp3Cyan = Color(0xFF22D3EE)
+private val Mp3Bg = Color(0xFF07090F)
+private val Mp3Surface = Color(0xFF111520)
+private val Mp3Card = Color(0xFF191F2E)
+private val Mp3Ink = Color(0xFFF5F5F7)
+private val Mp3Muted = Color(0xFFA3A8BA)
 
 private enum class MusicTab(val label: String) {
     QUICK_PICKS("Pilihan Cepat"),
@@ -150,18 +167,29 @@ private enum class MusicTab(val label: String) {
 
 private enum class MusicRepeatMode { OFF, ALL, ONE }
 
+/**
+ * Floating MP3 Player supporting Minimize, Maximize, Restore Floating Window, and Close.
+ * Audio playback (ExoPlayer / MediaPlayer fallback) persists seamlessly while minimized.
+ */
 @OptIn(UnstableApi::class)
 @Composable
-fun MusicPlayerScreen(
+fun FloatingMp3PlayerOverlay(
     app: CyberDeckApplication,
+    windowMode: FloatingMp3WindowMode,
+    onChangeWindowMode: (FloatingMp3WindowMode) -> Unit,
+    onClose: () -> Unit,
+    onTextInputFocusChanged: (Boolean) -> Unit = {},
     onShowMessage: (String) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+
     val tracks by app.musicRepository.tracksFlow.collectAsStateWithLifecycle(initialValue = emptyList())
     val settings by app.settingsRepository.settingsFlow.collectAsStateWithLifecycle(initialValue = AppSettingsEntity())
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
+
     val requiredAudioPerm = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             Manifest.permission.READ_MEDIA_AUDIO
@@ -191,7 +219,7 @@ fun MusicPlayerScreen(
         tracks.filter { it.id in accessibleIds }
     }
 
-    var selectedTab by remember { mutableStateOf(MusicTab.QUICK_PICKS) }
+    var selectedTab by remember { mutableStateOf(MusicTab.SONGS) }
     var searchOpen by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
     var selectedGroupFilter by remember { mutableStateOf<String?>(null) }
@@ -199,8 +227,7 @@ fun MusicPlayerScreen(
     var isRefreshing by remember { mutableStateOf(false) }
     var autoImportedOnce by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
-    var showNowPlayingPopup by remember { mutableStateOf(false) }
-    var fullPlayerExpanded by remember { mutableStateOf(false) }
+    var fullNowPlayingExpanded by remember { mutableStateOf(false) }
 
     var queue by remember { mutableStateOf<List<MusicTrackEntity>>(emptyList()) }
     var currentIndex by remember { mutableIntStateOf(-1) }
@@ -219,6 +246,12 @@ fun MusicPlayerScreen(
     var mediaPlayerFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
     var fallbackPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var usingFallbackPlayer by remember { mutableStateOf(false) }
+
+    // Floating & Minimized draggable offsets (dp)
+    var floatXDp by remember { mutableFloatStateOf(36f) }
+    var floatYDp by remember { mutableFloatStateOf(36f) }
+    var miniOffsetXPx by remember { mutableFloatStateOf(16f) }
+    var miniOffsetYPx by remember { mutableFloatStateOf(-64f) }
 
     val exoPlayer = remember {
         val extractorsFactory = DefaultExtractorsFactory()
@@ -292,7 +325,7 @@ fun MusicPlayerScreen(
     val currentTrack = queue.getOrNull(currentIndex)
         ?.let { cur -> tracks.firstOrNull { it.id == cur.id } ?: cur }
 
-    fun playFromList(list: List<MusicTrackEntity>, startIdx: Int, openPopup: Boolean = true) {
+    fun playFromList(list: List<MusicTrackEntity>, startIdx: Int) {
         if (list.isEmpty() || startIdx !in list.indices) return
         val target = list[startIdx]
         queue = list
@@ -306,9 +339,7 @@ fun MusicPlayerScreen(
         mediaPlayerFallbackTriedTrackId = null
         releaseFallbackPlayer()
         runCatching { exoPlayer.stop() }
-        if (openPopup) {
-            showNowPlayingPopup = true
-        }
+
         val token = ++playRequestToken
         val extraSaf = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
 
@@ -359,7 +390,7 @@ fun MusicPlayerScreen(
             else -1
         }
         if (nextIdx in queue.indices) {
-            playFromList(queue, nextIdx, openPopup = false)
+            playFromList(queue, nextIdx)
         } else {
             if (usingFallbackPlayer) {
                 runCatching { fallbackPlayer?.pause() }
@@ -382,7 +413,7 @@ fun MusicPlayerScreen(
             return
         }
         val prevIdx = if (currentIndex - 1 >= 0) currentIndex - 1 else queue.lastIndex
-        playFromList(queue, prevIdx, openPopup = false)
+        playFromList(queue, prevIdx)
     }
 
     fun startAndroidMediaPlayerFallback(track: MusicTrackEntity, uri: Uri): Boolean {
@@ -455,11 +486,11 @@ fun MusicPlayerScreen(
                             if (summary.importedCount > 0) add("${summary.importedCount} lagu baru")
                             if (summary.removedCount > 0) add("${summary.removedCount} lagu terputus dibersihkan")
                         }
-                        onShowMessage("Auto-Import Musik: ${parts.joinToString(", ")}.")
+                        onShowMessage("Auto-Import MP3 Player: ${parts.joinToString(", ")}.")
                     }
                 }
                 .onFailure {
-                    if (manual) onShowMessage("Refresh musik gagal: ${it.message}")
+                    if (manual) onShowMessage("Refresh MP3 gagal: ${it.message}")
                 }
             isRefreshing = false
         }
@@ -645,8 +676,10 @@ fun MusicPlayerScreen(
         }
         exoPlayer.addListener(listener)
         onDispose {
+            onTextInputFocusChanged(false)
             exoPlayer.removeListener(listener)
-            exoPlayer.release()
+            runCatching { exoPlayer.stop() }
+            runCatching { exoPlayer.release() }
             releaseFallbackPlayer()
         }
     }
@@ -672,11 +705,17 @@ fun MusicPlayerScreen(
         }
     }
 
-    BackHandler(enabled = fullPlayerExpanded || showNowPlayingPopup) {
-        if (fullPlayerExpanded) {
-            fullPlayerExpanded = false
-        } else {
-            showNowPlayingPopup = false
+    LaunchedEffect(windowMode) {
+        if (windowMode == FloatingMp3WindowMode.MINIMIZED) {
+            onTextInputFocusChanged(false)
+        }
+    }
+
+    BackHandler(enabled = fullNowPlayingExpanded || windowMode == FloatingMp3WindowMode.MAXIMIZED) {
+        if (fullNowPlayingExpanded) {
+            fullNowPlayingExpanded = false
+        } else if (windowMode == FloatingMp3WindowMode.MAXIMIZED) {
+            onChangeWindowMode(FloatingMp3WindowMode.FLOATING)
         }
     }
 
@@ -730,795 +769,795 @@ fun MusicPlayerScreen(
         }
     }
 
-    if (fullPlayerExpanded && currentTrack != null) {
-        FullMusicNowPlayingOverlay(
-            track = currentTrack,
-            isPlaying = isPlaying,
-            positionMs = positionMs,
-            durationMs = if (durationMs > 0L) durationMs else currentTrack.durationMs,
-            shuffleEnabled = shuffleEnabled,
-            repeatMode = repeatMode,
-            playbackSpeed = playbackSpeed,
-            showSpeedMenu = showSpeedMenu,
-            onToggleSpeedMenu = { showSpeedMenu = !showSpeedMenu },
-            onSelectSpeed = { sp ->
-                setAudioPlaybackSpeed(sp)
-                showSpeedMenu = false
-            },
-            onCollapse = { fullPlayerExpanded = false },
-            onSeek = { targetMs -> seekAudioTo(targetMs) },
-            onTogglePlayPause = { toggleAudioPlayPause() },
-            onNext = { playNextTrack(autoTriggered = false) },
-            onPrev = { playPrevTrack() },
-            onToggleShuffle = { shuffleEnabled = !shuffleEnabled },
-            onCycleRepeat = {
-                repeatMode = when (repeatMode) {
-                    MusicRepeatMode.OFF -> MusicRepeatMode.ALL
-                    MusicRepeatMode.ALL -> MusicRepeatMode.ONE
-                    MusicRepeatMode.ONE -> MusicRepeatMode.OFF
-                }
-            },
-            onToggleFavorite = {
-                scope.launch { app.musicRepository.toggleFavorite(currentTrack) }
-            }
-        )
-        return
-    }
-
-    Box(modifier = Modifier.fillMaxSize().background(YtmBg)) {
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(YtmBg)
+            .zIndex(9950f)
     ) {
-        // YouTube Music-style Top App Bar
-        Surface(color = YtmSurface) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(32.dp)
-                            .clip(CircleShape)
-                            .background(YtmRed),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            Icons.Filled.PlayArrow,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                    Column {
-                        Text(
-                            "Cyber Music",
-                            color = YtmInk,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            "${visibleTracks.size} lagu • Internal, SD & USB",
-                            color = YtmMuted,
-                            fontSize = 11.sp
-                        )
-                    }
-                }
+        val screenW = maxWidth.value
+        val screenH = maxHeight.value
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = {
-                        searchOpen = !searchOpen
-                        if (!searchOpen) searchQuery = ""
-                    }) {
-                        Icon(
-                            if (searchOpen) Icons.Filled.Close else Icons.Filled.Search,
-                            contentDescription = "Cari Musik",
-                            tint = YtmInk
-                        )
-                    }
-                    IconButton(
-                        onClick = { runRefreshImport(manual = true) },
-                        enabled = !isRefreshing
-                    ) {
-                        if (isRefreshing) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                color = YtmRed,
-                                strokeWidth = 2.dp
-                            )
-                        } else {
-                            Icon(Icons.Filled.Refresh, contentDescription = "Refresh Import Lagu", tint = YtmInk)
-                        }
-                    }
-                    IconButton(onClick = { safFolderPicker.launch(null) }) {
-                        Icon(Icons.Filled.FolderOpen, contentDescription = "Scan Folder SD / USB", tint = YtmInk)
-                    }
-                    IconButton(onClick = { showSettingsDialog = true }) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Pengaturan Musik", tint = YtmInk)
-                    }
-                    Button(
-                        onClick = { audioFilePicker.launch(arrayOf("audio/*", "application/ogg")) },
-                        colors = ButtonDefaults.buttonColors(containerColor = YtmRed, contentColor = Color.White),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("Import", fontSize = 12.sp)
-                    }
-                }
-            }
-        }
+        if (windowMode == FloatingMp3WindowMode.MINIMIZED) {
+            // MINIMIZED FLOATING MINI MP3 BAR (Music continues uninterrupted!)
+            val activeTrack = currentTrack
+            val dur = if (activeTrack != null) {
+                (if (durationMs > 0L) durationMs else activeTrack.durationMs).coerceAtLeast(1L)
+            } else 1L
+            val safePos = positionMs.coerceIn(0L, dur)
 
-        if (searchOpen) {
             Surface(
-                color = YtmCard,
-                shape = RoundedCornerShape(22.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = Mp3Surface.copy(alpha = 0.96f),
+                border = BorderStroke(1.5.dp, Mp3Accent.copy(alpha = 0.7f)),
+                shadowElevation = 18.dp,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(Icons.Filled.Search, contentDescription = null, tint = YtmMuted, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Box(modifier = Modifier.weight(1f)) {
-                        if (searchQuery.isEmpty()) {
-                            Text("Cari judul lagu, artis, album, atau nama file MP3...", color = YtmMuted, fontSize = 13.sp)
-                        }
-                        BasicTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            singleLine = true,
-                            textStyle = androidx.compose.ui.text.TextStyle(color = YtmInk, fontSize = 14.sp),
-                            cursorBrush = SolidColor(YtmRed),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                    if (searchQuery.isNotEmpty()) {
-                        Icon(
-                            Icons.Filled.Close,
-                            contentDescription = "Hapus",
-                            tint = YtmMuted,
-                            modifier = Modifier.size(18.dp).clickable { searchQuery = "" }
-                        )
-                    }
-                }
-            }
-        }
-
-        // YouTube Music Filter Chips Row
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            MusicTab.entries.forEach { tab ->
-                FilterChip(
-                    selected = selectedTab == tab,
-                    onClick = {
-                        selectedTab = tab
-                        selectedGroupFilter = null
-                    },
-                    label = { Text(tab.label) },
-                    colors = FilterChipDefaults.filterChipColors(
-                        containerColor = YtmCard,
-                        labelColor = YtmInk,
-                        selectedContainerColor = Color.White,
-                        selectedLabelColor = Color.Black
-                    ),
-                    border = FilterChipDefaults.filterChipBorder(
-                        enabled = true,
-                        selected = selectedTab == tab,
-                        borderColor = Color(0xFF2D2D38)
-                    )
-                )
-            }
-        }
-
-        if (!hasAudioPermission || !hasAllFilesAccess) {
-            Surface(
-                color = Color(0xFF1F161D),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, YtmRed.copy(alpha = 0.45f)),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 4.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(
-                        if (!hasAudioPermission) {
-                            "Berikan izin Audio agar lagu dari SD Card & Internal otomatis terbaca."
-                        } else {
-                            "Untuk akses file SD Card langsung tanpa SAF, aktifkan All Files Access atau pilih folder SD Card."
-                        },
-                        color = YtmInk,
-                        fontSize = 11.sp,
-                        modifier = Modifier.weight(1f)
-                    )
-                    if (!hasAudioPermission) {
-                        Button(
-                            onClick = { audioPermLauncher.launch(requiredAudioPerm) },
-                            colors = ButtonDefaults.buttonColors(containerColor = YtmRed, contentColor = Color.White),
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                        ) {
-                            Text("Izinkan Audio", fontSize = 11.sp)
-                        }
-                    } else {
-                        OutlinedButton(
-                            onClick = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                    runCatching {
-                                        context.startActivity(
-                                            Intent(
-                                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                                                Uri.parse("package:${context.packageName}")
-                                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        )
-                                    }
-                                }
-                            },
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                        ) {
-                            Text("Izin SD/File", color = YtmInk, fontSize = 11.sp)
+                    .align(Alignment.BottomStart)
+                    .offset { IntOffset(miniOffsetXPx.roundToInt(), miniOffsetYPx.roundToInt()) }
+                    .width(340.dp.coerceAtMost((screenW - 24f).dp))
+                    .pointerInput(Unit) {
+                        detectDragGestures { change, dragAmount ->
+                            change.consume()
+                            miniOffsetXPx += dragAmount.x
+                            miniOffsetYPx += dragAmount.y
                         }
                     }
-                    OutlinedButton(
-                        onClick = { safFolderPicker.launch(null) },
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                    ) {
-                        Text("Folder SD", color = YtmInk, fontSize = 11.sp)
-                    }
-                }
-            }
-        }
-
-        // Main Content Area
-        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-            when {
-                visibleTracks.isEmpty() -> {
-                    Column(
-                        modifier = Modifier.align(Alignment.Center).padding(28.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Icon(Icons.Filled.MusicNote, contentDescription = null, tint = YtmRed, modifier = Modifier.size(54.dp))
-                        Text("Perpustakaan Musik Masih Kosong", color = YtmInk, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                        Text(
-                            "Tekan Refresh Import untuk memindai seluruh file MP3 / audio di Internal, SD Card & USB, atau pilih Folder SD Card langsung.",
-                            color = YtmMuted,
-                            fontSize = 13.sp
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Button(
-                                onClick = {
-                                    if (!hasAudioPermission) {
-                                        audioPermLauncher.launch(requiredAudioPerm)
-                                    } else {
-                                        runRefreshImport(manual = true)
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = YtmRed, contentColor = Color.White)
-                            ) {
-                                Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text(if (!hasAudioPermission) "Izinkan & Scan MP3" else "Scan & Import Semua MP3")
-                            }
-                            OutlinedButton(onClick = { safFolderPicker.launch(null) }) {
-                                Text("Pilih Folder SD / USB", color = YtmInk)
-                            }
-                        }
-                    }
-                }
-
-                selectedTab == MusicTab.QUEUE -> {
-                    if (queue.isEmpty()) {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("Antrian kosong. Putar lagu apa saja untuk mengisi antrian.", color = YtmMuted)
-                        }
-                    } else {
-                        LazyColumn(
-                            contentPadding = PaddingValues(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            itemsIndexed(queue, key = { idx, t -> "${t.id}_$idx" }) { idx, track ->
-                                MusicTrackRow(
-                                    track = track,
-                                    isCurrent = idx == currentIndex,
-                                    isPlaying = idx == currentIndex && isPlaying,
-                                    onPlay = { playFromList(queue, idx) },
-                                    onToggleFavorite = { scope.launch { app.musicRepository.toggleFavorite(track) } },
-                                    onDelete = { scope.launch { app.musicRepository.deleteTrack(track) } }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                selectedTab == MusicTab.ARTISTS && selectedGroupFilter == null -> {
-                    val groups = remember(filteredTracks) {
-                        filteredTracks.groupBy { it.artist.ifBlank { "Unknown Artist" } }.toSortedMap()
-                    }
-                    LazyColumn(
-                        contentPadding = PaddingValues(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(groups.keys.toList(), key = { it }) { artist ->
-                            val list = groups[artist].orEmpty()
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = YtmCard),
-                                modifier = Modifier.fillMaxWidth().clickable { selectedGroupFilter = artist }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(14.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    Box(
-                                        modifier = Modifier.size(44.dp).clip(CircleShape).background(Color(0xFF2B2B36)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(Icons.Filled.Person, contentDescription = null, tint = YtmInk)
-                                    }
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(artist, color = YtmInk, fontWeight = FontWeight.SemiBold)
-                                        Text("${list.size} lagu", color = YtmMuted, fontSize = 12.sp)
-                                    }
-                                    IconButton(onClick = { playFromList(list, 0) }) {
-                                        Icon(Icons.Filled.PlayArrow, contentDescription = "Putar Artis", tint = YtmRed)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                selectedTab == MusicTab.ALBUMS && selectedGroupFilter == null -> {
-                    val groups = remember(filteredTracks) {
-                        filteredTracks.groupBy { it.album.ifBlank { "Local Music" } }.toSortedMap()
-                    }
-                    LazyColumn(
-                        contentPadding = PaddingValues(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(groups.keys.toList(), key = { it }) { album ->
-                            val list = groups[album].orEmpty()
-                            Card(
-                                colors = CardDefaults.cardColors(containerColor = YtmCard),
-                                modifier = Modifier.fillMaxWidth().clickable { selectedGroupFilter = album }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(14.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                                ) {
-                                    Box(
-                                        modifier = Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF2B2B36)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(Icons.Filled.Album, contentDescription = null, tint = YtmRed)
-                                    }
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(album, color = YtmInk, fontWeight = FontWeight.SemiBold)
-                                        Text("${list.size} lagu", color = YtmMuted, fontSize = 12.sp)
-                                    }
-                                    IconButton(onClick = { playFromList(list, 0) }) {
-                                        Icon(Icons.Filled.PlayArrow, contentDescription = "Putar Album", tint = YtmRed)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                else -> {
-                    LazyColumn(
-                        contentPadding = PaddingValues(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        if (selectedGroupFilter != null) {
-                            item {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(selectedGroupFilter!!, color = YtmInk, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                                    TextButton(onClick = { selectedGroupFilter = null }) {
-                                        Text("Semua", color = YtmRed)
-                                    }
-                                }
-                            }
-                        }
-
-                        if (selectedTab == MusicTab.QUICK_PICKS && searchQuery.isBlank() && selectedGroupFilter == null) {
-                            item {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text("Putar Cepat", color = YtmInk, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                                    OutlinedButton(onClick = {
-                                        shuffleEnabled = true
-                                        if (visibleTracks.isNotEmpty()) playFromList(visibleTracks.shuffled(), 0)
-                                    }) {
-                                        Icon(Icons.Filled.Shuffle, contentDescription = null, tint = YtmInk, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                        Text("Acak Semua", color = YtmInk, fontSize = 12.sp)
-                                    }
-                                }
-                                LazyRow(
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                    contentPadding = PaddingValues(vertical = 8.dp)
-                                ) {
-                                    itemsIndexed(visibleTracks.take(12), key = { _, t -> "qp_${t.id}" }) { idx, track ->
-                                        Surface(
-                                            color = YtmCard,
-                                            shape = RoundedCornerShape(10.dp),
-                                            modifier = Modifier
-                                                .width(148.dp)
-                                                .clickable { playFromList(visibleTracks, idx) }
-                                        ) {
-                                            Column(modifier = Modifier.padding(10.dp)) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .aspectRatio(1f)
-                                                        .clip(RoundedCornerShape(8.dp))
-                                                        .background(
-                                                            Brush.linearGradient(
-                                                                listOf(Color(0xFF42121D), Color(0xFF1F2438))
-                                                            )
-                                                        ),
-                                                    contentAlignment = Alignment.Center
-                                                ) {
-                                                    Icon(
-                                                        if (currentTrack?.id == track.id) Icons.Filled.GraphicEq else Icons.Filled.MusicNote,
-                                                        contentDescription = null,
-                                                        tint = if (currentTrack?.id == track.id) YtmRed else Color.White.copy(alpha = 0.85f),
-                                                        modifier = Modifier.size(38.dp)
-                                                    )
-                                                }
-                                                Spacer(Modifier.height(8.dp))
-                                                Text(track.title, color = YtmInk, fontWeight = FontWeight.SemiBold, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                                Text(track.artist, color = YtmMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            }
-                                        }
-                                    }
-                                }
-                                Text("Daftar Lagu", color = YtmInk, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
-                            }
-                        }
-
-                        itemsIndexed(filteredTracks, key = { _, t -> t.id }) { idx, track ->
-                            MusicTrackRow(
-                                track = track,
-                                isCurrent = currentTrack?.id == track.id,
-                                isPlaying = currentTrack?.id == track.id && isPlaying,
-                                onPlay = { playFromList(filteredTracks, idx) },
-                                onToggleFavorite = { scope.launch { app.musicRepository.toggleFavorite(track) } },
-                                onDelete = { scope.launch { app.musicRepository.deleteTrack(track) } }
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // YouTube Music-style Persistent Mini Player Bar (with Song Title, Navigator & Seek Progress)
-        if (currentTrack != null) {
-            HorizontalDivider(color = Color(0xFF282832))
-            Surface(
-                color = YtmSurface,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { showNowPlayingPopup = true }
             ) {
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    val dur = (if (durationMs > 0L) durationMs else currentTrack.durationMs).coerceAtLeast(1L)
-                    val safePos = positionMs.coerceIn(0L, dur)
-                    Slider(
-                        value = safePos.toFloat() / dur.toFloat(),
-                        onValueChange = { frac -> seekAudioTo((frac * dur).toLong()) },
-                        colors = SliderDefaults.colors(
-                            thumbColor = Color.White,
-                            activeTrackColor = YtmRed,
-                            inactiveTrackColor = Color(0xFF2B2B36)
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(22.dp)
-                            .padding(horizontal = 8.dp)
-                    )
+                    if (activeTrack != null) {
+                        LinearProgressIndicator(
+                            progress = { (safePos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) },
+                            color = Mp3Accent,
+                            trackColor = Color(0xFF282D3C),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(3.dp)
+                        )
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(start = 12.dp, end = 8.dp, bottom = 8.dp),
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Brush.linearGradient(listOf(YtmRed.copy(alpha = 0.7f), Color(0xFF282836)))),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Filled.GraphicEq, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
-                        }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                currentTrack.title,
-                                color = YtmInk,
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 14.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                "${currentTrack.artist} • ${Formatters.formatDurationMs(safePos)} / ${Formatters.formatDurationMs(dur)}",
-                                color = YtmMuted,
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        IconButton(onClick = { scope.launch { app.musicRepository.toggleFavorite(currentTrack) } }, modifier = Modifier.size(34.dp)) {
-                            Icon(
-                                if (currentTrack.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                                contentDescription = "Favorit",
-                                tint = if (currentTrack.isFavorite) YtmRed else YtmMuted,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        IconButton(onClick = { playPrevTrack() }, modifier = Modifier.size(36.dp)) {
-                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White)
-                        }
-                        IconButton(
-                            onClick = { toggleAudioPlayPause() },
-                            modifier = Modifier.size(38.dp)
-                        ) {
-                            Icon(
-                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                contentDescription = "Play/Pause",
-                                tint = Color.White,
-                                modifier = Modifier.size(28.dp)
-                            )
-                        }
-                        IconButton(onClick = { playNextTrack(autoTriggered = false) }, modifier = Modifier.size(36.dp)) {
-                            Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Floating Now-Playing Popup Overlay (Song Title + Music Navigator + Interactive Progress Bar)
-    if (showNowPlayingPopup && currentTrack != null) {
-        val safeDur = (if (durationMs > 0L) durationMs else currentTrack.durationMs).coerceAtLeast(1L)
-        val safePos = positionMs.coerceIn(0L, safeDur)
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .zIndex(50f)
-                .background(Color.Black.copy(alpha = 0.65f))
-                .clickable { showNowPlayingPopup = false },
-            contentAlignment = Alignment.Center
-        ) {
-            Surface(
-                shape = RoundedCornerShape(18.dp),
-                color = YtmSurface,
-                border = BorderStroke(1.dp, YtmRed.copy(alpha = 0.55f)),
-                shadowElevation = 18.dp,
-                modifier = Modifier
-                    .fillMaxWidth(0.92f)
-                    .padding(16.dp)
-                    .clickable(enabled = false) {}
-            ) {
-                Column(
-                    modifier = Modifier.padding(18.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "SEDANG DIPUTAR • ${currentTrack.volumeLabel}",
-                            color = YtmRed,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box {
-                                TextButton(onClick = { showSpeedMenu = !showSpeedMenu }) {
-                                    Icon(Icons.Filled.Speed, contentDescription = null, tint = YtmInk, modifier = Modifier.size(15.dp))
-                                    Spacer(Modifier.width(3.dp))
-                                    Text("${playbackSpeed}x", color = YtmInk, fontSize = 12.sp)
-                                }
-                                DropdownMenu(expanded = showSpeedMenu, onDismissRequest = { showSpeedMenu = false }) {
-                                    listOf(0.75f, 1.0f, 1.15f, 1.25f, 1.5f).forEach { sp ->
-                                        DropdownMenuItem(
-                                            text = { Text("${sp}x") },
-                                            onClick = {
-                                                setAudioPlaybackSpeed(sp)
-                                                showSpeedMenu = false
-                                            }
-                                        )
-                                    }
-                                }
-                            }
-                            IconButton(
-                                onClick = {
-                                    showNowPlayingPopup = false
-                                    fullPlayerExpanded = true
-                                },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(Icons.Filled.OpenInFull, contentDescription = "Layar Penuh", tint = YtmMuted, modifier = Modifier.size(16.dp))
-                            }
-                            IconButton(
-                                onClick = { showNowPlayingPopup = false },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(Icons.Filled.Close, contentDescription = "Tutup Popup", tint = YtmInk, modifier = Modifier.size(18.dp))
-                            }
-                        }
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(14.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(68.dp)
-                                .clip(RoundedCornerShape(12.dp))
+                                .size(34.dp)
+                                .clip(CircleShape)
                                 .background(
-                                    Brush.linearGradient(
-                                        listOf(YtmRed.copy(alpha = 0.85f), Color(0xFF28193B))
-                                    )
-                                ),
+                                    Brush.linearGradient(listOf(Mp3Accent, Color(0xFF311B42)))
+                                )
+                                .clickable { onChangeWindowMode(FloatingMp3WindowMode.FLOATING) },
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 if (isPlaying) Icons.Filled.GraphicEq else Icons.Filled.MusicNote,
-                                contentDescription = null,
+                                contentDescription = "Restore MP3 Player",
                                 tint = Color.White,
-                                modifier = Modifier.size(34.dp)
+                                modifier = Modifier.size(18.dp)
                             )
                         }
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            Text(
-                                text = currentTrack.title,
-                                color = YtmInk,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 18.sp,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = "${currentTrack.artist} • ${currentTrack.album}",
-                                color = YtmMuted,
-                                fontSize = 13.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = currentTrack.fileName,
-                                color = YtmMuted.copy(alpha = 0.7f),
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        IconButton(onClick = { scope.launch { app.musicRepository.toggleFavorite(currentTrack) } }) {
-                            Icon(
-                                if (currentTrack.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
-                                contentDescription = "Favorit",
-                                tint = if (currentTrack.isFavorite) YtmRed else YtmInk
-                            )
-                        }
-                    }
-
-                    // Progress Bar & Timestamps
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Slider(
-                            value = safePos.toFloat() / safeDur.toFloat(),
-                            onValueChange = { frac -> seekAudioTo((frac * safeDur).toLong()) },
-                            colors = SliderDefaults.colors(
-                                thumbColor = Color.White,
-                                activeTrackColor = YtmRed,
-                                inactiveTrackColor = Color(0xFF3A3A48)
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(Formatters.formatDurationMs(safePos), color = YtmMuted, fontSize = 12.sp)
-                            Text(Formatters.formatDurationMs(safeDur), color = YtmMuted, fontSize = 12.sp)
-                        }
-                    }
-
-                    // Music Navigator Controls
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(onClick = { shuffleEnabled = !shuffleEnabled }) {
-                            Icon(
-                                Icons.Filled.Shuffle,
-                                contentDescription = "Acak",
-                                tint = if (shuffleEnabled) YtmRed else YtmMuted
-                            )
-                        }
-                        IconButton(onClick = { playPrevTrack() }, modifier = Modifier.size(44.dp)) {
-                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White, modifier = Modifier.size(30.dp))
-                        }
-                        Box(
+                        Column(
                             modifier = Modifier
-                                .size(56.dp)
-                                .clip(CircleShape)
-                                .background(Color.White)
-                                .clickable { toggleAudioPlayPause() },
-                            contentAlignment = Alignment.Center
+                                .weight(1f)
+                                .clickable { onChangeWindowMode(FloatingMp3WindowMode.FLOATING) }
                         ) {
-                            Icon(
-                                if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                contentDescription = "Play/Pause",
-                                tint = Color.Black,
-                                modifier = Modifier.size(32.dp)
+                            Text(
+                                text = activeTrack?.title ?: "MP3 Player (Minimized)",
+                                color = Mp3Ink,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = if (activeTrack != null) {
+                                    "${Formatters.formatDurationMs(safePos)} / ${Formatters.formatDurationMs(dur)}"
+                                } else {
+                                    "${visibleTracks.size} lagu siap"
+                                },
+                                color = Mp3Muted,
+                                fontSize = 10.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                        IconButton(onClick = { playNextTrack(autoTriggered = false) }, modifier = Modifier.size(44.dp)) {
-                            Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White, modifier = Modifier.size(30.dp))
+                        if (activeTrack != null) {
+                            IconButton(onClick = { playPrevTrack() }, modifier = Modifier.size(28.dp)) {
+                                Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Mp3Ink, modifier = Modifier.size(18.dp))
+                            }
+                            IconButton(onClick = { toggleAudioPlayPause() }, modifier = Modifier.size(30.dp)) {
+                                Icon(
+                                    if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                    contentDescription = "Play/Pause",
+                                    tint = Mp3Accent,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                            }
+                            IconButton(onClick = { playNextTrack(autoTriggered = false) }, modifier = Modifier.size(28.dp)) {
+                                Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Mp3Ink, modifier = Modifier.size(18.dp))
+                            }
                         }
-                        IconButton(onClick = {
+                        IconButton(
+                            onClick = { onChangeWindowMode(FloatingMp3WindowMode.FLOATING) },
+                            modifier = Modifier.size(26.dp)
+                        ) {
+                            Icon(Icons.Filled.OpenInFull, contentDescription = "Restore Floating", tint = Mp3Cyan, modifier = Modifier.size(15.dp))
+                        }
+                        IconButton(
+                            onClick = { onChangeWindowMode(FloatingMp3WindowMode.MAXIMIZED) },
+                            modifier = Modifier.size(26.dp)
+                        ) {
+                            Icon(Icons.Filled.CropSquare, contentDescription = "Maximize", tint = Mp3Ink, modifier = Modifier.size(15.dp))
+                        }
+                        IconButton(
+                            onClick = onClose,
+                            modifier = Modifier.size(26.dp)
+                        ) {
+                            Icon(Icons.Filled.Close, contentDescription = "Close", tint = Color(0xFFEF4444), modifier = Modifier.size(16.dp))
+                        }
+                    }
+                }
+            }
+            return@BoxWithConstraints
+        }
+
+        // FLOATING WINDOW (DEFAULT) OR MAXIMIZED WINDOW
+        val isMaximized = windowMode == FloatingMp3WindowMode.MAXIMIZED
+        val winWidthDp = (screenW * 0.72f).coerceIn(320f, 560f)
+        val winHeightDp = (screenH * 0.76f).coerceIn(320f, 580f)
+        val clampedX = floatXDp.coerceIn(0f, (screenW - winWidthDp).coerceAtLeast(0f))
+        val clampedY = floatYDp.coerceIn(0f, (screenH - winHeightDp).coerceAtLeast(0f))
+
+        val containerModifier = if (isMaximized) {
+            Modifier.fillMaxSize()
+        } else {
+            Modifier
+                .offset {
+                    with(density) { IntOffset(clampedX.dp.roundToPx(), clampedY.dp.roundToPx()) }
+                }
+                .width(winWidthDp.dp)
+                .height(winHeightDp.dp)
+        }
+
+        Surface(
+            shape = if (isMaximized) RoundedCornerShape(0.dp) else RoundedCornerShape(14.dp),
+            color = Mp3Bg,
+            border = if (isMaximized) null else BorderStroke(1.5.dp, Mp3Accent.copy(alpha = 0.7f)),
+            shadowElevation = if (isMaximized) 0.dp else 20.dp,
+            modifier = containerModifier
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // WINDOW CHROME TITLE BAR (Draggable in Floating mode + Minimize / Maximize / Close)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0C101A))
+                        .pointerInput(isMaximized) {
+                            detectDragGestures { change, dragAmount ->
+                                change.consume()
+                                if (!isMaximized) {
+                                    floatXDp = (floatXDp + dragAmount.x / density.density)
+                                        .coerceIn(0f, (screenW - winWidthDp).coerceAtLeast(0f))
+                                    floatYDp = (floatYDp + dragAmount.y / density.density)
+                                        .coerceIn(0f, (screenH - winHeightDp).coerceAtLeast(0f))
+                                }
+                            }
+                        }
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .clip(CircleShape)
+                            .background(Mp3Accent),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Filled.MusicNote, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "MP3 Player (${visibleTracks.size} lagu)",
+                            color = Mp3Ink,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            fullNowPlayingExpanded = false
+                            onChangeWindowMode(FloatingMp3WindowMode.MINIMIZED)
+                        },
+                        modifier = Modifier.size(30.dp)
+                    ) {
+                        Icon(Icons.Filled.Remove, contentDescription = "Minimize", tint = Mp3Ink, modifier = Modifier.size(18.dp))
+                    }
+                    IconButton(
+                        onClick = {
+                            onChangeWindowMode(
+                                if (isMaximized) FloatingMp3WindowMode.FLOATING else FloatingMp3WindowMode.MAXIMIZED
+                            )
+                        },
+                        modifier = Modifier.size(30.dp)
+                    ) {
+                        Icon(
+                            if (isMaximized) Icons.Filled.FilterNone else Icons.Filled.CropSquare,
+                            contentDescription = if (isMaximized) "Restore Floating" else "Maximize",
+                            tint = Mp3Ink,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = onClose,
+                        modifier = Modifier.size(30.dp)
+                    ) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close", tint = Color(0xFFEF4444), modifier = Modifier.size(18.dp))
+                    }
+                }
+
+                HorizontalDivider(color = Color(0xFF232838))
+
+                if (fullNowPlayingExpanded && currentTrack != null) {
+                    FullMusicNowPlayingView(
+                        track = currentTrack,
+                        isPlaying = isPlaying,
+                        positionMs = positionMs,
+                        durationMs = if (durationMs > 0L) durationMs else currentTrack.durationMs,
+                        shuffleEnabled = shuffleEnabled,
+                        repeatMode = repeatMode,
+                        playbackSpeed = playbackSpeed,
+                        showSpeedMenu = showSpeedMenu,
+                        onToggleSpeedMenu = { showSpeedMenu = !showSpeedMenu },
+                        onSelectSpeed = { sp ->
+                            setAudioPlaybackSpeed(sp)
+                            showSpeedMenu = false
+                        },
+                        onCollapse = { fullNowPlayingExpanded = false },
+                        onSeek = { targetMs -> seekAudioTo(targetMs) },
+                        onTogglePlayPause = { toggleAudioPlayPause() },
+                        onNext = { playNextTrack(autoTriggered = false) },
+                        onPrev = { playPrevTrack() },
+                        onToggleShuffle = { shuffleEnabled = !shuffleEnabled },
+                        onCycleRepeat = {
                             repeatMode = when (repeatMode) {
                                 MusicRepeatMode.OFF -> MusicRepeatMode.ALL
                                 MusicRepeatMode.ALL -> MusicRepeatMode.ONE
                                 MusicRepeatMode.ONE -> MusicRepeatMode.OFF
                             }
-                        }) {
-                            Icon(
-                                if (repeatMode == MusicRepeatMode.ONE) Icons.Filled.RepeatOne else Icons.Filled.Repeat,
-                                contentDescription = "Ulangi",
-                                tint = if (repeatMode != MusicRepeatMode.OFF) YtmRed else YtmMuted
+                        },
+                        onToggleFavorite = {
+                            scope.launch { app.musicRepository.toggleFavorite(currentTrack) }
+                        }
+                    )
+                } else {
+                    // TOOLBAR & ACTIONS
+                    Surface(color = Mp3Surface) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text = "Internal, SD & USB Audio",
+                                color = Mp3Muted,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
                             )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = {
+                                        searchOpen = !searchOpen
+                                        if (!searchOpen) searchQuery = ""
+                                    },
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    Icon(
+                                        if (searchOpen) Icons.Filled.Close else Icons.Filled.Search,
+                                        contentDescription = "Cari MP3",
+                                        tint = Mp3Ink,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { runRefreshImport(manual = true) },
+                                    enabled = !isRefreshing,
+                                    modifier = Modifier.size(34.dp)
+                                ) {
+                                    if (isRefreshing) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            color = Mp3Accent,
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else {
+                                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh MP3", tint = Mp3Ink, modifier = Modifier.size(18.dp))
+                                    }
+                                }
+                                IconButton(onClick = { safFolderPicker.launch(null) }, modifier = Modifier.size(34.dp)) {
+                                    Icon(Icons.Filled.FolderOpen, contentDescription = "Folder SD / USB", tint = Mp3Ink, modifier = Modifier.size(18.dp))
+                                }
+                                IconButton(onClick = { showSettingsDialog = true }, modifier = Modifier.size(34.dp)) {
+                                    Icon(Icons.Filled.Settings, contentDescription = "Pengaturan MP3", tint = Mp3Ink, modifier = Modifier.size(18.dp))
+                                }
+                                Button(
+                                    onClick = { audioFilePicker.launch(arrayOf("audio/*", "application/ogg")) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Mp3Accent, contentColor = Color.White),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                                ) {
+                                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(15.dp))
+                                    Spacer(Modifier.width(3.dp))
+                                    Text("Import", fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+
+                    if (searchOpen) {
+                        Surface(
+                            color = Mp3Card,
+                            shape = RoundedCornerShape(18.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.Search, contentDescription = null, tint = Mp3Muted, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Box(modifier = Modifier.weight(1f)) {
+                                    if (searchQuery.isEmpty()) {
+                                        Text("Cari judul lagu, artis, album, atau nama file MP3...", color = Mp3Muted, fontSize = 12.sp)
+                                    }
+                                    BasicTextField(
+                                        value = searchQuery,
+                                        onValueChange = { searchQuery = it },
+                                        singleLine = true,
+                                        textStyle = androidx.compose.ui.text.TextStyle(color = Mp3Ink, fontSize = 13.sp),
+                                        cursorBrush = SolidColor(Mp3Accent),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .onFocusChanged { onTextInputFocusChanged(it.isFocused) }
+                                    )
+                                }
+                                if (searchQuery.isNotEmpty()) {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "Hapus",
+                                        tint = Mp3Muted,
+                                        modifier = Modifier.size(16.dp).clickable { searchQuery = "" }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // FILTER TABS
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        MusicTab.entries.forEach { tab ->
+                            FilterChip(
+                                selected = selectedTab == tab,
+                                onClick = {
+                                    selectedTab = tab
+                                    selectedGroupFilter = null
+                                },
+                                label = { Text(tab.label, fontSize = 12.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    containerColor = Mp3Card,
+                                    labelColor = Mp3Ink,
+                                    selectedContainerColor = Color.White,
+                                    selectedLabelColor = Color.Black
+                                ),
+                                border = FilterChipDefaults.filterChipBorder(
+                                    enabled = true,
+                                    selected = selectedTab == tab,
+                                    borderColor = Color(0xFF2D2D38)
+                                )
+                            )
+                        }
+                    }
+
+                    if (!hasAudioPermission || !hasAllFilesAccess) {
+                        Surface(
+                            color = Color(0xFF1F161D),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Mp3Accent.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 3.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    if (!hasAudioPermission) {
+                                        "Berikan izin Audio agar lagu dari SD Card & Internal otomatis terbaca."
+                                    } else {
+                                        "Aktifkan All Files Access atau pilih folder SD Card lewat SAF."
+                                    },
+                                    color = Mp3Ink,
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (!hasAudioPermission) {
+                                    Button(
+                                        onClick = { audioPermLauncher.launch(requiredAudioPerm) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Mp3Accent, contentColor = Color.White),
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Izinkan", fontSize = 11.sp)
+                                    }
+                                } else {
+                                    OutlinedButton(
+                                        onClick = {
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                                runCatching {
+                                                    context.startActivity(
+                                                        Intent(
+                                                            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                            Uri.parse("package:${context.packageName}")
+                                                        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                                    )
+                                                }
+                                            }
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                                    ) {
+                                        Text("Izin File", color = Mp3Ink, fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // TRACK LIST AREA
+                    Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                        when {
+                            visibleTracks.isEmpty() -> {
+                                Column(
+                                    modifier = Modifier.align(Alignment.Center).padding(20.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(Icons.Filled.MusicNote, contentDescription = null, tint = Mp3Accent, modifier = Modifier.size(44.dp))
+                                    Text("Daftar MP3 Masih Kosong", color = Mp3Ink, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                    Text(
+                                        "Tekan Scan / Refresh atau pilih Folder SD Card / USB untuk memuat lagu.",
+                                        color = Mp3Muted,
+                                        fontSize = 12.sp
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(
+                                            onClick = {
+                                                if (!hasAudioPermission) {
+                                                    audioPermLauncher.launch(requiredAudioPerm)
+                                                } else {
+                                                    runRefreshImport(manual = true)
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Mp3Accent, contentColor = Color.White)
+                                        ) {
+                                            Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text(if (!hasAudioPermission) "Izinkan & Scan" else "Scan MP3", fontSize = 12.sp)
+                                        }
+                                        OutlinedButton(onClick = { safFolderPicker.launch(null) }) {
+                                            Text("Folder SD/USB", color = Mp3Ink, fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+
+                            selectedTab == MusicTab.QUEUE -> {
+                                if (queue.isEmpty()) {
+                                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text("Antrian kosong. Putar lagu untuk mengisi antrian.", color = Mp3Muted, fontSize = 12.sp)
+                                    }
+                                } else {
+                                    LazyColumn(
+                                        contentPadding = PaddingValues(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        itemsIndexed(queue, key = { idx, t -> "${t.id}_$idx" }) { idx, track ->
+                                            Mp3TrackRow(
+                                                track = track,
+                                                isCurrent = idx == currentIndex,
+                                                isPlaying = idx == currentIndex && isPlaying,
+                                                onPlay = { playFromList(queue, idx) },
+                                                onToggleFavorite = { scope.launch { app.musicRepository.toggleFavorite(track) } },
+                                                onDelete = { scope.launch { app.musicRepository.deleteTrack(track) } }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            selectedTab == MusicTab.ARTISTS && selectedGroupFilter == null -> {
+                                val groups = remember(filteredTracks) {
+                                    filteredTracks.groupBy { it.artist.ifBlank { "Unknown Artist" } }.toSortedMap()
+                                }
+                                LazyColumn(
+                                    contentPadding = PaddingValues(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    items(groups.keys.toList(), key = { it }) { artist ->
+                                        val list = groups[artist].orEmpty()
+                                        Card(
+                                            colors = CardDefaults.cardColors(containerColor = Mp3Card),
+                                            modifier = Modifier.fillMaxWidth().clickable { selectedGroupFilter = artist }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(12.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier.size(38.dp).clip(CircleShape).background(Color(0xFF2B2B36)),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Icon(Icons.Filled.Person, contentDescription = null, tint = Mp3Ink)
+                                                }
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(artist, color = Mp3Ink, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                                    Text("${list.size} lagu", color = Mp3Muted, fontSize = 11.sp)
+                                                }
+                                                IconButton(onClick = { playFromList(list, 0) }) {
+                                                    Icon(Icons.Filled.PlayArrow, contentDescription = "Putar Artis", tint = Mp3Accent)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            selectedTab == MusicTab.ALBUMS && selectedGroupFilter == null -> {
+                                val groups = remember(filteredTracks) {
+                                    filteredTracks.groupBy { it.album.ifBlank { "Local Music" } }.toSortedMap()
+                                }
+                                LazyColumn(
+                                    contentPadding = PaddingValues(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    items(groups.keys.toList(), key = { it }) { album ->
+                                        val list = groups[album].orEmpty()
+                                        Card(
+                                            colors = CardDefaults.cardColors(containerColor = Mp3Card),
+                                            modifier = Modifier.fillMaxWidth().clickable { selectedGroupFilter = album }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(12.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                            ) {
+                                                Box(
+                                                    modifier = Modifier.size(38.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF2B2B36)),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
+                                                    Icon(Icons.Filled.Album, contentDescription = null, tint = Mp3Accent)
+                                                }
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(album, color = Mp3Ink, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                                    Text("${list.size} lagu", color = Mp3Muted, fontSize = 11.sp)
+                                                }
+                                                IconButton(onClick = { playFromList(list, 0) }) {
+                                                    Icon(Icons.Filled.PlayArrow, contentDescription = "Putar Album", tint = Mp3Accent)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            else -> {
+                                LazyColumn(
+                                    contentPadding = PaddingValues(10.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (selectedGroupFilter != null) {
+                                        item {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Text(selectedGroupFilter!!, color = Mp3Ink, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                                TextButton(onClick = { selectedGroupFilter = null }) {
+                                                    Text("Semua", color = Mp3Accent)
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if (selectedTab == MusicTab.QUICK_PICKS && searchQuery.isBlank() && selectedGroupFilter == null) {
+                                        item {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text("Putar Cepat", color = Mp3Ink, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                                OutlinedButton(onClick = {
+                                                    shuffleEnabled = true
+                                                    if (visibleTracks.isNotEmpty()) playFromList(visibleTracks.shuffled(), 0)
+                                                }) {
+                                                    Icon(Icons.Filled.Shuffle, contentDescription = null, tint = Mp3Ink, modifier = Modifier.size(14.dp))
+                                                    Spacer(Modifier.width(4.dp))
+                                                    Text("Acak Semua", color = Mp3Ink, fontSize = 11.sp)
+                                                }
+                                            }
+                                            LazyRow(
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                                contentPadding = PaddingValues(vertical = 6.dp)
+                                            ) {
+                                                itemsIndexed(visibleTracks.take(12), key = { _, t -> "qp_${t.id}" }) { idx, track ->
+                                                    Surface(
+                                                        color = Mp3Card,
+                                                        shape = RoundedCornerShape(10.dp),
+                                                        modifier = Modifier
+                                                            .width(128.dp)
+                                                            .clickable { playFromList(visibleTracks, idx) }
+                                                    ) {
+                                                        Column(modifier = Modifier.padding(8.dp)) {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .fillMaxWidth()
+                                                                    .aspectRatio(1f)
+                                                                    .clip(RoundedCornerShape(8.dp))
+                                                                    .background(
+                                                                        Brush.linearGradient(
+                                                                            listOf(Color(0xFF42121D), Color(0xFF1F2438))
+                                                                        )
+                                                                    ),
+                                                                contentAlignment = Alignment.Center
+                                                            ) {
+                                                                Icon(
+                                                                    if (currentTrack?.id == track.id) Icons.Filled.GraphicEq else Icons.Filled.MusicNote,
+                                                                    contentDescription = null,
+                                                                    tint = if (currentTrack?.id == track.id) Mp3Accent else Color.White.copy(alpha = 0.85f),
+                                                                    modifier = Modifier.size(32.dp)
+                                                                )
+                                                            }
+                                                            Spacer(Modifier.height(6.dp))
+                                                            Text(track.title, color = Mp3Ink, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                            Text(track.artist, color = Mp3Muted, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    itemsIndexed(filteredTracks, key = { _, t -> t.id }) { idx, track ->
+                                        Mp3TrackRow(
+                                            track = track,
+                                            isCurrent = currentTrack?.id == track.id,
+                                            isPlaying = currentTrack?.id == track.id && isPlaying,
+                                            onPlay = { playFromList(filteredTracks, idx) },
+                                            onToggleFavorite = { scope.launch { app.musicRepository.toggleFavorite(track) } },
+                                            onDelete = { scope.launch { app.musicRepository.deleteTrack(track) } }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // DOCKED BOTTOM TRANSPORT BAR
+                    if (currentTrack != null) {
+                        HorizontalDivider(color = Color(0xFF282832))
+                        Surface(
+                            color = Mp3Surface,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { fullNowPlayingExpanded = true }
+                        ) {
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                val dur = (if (durationMs > 0L) durationMs else currentTrack.durationMs).coerceAtLeast(1L)
+                                val safePos = positionMs.coerceIn(0L, dur)
+                                Slider(
+                                    value = safePos.toFloat() / dur.toFloat(),
+                                    onValueChange = { frac -> seekAudioTo((frac * dur).toLong()) },
+                                    colors = SliderDefaults.colors(
+                                        thumbColor = Color.White,
+                                        activeTrackColor = Mp3Accent,
+                                        inactiveTrackColor = Color(0xFF2B2B36)
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(22.dp)
+                                        .padding(horizontal = 8.dp)
+                                )
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 10.dp, end = 6.dp, bottom = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(34.dp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(Brush.linearGradient(listOf(Mp3Accent.copy(alpha = 0.7f), Color(0xFF282836)))),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(Icons.Filled.GraphicEq, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                                    }
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            currentTrack.title,
+                                            color = Mp3Ink,
+                                            fontWeight = FontWeight.SemiBold,
+                                            fontSize = 13.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            "${currentTrack.artist} • ${Formatters.formatDurationMs(safePos)} / ${Formatters.formatDurationMs(dur)}",
+                                            color = Mp3Muted,
+                                            fontSize = 10.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    IconButton(onClick = { scope.launch { app.musicRepository.toggleFavorite(currentTrack) } }, modifier = Modifier.size(30.dp)) {
+                                        Icon(
+                                            if (currentTrack.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
+                                            contentDescription = "Favorit",
+                                            tint = if (currentTrack.isFavorite) Mp3Accent else Mp3Muted,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                    IconButton(onClick = { playPrevTrack() }, modifier = Modifier.size(32.dp)) {
+                                        Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White, modifier = Modifier.size(20.dp))
+                                    }
+                                    IconButton(
+                                        onClick = { toggleAudioPlayPause() },
+                                        modifier = Modifier.size(34.dp)
+                                    ) {
+                                        Icon(
+                                            if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                            contentDescription = "Play/Pause",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                    }
+                                    IconButton(onClick = { playNextTrack(autoTriggered = false) }, modifier = Modifier.size(32.dp)) {
+                                        Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White, modifier = Modifier.size(20.dp))
+                                    }
+                                    IconButton(onClick = { fullNowPlayingExpanded = true }, modifier = Modifier.size(28.dp)) {
+                                        Icon(Icons.Filled.OpenInFull, contentDescription = "Detail Player", tint = Mp3Muted, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
-    }
 
     if (showSettingsDialog) {
         AlertDialog(
             onDismissRequest = { showSettingsDialog = false },
-            title = { Text("Pengaturan Cyber Music") },
+            title = { Text("Pengaturan MP3 Player") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(
@@ -1576,7 +1615,7 @@ fun MusicPlayerScreen(
 }
 
 @Composable
-private fun MusicTrackRow(
+private fun Mp3TrackRow(
     track: MusicTrackEntity,
     isCurrent: Boolean,
     isPlaying: Boolean,
@@ -1585,39 +1624,40 @@ private fun MusicTrackRow(
     onDelete: () -> Unit
 ) {
     Surface(
-        color = if (isCurrent) Color(0xFF281720) else YtmCard,
+        color = if (isCurrent) Color(0xFF281720) else Mp3Card,
         shape = RoundedCornerShape(10.dp),
-        border = if (isCurrent) BorderStroke(1.dp, YtmRed.copy(alpha = 0.65f)) else null,
+        border = if (isCurrent) BorderStroke(1.dp, Mp3Accent.copy(alpha = 0.65f)) else null,
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onPlay)
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Box(
                 modifier = Modifier
-                    .size(44.dp)
+                    .size(38.dp)
                     .clip(RoundedCornerShape(8.dp))
                     .background(
-                        if (isCurrent) YtmRed.copy(alpha = 0.25f) else Color(0xFF262632)
+                        if (isCurrent) Mp3Accent.copy(alpha = 0.25f) else Color(0xFF262632)
                     ),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     if (isCurrent && isPlaying) Icons.Filled.GraphicEq else Icons.Filled.MusicNote,
                     contentDescription = null,
-                    tint = if (isCurrent) YtmRed else YtmInk
+                    tint = if (isCurrent) Mp3Accent else Mp3Ink,
+                    modifier = Modifier.size(20.dp)
                 )
             }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     track.title,
-                    color = if (isCurrent) YtmRed else YtmInk,
+                    color = if (isCurrent) Mp3Accent else Mp3Ink,
                     fontWeight = FontWeight.SemiBold,
-                    fontSize = 14.sp,
+                    fontSize = 13.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -1628,26 +1668,26 @@ private fun MusicTrackRow(
                         append(track.volumeLabel)
                         if (track.durationMs > 0L) append(" • ${Formatters.formatDurationMs(track.durationMs)}")
                     },
-                    color = YtmMuted,
-                    fontSize = 12.sp,
+                    color = Mp3Muted,
+                    fontSize = 11.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            IconButton(onClick = onToggleFavorite, modifier = Modifier.size(34.dp)) {
+            IconButton(onClick = onToggleFavorite, modifier = Modifier.size(30.dp)) {
                 Icon(
                     if (track.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                     contentDescription = "Favorit",
-                    tint = if (track.isFavorite) YtmRed else YtmMuted,
-                    modifier = Modifier.size(18.dp)
+                    tint = if (track.isFavorite) Mp3Accent else Mp3Muted,
+                    modifier = Modifier.size(16.dp)
                 )
             }
-            IconButton(onClick = onDelete, modifier = Modifier.size(34.dp)) {
+            IconButton(onClick = onDelete, modifier = Modifier.size(30.dp)) {
                 Icon(
                     Icons.Filled.Delete,
                     contentDescription = "Hapus dari daftar",
-                    tint = YtmMuted,
-                    modifier = Modifier.size(18.dp)
+                    tint = Mp3Muted,
+                    modifier = Modifier.size(16.dp)
                 )
             }
         }
@@ -1655,7 +1695,7 @@ private fun MusicTrackRow(
 }
 
 @Composable
-private fun FullMusicNowPlayingOverlay(
+private fun FullMusicNowPlayingView(
     track: MusicTrackEntity,
     isPlaying: Boolean,
     positionMs: Long,
@@ -1683,10 +1723,10 @@ private fun FullMusicNowPlayingOverlay(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(Color(0xFF280B14), YtmBg)
+                    listOf(Color(0xFF280B14), Mp3Bg)
                 )
             )
-            .padding(20.dp),
+            .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Row(
@@ -1695,14 +1735,14 @@ private fun FullMusicNowPlayingOverlay(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onCollapse) {
-                Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Tutup Player", tint = YtmInk)
+                Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Kembali ke Daftar", tint = Mp3Ink)
             }
-            Text("Sedang Diputar • ${track.volumeLabel}", color = YtmMuted, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Text("Sedang Diputar • ${track.volumeLabel}", color = Mp3Muted, fontSize = 12.sp, fontWeight = FontWeight.Medium)
             Box {
                 TextButton(onClick = onToggleSpeedMenu) {
-                    Icon(Icons.Filled.Speed, contentDescription = null, tint = YtmInk, modifier = Modifier.size(16.dp))
+                    Icon(Icons.Filled.Speed, contentDescription = null, tint = Mp3Ink, modifier = Modifier.size(15.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("${playbackSpeed}x", color = YtmInk)
+                    Text("${playbackSpeed}x", color = Mp3Ink, fontSize = 12.sp)
                 }
                 DropdownMenu(expanded = showSpeedMenu, onDismissRequest = onToggleSpeedMenu) {
                     listOf(0.75f, 1.0f, 1.15f, 1.25f, 1.5f).forEach { sp ->
@@ -1712,15 +1752,15 @@ private fun FullMusicNowPlayingOverlay(
             }
         }
 
-        Spacer(Modifier.weight(0.5f))
+        Spacer(Modifier.weight(0.4f))
 
         Box(
             modifier = Modifier
-                .size(220.dp)
-                .clip(RoundedCornerShape(18.dp))
+                .size(150.dp)
+                .clip(RoundedCornerShape(16.dp))
                 .background(
                     Brush.linearGradient(
-                        listOf(YtmRed.copy(alpha = 0.78f), Color(0xFF241432))
+                        listOf(Mp3Accent.copy(alpha = 0.78f), Color(0xFF241432))
                     )
                 ),
             contentAlignment = Alignment.Center
@@ -1729,11 +1769,11 @@ private fun FullMusicNowPlayingOverlay(
                 if (isPlaying) Icons.Filled.GraphicEq else Icons.Filled.MusicNote,
                 contentDescription = null,
                 tint = Color.White,
-                modifier = Modifier.size(96.dp)
+                modifier = Modifier.size(72.dp)
             )
         }
 
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(16.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1743,16 +1783,16 @@ private fun FullMusicNowPlayingOverlay(
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     track.title,
-                    color = YtmInk,
+                    color = Mp3Ink,
                     fontWeight = FontWeight.Bold,
-                    fontSize = 20.sp,
+                    fontSize = 17.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
                     "${track.artist} • ${track.album}",
-                    color = YtmMuted,
-                    fontSize = 14.sp,
+                    color = Mp3Muted,
+                    fontSize = 13.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -1761,19 +1801,19 @@ private fun FullMusicNowPlayingOverlay(
                 Icon(
                     if (track.isFavorite) Icons.Filled.Favorite else Icons.Filled.FavoriteBorder,
                     contentDescription = "Favorit",
-                    tint = if (track.isFavorite) YtmRed else YtmInk
+                    tint = if (track.isFavorite) Mp3Accent else Mp3Ink
                 )
             }
         }
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(10.dp))
 
         Slider(
             value = safePos.toFloat() / safeDur.toFloat(),
             onValueChange = { frac -> onSeek((frac * safeDur).toLong()) },
             colors = SliderDefaults.colors(
                 thumbColor = Color.White,
-                activeTrackColor = YtmRed,
+                activeTrackColor = Mp3Accent,
                 inactiveTrackColor = Color(0xFF3A3A48)
             ),
             modifier = Modifier.fillMaxWidth()
@@ -1782,11 +1822,11 @@ private fun FullMusicNowPlayingOverlay(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(Formatters.formatDurationMs(safePos), color = YtmMuted, fontSize = 12.sp)
-            Text(Formatters.formatDurationMs(safeDur), color = YtmMuted, fontSize = 12.sp)
+            Text(Formatters.formatDurationMs(safePos), color = Mp3Muted, fontSize = 11.sp)
+            Text(Formatters.formatDurationMs(safeDur), color = Mp3Muted, fontSize = 11.sp)
         }
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(10.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1797,15 +1837,15 @@ private fun FullMusicNowPlayingOverlay(
                 Icon(
                     Icons.Filled.Shuffle,
                     contentDescription = "Acak",
-                    tint = if (shuffleEnabled) YtmRed else YtmMuted
+                    tint = if (shuffleEnabled) Mp3Accent else Mp3Muted
                 )
             }
-            IconButton(onClick = onPrev, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White, modifier = Modifier.size(34.dp))
+            IconButton(onClick = onPrev, modifier = Modifier.size(44.dp)) {
+                Icon(Icons.Filled.SkipPrevious, contentDescription = "Sebelumnya", tint = Color.White, modifier = Modifier.size(30.dp))
             }
             Box(
                 modifier = Modifier
-                    .size(66.dp)
+                    .size(56.dp)
                     .clip(CircleShape)
                     .background(Color.White)
                     .clickable(onClick = onTogglePlayPause),
@@ -1815,21 +1855,21 @@ private fun FullMusicNowPlayingOverlay(
                     if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                     contentDescription = "Play/Pause",
                     tint = Color.Black,
-                    modifier = Modifier.size(36.dp)
+                    modifier = Modifier.size(30.dp)
                 )
             }
-            IconButton(onClick = onNext, modifier = Modifier.size(48.dp)) {
-                Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White, modifier = Modifier.size(34.dp))
+            IconButton(onClick = onNext, modifier = Modifier.size(44.dp)) {
+                Icon(Icons.Filled.SkipNext, contentDescription = "Berikutnya", tint = Color.White, modifier = Modifier.size(30.dp))
             }
             IconButton(onClick = onCycleRepeat) {
                 Icon(
                     if (repeatMode == MusicRepeatMode.ONE) Icons.Filled.RepeatOne else Icons.Filled.Repeat,
                     contentDescription = "Ulangi",
-                    tint = if (repeatMode != MusicRepeatMode.OFF) YtmRed else YtmMuted
+                    tint = if (repeatMode != MusicRepeatMode.OFF) Mp3Accent else Mp3Muted
                 )
             }
         }
 
-        Spacer(Modifier.weight(0.5f))
+        Spacer(Modifier.weight(0.4f))
     }
 }

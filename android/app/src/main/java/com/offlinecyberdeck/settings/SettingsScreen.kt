@@ -120,6 +120,8 @@ fun SettingsScreen(
         .collectAsStateWithLifecycle()
     val terminalCustomCommands by app.settingsRepository.terminalCustomCommandsFlow
         .collectAsStateWithLifecycle()
+    val hardwareKeyboardPopupEnabled by app.settingsRepository.hardwareKeyboardPopupEnabledFlow
+        .collectAsStateWithLifecycle()
 
     var showCustomCommandDialog by remember { mutableStateOf(false) }
     var installedAppsForCustomCmd by remember { mutableStateOf<List<InstalledAppInfo>>(emptyList()) }
@@ -438,6 +440,18 @@ fun SettingsScreen(
                         scope.launch { app.settingsRepository.updateSettings { it.copy(notificationSoundEnabled = v) } }
                     }
                 )
+                SettingSwitchRow(
+                    title = "Popup Input Keyboard Fisik (BT / USB)",
+                    subtitle = "Menampilkan kotak pop-up inputan real-time di kanan bawah (~3/4 layar) saat mengetik ke textbox lewat keyboard Bluetooth/USB, lalu hilang 0.3 detik setelah Enter",
+                    checked = hardwareKeyboardPopupEnabled,
+                    onCheckedChange = { v ->
+                        app.settingsRepository.setHardwareKeyboardPopupEnabled(v)
+                        onShowMessage(
+                            if (v) "Popup keyboard fisik (BT / USB) diaktifkan"
+                            else "Popup keyboard fisik (BT / USB) dinonaktifkan"
+                        )
+                    }
+                )
                 OutlinedButton(
                     onClick = onOpenDexPermissions,
                     modifier = Modifier.fillMaxWidth()
@@ -613,9 +627,9 @@ fun SettingsScreen(
         // MEDIA AUTO-IMPORT & ALL FILES PERMISSION
         item {
             val allFilesOk = DesktopLauncherManager.hasAllFilesAccess(context)
-            SectionCard("Cyber Music, OfflineTube & File Access") {
+            SectionCard("MP3 Player, OfflineTube & File Access") {
                 SettingSwitchRow(
-                    title = "Auto-Import MP3 (Cyber Music)",
+                    title = "Auto-Import MP3 (MP3 Player)",
                     subtitle = "Otomatis scan lagu MP3/audio baru dari Internal, SD Card & Eksternal tanpa duplikat",
                     checked = settings.musicAutoImport,
                     onCheckedChange = { v ->
@@ -1420,8 +1434,9 @@ fun SettingsScreen(
                 DesktopWindowKind.BROWSER,
                 DesktopWindowKind.SEARCH,
                 DesktopWindowKind.OFFLINE_WIKI,
+                DesktopWindowKind.AI_OFFLINE,
                 DesktopWindowKind.MEDIA,
-                DesktopWindowKind.MUSIC,
+                DesktopWindowKind.MP3_PLAYER,
                 DesktopWindowKind.FILES,
                 DesktopWindowKind.LIBRARY,
                 DesktopWindowKind.TASK_MANAGER,

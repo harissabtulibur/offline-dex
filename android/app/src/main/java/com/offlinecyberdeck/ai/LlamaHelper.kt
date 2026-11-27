@@ -10,6 +10,9 @@ import com.llamatik.core.platform.LlamaBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -42,9 +45,19 @@ object LlamaHelper {
         val batchSize: Int
     )
 
+    data class AiLoadProgress(
+        val isLoading: Boolean = false,
+        val progress: Float = 0f,
+        val stage: String = "",
+        val fileName: String = ""
+    )
+
     private val modelMutex = Mutex()
     private val helperScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val generatingFlag = AtomicBoolean(false)
+
+    private val _loadProgress = MutableStateFlow(AiLoadProgress())
+    val loadProgressFlow: StateFlow<AiLoadProgress> = _loadProgress.asStateFlow()
 
     @Volatile
     private var loaded: Boolean = false
@@ -93,9 +106,23 @@ object LlamaHelper {
 
                 unloadInternal()
 
+                _loadProgress.value = AiLoadProgress(
+                    isLoading = true,
+                    progress = 0.15f,
+                    stage = "Membuka File Descriptor SAF...",
+                    fileName = fileName
+                )
+
                 val resolver = context.applicationContext.contentResolver
                 val probePfd = runCatching { resolver.openFileDescriptor(modelUri, "r") }.getOrNull()
                     ?: error("Gagal membuka File Descriptor untuk '$fileName'. Pastikan izin SAF masih aktif dan SSD terhubung.")
+
+                _loadProgress.value = AiLoadProgress(
+                    isLoading = true,
+                    progress = 0.30f,
+                    stage = "Memvalidasi header model GGUF...",
+                    fileName = fileName
+                )
 
                 val validation = validateGgufFileDescriptor(probePfd)
                 runCatching { probePfd.close() }
@@ -116,7 +143,14 @@ object LlamaHelper {
                 var succeededMode = ""
                 var hookSummary = "not-installed"
 
-                for (profile in profiles) {
+                for ((idx, profile) in profiles.withIndex()) {
+                    _loadProgress.value = AiLoadProgress(
+                        isLoading = true,
+                        progress = (0.48f + idx * 0.16f).coerceAtMost(0.90f),
+                        stage = "Memuat model ke llama.cpp (${profile.label}, n_ctx=${profile.contextLength})...",
+                        fileName = fileName
+                    )
+
                     closePfdQuietly()
                     val pfd = runCatching { resolver.openFileDescriptor(modelUri, "r") }.getOrNull()
                         ?: continue
@@ -167,9 +201,16 @@ object LlamaHelper {
                 currentModelName = fileName
                 currentModelUri = uriStr
                 currentLoadModeLabel = succeededMode
+                _loadProgress.value = AiLoadProgress(
+                    isLoading = false,
+                    progress = 1f,
+                    stage = "Model siap ($succeededMode)",
+                    fileName = fileName
+                )
                 fileName
             }.onFailure {
                 FdHookBridge.setTargetFd(-1)
+                _loadProgress.value = AiLoadProgress()
                 unloadInternal()
             }
         }
@@ -264,6 +305,7 @@ object LlamaHelper {
         currentModelName = null
         currentModelUri = null
         currentLoadModeLabel = "FD"
+        _loadProgress.value = AiLoadProgress()
         closePfdQuietly()
     }
 

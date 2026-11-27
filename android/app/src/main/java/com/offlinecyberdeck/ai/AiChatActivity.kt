@@ -14,6 +14,7 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -80,6 +81,10 @@ class AiChatActivity : AppCompatActivity() {
         ) : FolderScanResult()
     }
 
+    private lateinit var layoutImportProgress: LinearLayout
+    private lateinit var tvImportStage: TextView
+    private lateinit var tvImportPercent: TextView
+    private lateinit var pbModelImport: ProgressBar
     private lateinit var btnBack: Button
     private lateinit var tvActiveModel: TextView
     private lateinit var btnPickFile: Button
@@ -137,11 +142,29 @@ class AiChatActivity : AppCompatActivity() {
         bindViews()
         setupRecyclerView()
         setupListeners()
+        observeLoadProgress()
 
         appendSystemLog(
             "Terminal AI Offline siap (SAF FD • n_ctx=${LlamaHelper.TARGET_N_CTX}, threads=${LlamaHelper.TARGET_N_THREADS})."
         )
         restorePersistedModelOrPrompt()
+    }
+
+    private fun observeLoadProgress() {
+        lifecycleScope.launch {
+            LlamaHelper.loadProgressFlow.collect { prog ->
+                if (prog.isLoading) {
+                    layoutImportProgress.visibility = View.VISIBLE
+                    val pct = (prog.progress.coerceIn(0f, 1f) * 100f).toInt()
+                    pbModelImport.isIndeterminate = false
+                    pbModelImport.progress = pct
+                    tvImportStage.text = if (prog.stage.isNotBlank()) prog.stage else "Memuat ${prog.fileName}..."
+                    tvImportPercent.text = "$pct%"
+                } else {
+                    layoutImportProgress.visibility = View.GONE
+                }
+            }
+        }
     }
 
     override fun onResume() {
@@ -161,6 +184,10 @@ class AiChatActivity : AppCompatActivity() {
     }
 
     private fun bindViews() {
+        layoutImportProgress = findViewById(R.id.layoutImportProgress)
+        tvImportStage = findViewById(R.id.tvImportStage)
+        tvImportPercent = findViewById(R.id.tvImportPercent)
+        pbModelImport = findViewById(R.id.pbModelImport)
         btnBack = findViewById(R.id.btnBack)
         tvActiveModel = findViewById(R.id.tvActiveModel)
         btnPickFile = findViewById(R.id.btnPickFile)

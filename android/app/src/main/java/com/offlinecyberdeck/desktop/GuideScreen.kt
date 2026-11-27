@@ -175,7 +175,7 @@ fun GuideScreen(
                     "Tersedia filter tab: All, Videos, Audio, Offline Ready, Watch Later, Continue Watching, Channels, dan Playlists.",
                     "Pemutar video memakai ExoPlayer dengan dukungan kecepatan putar (speed), mode layar penuh, dan melanjutkan posisi tontonan terakhir."
                 ),
-                importantNote = "Jumlah kolom tampilan video dan opsi Auto-Import dapat diatur di Settings -> Cyber Music, OfflineTube & File Access.",
+                importantNote = "Jumlah kolom tampilan video dan opsi Auto-Import dapat diatur di Settings -> MP3 Player, OfflineTube & File Access.",
                 targetWindow = DesktopWindowKind.MEDIA
             ),
             GuideTopic(
@@ -195,36 +195,36 @@ fun GuideScreen(
                 targetWindow = DesktopWindowKind.SEARCH
             ),
             GuideTopic(
-                id = "cyber_music",
-                title = "Cyber Music",
-                subtitle = "Pemutar musik offline untuk MP3, FLAC, M4A, WAV & OGG",
+                id = "mp3_player",
+                title = "MP3 Player (Floating)",
+                subtitle = "Pemutar musik floating (Minimize / Maximize / Close) untuk MP3, FLAC, M4A, WAV & OGG",
                 category = GuideCategory.OFFLINE,
                 icon = Icons.Filled.LibraryMusic,
                 accent = Color(0xFFC084FC),
-                whatIsIt = "Pemutar musik lokal yang mendukung pemindaian otomatis lagu dari Internal Storage, SD Card, maupun SSD OTG.",
+                whatIsIt = "Pemutar musik lokal bergaya jendela floating yang mendukung pemindaian otomatis lagu dari Internal Storage, SD Card, maupun SSD OTG, dan tetap memutar lagu saat diminimize.",
                 howItWorks = listOf(
                     "Auto-Import memindai lagu MP3/FLAC/M4A/WAV/OGG/OPUS dari penyimpanan perangkat dan folder SAF yang dipilih di Settings.",
-                    "Menampilkan pop-up judul lagu, navigator musik (Prev / Play-Pause / Next), seekbar progres lagu, pengatur kecepatan putar, tab Favorit, Artis, Album, dan Antrian.",
+                    "Mendukung kontrol jendela lengkap: Minimize (menjadi mini player ringkas sementara lagu tetap jalan), Maximize (layar penuh), Restore Floating, dan Close.",
                     "Untuk file audio di SD Card/OTG dengan izin terbatas, aplikasi otomatis memakai jalur langsung atau staging cache aman agar pemutaran tidak gagal."
                 ),
-                importantNote = "Jika lagu di SD Card atau SSD belum muncul, pastikan folder SSD/SD Card sudah ditautkan lewat Settings -> Deck Drive atau 'Folder Media Tambahan', lalu klik Refresh/Scan di Cyber Music.",
-                targetWindow = DesktopWindowKind.MUSIC
+                importantNote = "Jika lagu di SD Card atau SSD belum muncul, pastikan folder SSD/SD Card sudah ditautkan lewat Settings -> Deck Drive atau 'Folder Media Tambahan', lalu klik Refresh/Scan di MP3 Player.",
+                targetWindow = DesktopWindowKind.MP3_PLAYER
             ),
             GuideTopic(
                 id = "ai_offline",
                 title = "AI OFFLINE (Qwen2.5 GGUF)",
-                subtitle = "Asisten AI Chat lokal 100% tanpa internet & tanpa API Key",
+                subtitle = "Asisten AI Chat lokal 100% dalam jendela floating & progress bar import",
                 category = GuideCategory.OFFLINE,
                 icon = Icons.Filled.SmartToy,
                 accent = Color(0xFF00FF41),
-                whatIsIt = "Chat AI lokal berbasis llama.cpp (streaming token per token) yang dioptimalkan untuk Samsung Galaxy Tab A9 (RAM 4GB, Helio G99) memakai parameter n_ctx = 2048, n_threads = 4, dan mmap = true.",
+                whatIsIt = "Chat AI lokal berbasis llama.cpp (streaming token per token) yang terbuka otomatis sebagai jendela floating (bisa Minimize, Maximize, Close) dengan indikator progress bar di bagian atas saat memuat model GGUF.",
                 howItWorks = listOf(
                     "Siapkan SSD Eksternal USB-C OTG (format exFAT) dan buat folder bernama tepat 'AI_Models' di root SSD: SSD/AI_Models/.",
                     "Taruh file model (contoh: Qwen2.5-1.5B-Instruct-Q4_K_M.gguf) di dalam folder AI_Models tersebut — jangan di root SSD atau folder Download.",
-                    "Saat pertama kali membuka AI OFFLINE, pilih folder 'AI_Models' melalui dialog pemilih folder Android (SAF). Izin akan disimpan permanen sehingga pembukaan berikutnya langsung memuat model otomatis.",
+                    "Saat pertama kali membuka AI OFFLINE, pilih folder 'AI_Models' melalui dialog pemilih folder Android (SAF). Progress bar di bagian atas akan menampilkan status pemindaian & pemuatan model.",
                     "Model dimuat menggunakan memory-mapping (mmap) langsung dari SSD tanpa menyalin file 1 GB ke memori internal tablet."
                 ),
-                importantNote = "Gunakan tombol 'Stop' untuk menghentikan jawaban AI di tengah jalan, 'Clear Chat' untuk membersihkan riwayat percakapan, atau 'Pilih Folder AI_Models' untuk mengganti lokasi folder.",
+                importantNote = "Gunakan tombol Minimize/Maximize/Close di header jendela, tombol 'Stop' untuk menghentikan jawaban AI, atau 'Clear' untuk membersihkan percakapan.",
                 isAiOffline = true
             ),
             GuideTopic(
@@ -267,7 +267,7 @@ fun GuideScreen(
                 accent = Color(0xFFEAB308),
                 whatIsIt = "Ringkasan pengaturan penting di Cyber Deck Settings serta izin Android yang memengaruhi fitur DeX, penyimpanan SSD, jendela floating, dan performa RAM 4GB.",
                 howItWorks = listOf(
-                    "1. Deck Drive (USB-C SSD via SAF): Pilih folder utama SSD Anda sekali saja agar Download, Web Archive, OfflineTube, dan Cyber Music bisa membaca/menulis ke SSD.",
+                    "1. Deck Drive (USB-C SSD via SAF): Pilih folder utama SSD Anda sekali saja agar Download, Web Archive, OfflineTube, dan MP3 Player bisa membaca/menulis ke SSD.",
                     "2. Izin DeX Launcher & Floating Apps: (a) Jadikan Cyber Deck sebagai Home Launcher Utama jika ingin tampil saat tekan Home; (b) Aktifkan Izin Overlay; (c) Di Developer Options tablet aktifkan 'Enable freeform windows' + 'Force activities to be resizable' lalu restart agar aplikasi luar (WA/YouTube) terbuka sebagai jendela mengambang; (d) Aktifkan Akses Notifikasi agar notif muncul di panel kanan taskbar.",
                     "3. Izin Akses Semua File (All Files Access): Wajib aktif untuk File Explorer penuh, Offline Search ke SD/Internal, dan auto-import musik/video.",
                     "4. Akses Data Penggunaan (Usage Access): Wajib aktif agar Task Manager bisa menampilkan Recent Apps dan penggunaan RAM per aplikasi.",

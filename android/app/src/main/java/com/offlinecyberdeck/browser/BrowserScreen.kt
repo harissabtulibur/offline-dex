@@ -91,6 +91,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
@@ -131,6 +132,7 @@ fun BrowserScreen(
     onOpenHistory: () -> Unit,
     onOpenSettings: () -> Unit,
     onReturnToLauncher: (() -> Unit)? = null,
+    onTextInputFocusChanged: (Boolean) -> Unit = {},
     onShowMessage: (String) -> Unit
 ) {
     val tabs by viewModel.tabs.collectAsStateWithLifecycle()
@@ -418,7 +420,9 @@ fun BrowserScreen(
                                     viewModel.navigateFromInput(addressInput)
                                 }
                             ),
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { onTextInputFocusChanged(it.isFocused) }
                         )
                     }
                     if (addressInput.isNotEmpty()) {
@@ -750,7 +754,9 @@ fun BrowserScreen(
                     onValueChange = { viewModel.updateFindQuery(it) },
                     singleLine = true,
                     placeholder = { Text("Find in page") },
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier
+                        .weight(1f)
+                        .onFocusChanged { onTextInputFocusChanged(it.isFocused) }
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(

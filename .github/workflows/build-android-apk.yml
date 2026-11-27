@@ -46,8 +46,18 @@ jobs:
         working-directory: android
         run: gradle assembleDebug --stacktrace
 
+      - name: Rename APK to offline_cyberdeck.apk
+        run: |
+          SRC_APK=$(ls android/app/build/outputs/apk/debug/*.apk | head -n 1)
+          if [ -z "$SRC_APK" ]; then
+            echo "No APK found!"
+            exit 1
+          fi
+          cp "$SRC_APK" android/app/build/outputs/apk/debug/offline_cyberdeck.apk
+          ls -lh android/app/build/outputs/apk/debug/offline_cyberdeck.apk
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: offline-cyber-deck-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: offline_cyberdeck
+          path: android/app/build/outputs/apk/debug/offline_cyberdeck.apk

@@ -175,7 +175,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.offlinecyberdeck.CyberDeckApplication
-import com.offlinecyberdeck.ai.AiChatActivity
+import com.offlinecyberdeck.ai.AiChatSessionStore
+import com.offlinecyberdeck.ai.AiOfflineWindowScreen
+import com.offlinecyberdeck.ai.LlamaHelper
 import com.offlinecyberdeck.archive.ArchiveReaderScreen
 import com.offlinecyberdeck.bookmarks.BookmarksScreen
 import com.offlinecyberdeck.bookmarks.HistoryScreen
@@ -198,7 +200,6 @@ import com.offlinecyberdeck.library.TextDocumentReaderScreen
 import com.offlinecyberdeck.library.ZimViewerScreen
 import com.offlinecyberdeck.media.MediaPlayerScreen
 import com.offlinecyberdeck.media.MediaVaultScreen
-import com.offlinecyberdeck.music.MusicPlayerScreen
 import com.offlinecyberdeck.search.UnifiedSearchScreen
 import com.offlinecyberdeck.settings.SettingsScreen
 import com.offlinecyberdeck.ui.theme.DeckAmber
@@ -219,7 +220,8 @@ enum class DesktopWindowKind(val defaultTitle: String) {
     LIBRARY("Knowledge Vault"),
     ARCHIVES("Web Archives"),
     MEDIA("OfflineTube"),
-    MUSIC("Cyber Music"),
+    MP3_PLAYER("MP3 Player"),
+    AI_OFFLINE("AI Offline"),
     FILES("File Explorer"),
     TASK_MANAGER("Task Manager"),
     DOWNLOADS("Downloads"),
@@ -280,7 +282,8 @@ fun DesktopLauncherScreen(
     onShowMessage: (String) -> Unit,
     onRegisterToggleTerminal: ((() -> Unit)?) -> Unit = {},
     onRegisterActiveBackHandler: ((() -> Boolean)?) -> Unit = {},
-    onTextInputFocusChanged: (Boolean) -> Unit = {}
+    onTextInputFocusChanged: (Boolean) -> Unit = {},
+    onOpenFloatingMp3Player: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
@@ -338,13 +341,7 @@ fun DesktopLauncherScreen(
     var filesGoBackHandler by remember { mutableStateOf<(() -> Boolean)?>(null) }
     val notifSoundEnabledState by rememberUpdatedState(settings.notificationSoundEnabled)
     val haptic = LocalHapticFeedback.current
-    val launchAiOfflineActivity: () -> Unit = {
-        runCatching {
-            context.startActivity(Intent(context, AiChatActivity::class.java))
-        }.onFailure { err ->
-            onShowMessage("Gagal membuka AI Offline: ${err.message}")
-        }
-    }
+    val latestOpenMp3Player by rememberUpdatedState(onOpenFloatingMp3Player)
 
     val btPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -524,6 +521,12 @@ fun DesktopLauncherScreen(
         title: String = kind.defaultTitle,
         startMaximized: Boolean = false
     ) {
+        if (kind == DesktopWindowKind.MP3_PLAYER) {
+            latestOpenMp3Player()
+            appDrawerOpen = false
+            return
+        }
+
         val existingIdx = windows.indexOfFirst {
             it.kind == kind && (refId.isBlank() || it.refId == refId)
         }
@@ -540,10 +543,18 @@ fun DesktopLauncherScreen(
         // Enforce 4-window memory cap for 4 GB RAM tablets (close oldest non-browser window if > 3)
         if (windows.size >= 4) {
             val evictIdx = windows.indexOfFirst { it.kind != DesktopWindowKind.BROWSER }
-            if (evictIdx >= 0) windows.removeAt(evictIdx)
+            if (evictIdx >= 0) {
+                val evicted = windows.removeAt(evictIdx)
+                if (evicted.kind == DesktopWindowKind.AI_OFFLINE) {
+                    LlamaHelper.unloadModel()
+                    AiChatSessionStore.clearAll()
+                }
+            }
         }
 
         val cascade = (windows.size % 4) * 28f
+        val defaultWidth = if (kind == DesktopWindowKind.AI_OFFLINE) 680f else 780f
+        val defaultHeight = if (kind == DesktopWindowKind.AI_OFFLINE) 470f else 500f
         windows += DesktopWindowState(
             id = if (kind == DesktopWindowKind.BROWSER) "main_browser" else UUID.randomUUID().toString(),
             kind = kind,
@@ -553,8 +564,8 @@ fun DesktopLauncherScreen(
             isMaximized = startMaximized,
             xDp = 56f + cascade,
             yDp = 24f + cascade,
-            widthDp = 780f,
-            heightDp = 500f,
+            widthDp = defaultWidth,
+            heightDp = defaultHeight,
             zIndex = ++topZ
         )
         appDrawerOpen = false
@@ -581,7 +592,12 @@ fun DesktopLauncherScreen(
     }
 
     fun closeWindow(winId: String) {
+        val closing = windows.filter { it.id == winId }
         windows.removeAll { it.id == winId }
+        if (closing.any { it.kind == DesktopWindowKind.AI_OFFLINE }) {
+            LlamaHelper.unloadModel()
+            AiChatSessionStore.clearAll()
+        }
     }
 
     fun minimizeAllWindows() {
@@ -863,7 +879,7 @@ fun DesktopLauncherScreen(
                         makeBuiltIn(
                             id = "builtin_SEARCH",
                             label = "Offline Search",
-                            desc = "Mesin pencari instan di seluruh indeks lokal: arsip web, pustaka ZIM/PDF, video OfflineTube, lagu Cyber Music, dan bookmark.",
+                            desc = "Mesin pencari instan di seluruh indeks lokal: arsip web, pustaka ZIM/PDF, video OfflineTube, lagu MP3 Player, dan bookmark.",
                             hint = "search",
                             icon = Icons.Filled.Search,
                             tint = Color(0xFF34D399),
@@ -873,22 +889,22 @@ fun DesktopLauncherScreen(
                         makeBuiltIn(
                             id = "builtin_AI_OFFLINE",
                             label = "AI Offline",
-                            desc = "Asisten AI Chat 100% lokal (Qwen2.5-1.5B-Instruct Q4_K_M GGUF via llama.cpp mmap) yang membaca model langsung dari SSD/AI_Models.",
+                            desc = "Asisten AI Chat 100% lokal (GGUF via llama.cpp mmap) di jendela floating dengan kontrol Minimize/Maximize/Close & progress bar import.",
                             hint = "ai",
                             icon = Icons.Filled.SmartToy,
                             tint = Color(0xFF00FF41),
-                            target = "com.offlinecyberdeck.ai.AiChatActivity",
-                            onOpen = { launchAiOfflineActivity() }
+                            target = "cyberdeck://window/${DesktopWindowKind.AI_OFFLINE.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.AI_OFFLINE, startMaximized = false) }
                         ),
                         makeBuiltIn(
-                            id = "builtin_MUSIC",
-                            label = "Cyber Music",
-                            desc = "Pemutar musik offline dengan dukungan auto-import MP3/FLAC/M4A dari Internal, SD Card, dan USB OTG serta popup kontrol cepat.",
-                            hint = "music",
+                            id = "builtin_MP3_PLAYER",
+                            label = "MP3 Player",
+                            desc = "Pemutar musik floating dengan Minimize, Maximize, dan Close serta dukungan auto-import MP3/FLAC/M4A dari Internal, SD Card, dan USB OTG.",
+                            hint = "music / mp3",
                             icon = Icons.Filled.LibraryMusic,
                             tint = Color(0xFFF43F5E),
-                            target = "cyberdeck://window/${DesktopWindowKind.MUSIC.name}",
-                            onOpen = { openOrFocusWindow(DesktopWindowKind.MUSIC) }
+                            target = "cyberdeck://floating/MP3_PLAYER",
+                            onOpen = { latestOpenMp3Player() }
                         ),
                         makeBuiltIn(
                             id = "builtin_FILES",
@@ -1610,6 +1626,7 @@ fun DesktopLauncherScreen(
                                                     onOpenHistory = { openOrFocusWindow(DesktopWindowKind.HISTORY) },
                                                     onOpenSettings = { openOrFocusWindow(DesktopWindowKind.SETTINGS) },
                                                     onReturnToLauncher = { toggleMinimize(win.id) },
+                                                    onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
@@ -1662,9 +1679,15 @@ fun DesktopLauncherScreen(
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
-                                            DesktopWindowKind.MUSIC -> {
-                                                MusicPlayerScreen(
-                                                    app = app,
+                                            DesktopWindowKind.MP3_PLAYER -> {
+                                                LaunchedEffect(win.id) {
+                                                    closeWindow(win.id)
+                                                    latestOpenMp3Player()
+                                                }
+                                            }
+                                            DesktopWindowKind.AI_OFFLINE -> {
+                                                AiOfflineWindowScreen(
+                                                    onTextInputFocusChanged = onTextInputFocusChanged,
                                                     onShowMessage = onShowMessage
                                                 )
                                             }
@@ -1754,7 +1777,7 @@ fun DesktopLauncherScreen(
                                                     customCommands = terminalCustomCommands,
                                                     onOpenWindow = { targetKind -> openOrFocusWindow(targetKind) },
                                                     onLaunchPackage = { pkg -> launchExternalPackage(pkg) },
-                                                    onLaunchAiOffline = launchAiOfflineActivity,
+                                                    onLaunchAiOffline = { openOrFocusWindow(DesktopWindowKind.AI_OFFLINE, startMaximized = false) },
                                                     onCloseTerminal = { closeWindow(win.id) },
                                                     isWindowFocused = isTopFront,
                                                     onTextInputFocusChanged = onTextInputFocusChanged,
@@ -1773,7 +1796,7 @@ fun DesktopLauncherScreen(
                                             DesktopWindowKind.GUIDE -> {
                                                 GuideScreen(
                                                     onOpenWindow = { targetKind -> openOrFocusWindow(targetKind) },
-                                                    onLaunchAiOffline = launchAiOfflineActivity,
+                                                    onLaunchAiOffline = { openOrFocusWindow(DesktopWindowKind.AI_OFFLINE, startMaximized = false) },
                                                     onOpenDexPermissions = onShowPermissionsDialog
                                                 )
                                             }
@@ -2530,7 +2553,7 @@ fun DesktopLauncherScreen(
                                             )
                                             Text(
                                                 text = if (isOnline) "Cyber Browser, Search & Download online siap digunakan."
-                                                else "ZIM Encyclopedia, OfflineTube, Cyber Music & File Explorer tetap 100% aktif.",
+                                                else "ZIM Encyclopedia, OfflineTube, MP3 Player & File Explorer tetap 100% aktif.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
@@ -3811,7 +3834,7 @@ fun DesktopLauncherScreen(
                                 .weight(1f)
                                 .clickable {
                                     showOfflineHubDialog = false
-                                    launchAiOfflineActivity()
+                                    openOrFocusWindow(DesktopWindowKind.AI_OFFLINE, startMaximized = false)
                                 }
                         ) {
                             Column(
@@ -4602,7 +4625,8 @@ private fun windowIconForKind(kind: DesktopWindowKind): ImageVector = when (kind
     DesktopWindowKind.ZIM_READER -> Icons.Filled.MenuBook
     DesktopWindowKind.MEDIA,
     DesktopWindowKind.MEDIA_PLAYER -> Icons.Filled.VideoLibrary
-    DesktopWindowKind.MUSIC -> Icons.Filled.LibraryMusic
+    DesktopWindowKind.MP3_PLAYER -> Icons.Filled.LibraryMusic
+    DesktopWindowKind.AI_OFFLINE -> Icons.Filled.SmartToy
     DesktopWindowKind.FILES -> Icons.Filled.Folder
     DesktopWindowKind.TASK_MANAGER -> Icons.Filled.Speed
     DesktopWindowKind.DOWNLOADS -> Icons.Filled.Download

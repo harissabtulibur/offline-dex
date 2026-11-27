@@ -666,7 +666,7 @@ fun TaskManagerScreen(
                                 color = DeckGreen
                             )
                             Text(
-                                text = "Lingkungan kerja DeX offline-first: Browser Dark Mode, ZIM Wikipedia Viewer, File Explorer, OfflineTube, Cyber Music, dan Task Manager.",
+                                text = "Lingkungan kerja DeX offline-first: Browser Dark Mode, ZIM Wikipedia Viewer, File Explorer, OfflineTube, MP3 Player, dan Task Manager.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

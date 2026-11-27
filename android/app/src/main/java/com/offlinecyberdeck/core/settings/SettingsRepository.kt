@@ -108,6 +108,12 @@ class SettingsRepository(
     private val _terminalCustomCommands = MutableStateFlow(loadTerminalCommandsFromPrefs())
     val terminalCustomCommandsFlow: StateFlow<List<TerminalCustomCommand>> = _terminalCustomCommands.asStateFlow()
 
+    private val _hardwareKeyboardPopupEnabled = MutableStateFlow(
+        uiPrefs.getBoolean(KEY_HARDWARE_KEYBOARD_POPUP_ENABLED, true)
+    )
+    val hardwareKeyboardPopupEnabledFlow: StateFlow<Boolean> =
+        _hardwareKeyboardPopupEnabled.asStateFlow()
+
     val settingsFlow: Flow<AppSettingsEntity> = db.settingsDao().observe().map {
         it ?: AppSettingsEntity()
     }
@@ -176,12 +182,26 @@ class SettingsRepository(
         removeDesktopIconPosition(id)
     }
 
+    fun isHardwareKeyboardPopupEnabledSync(): Boolean =
+        uiPrefs.getBoolean(KEY_HARDWARE_KEYBOARD_POPUP_ENABLED, true)
+
+    fun setHardwareKeyboardPopupEnabled(enabled: Boolean) {
+        uiPrefs.edit().putBoolean(KEY_HARDWARE_KEYBOARD_POPUP_ENABLED, enabled).apply()
+        _hardwareKeyboardPopupEnabled.value = enabled
+    }
+
     private fun loadPinnedInAppDesktopIdsFromPrefs(): List<String> {
         if (!uiPrefs.contains(KEY_PINNED_INAPP_DESKTOP_IDS)) {
             return DEFAULT_PINNED_INAPP_DESKTOP_IDS
         }
         val raw = uiPrefs.getString(KEY_PINNED_INAPP_DESKTOP_IDS, "").orEmpty()
-        return raw.split(',').map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        return raw.split(',')
+            .map { id ->
+                val trimmed = id.trim()
+                if (trimmed == "builtin_MUSIC") "builtin_MP3_PLAYER" else trimmed
+            }
+            .filter { it.isNotBlank() }
+            .distinct()
     }
 
     private fun savePinnedInAppDesktopIdsToPrefs(ids: List<String>) {
@@ -292,11 +312,13 @@ class SettingsRepository(
         private const val KEY_APP_DRAWER_ICON_SIZE_DP = "app_drawer_icon_size_dp"
         private const val KEY_PINNED_INAPP_DESKTOP_IDS = "pinned_inapp_desktop_ids"
         private const val KEY_TERMINAL_CUSTOM_COMMANDS = "terminal_custom_commands_json"
+        private const val KEY_HARDWARE_KEYBOARD_POPUP_ENABLED = "hardware_keyboard_popup_enabled"
 
         val DEFAULT_PINNED_INAPP_DESKTOP_IDS = listOf(
             "builtin_BROWSER",
             "builtin_LIBRARY",
-            "builtin_MUSIC",
+            "builtin_MP3_PLAYER",
+            "builtin_AI_OFFLINE",
             "builtin_FILES",
             "builtin_TASK_MANAGER",
             "builtin_TERMINAL",

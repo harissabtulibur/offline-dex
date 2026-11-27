@@ -11,8 +11,11 @@ import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.view.InputDevice
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -20,17 +23,25 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -40,6 +51,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Public
@@ -80,8 +92,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -91,6 +106,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.offlinecyberdeck.archive.ArchiveReaderScreen
 import com.offlinecyberdeck.bookmarks.BookmarksScreen
@@ -117,12 +133,14 @@ import com.offlinecyberdeck.library.TextDocumentReaderScreen
 import com.offlinecyberdeck.library.ZimViewerScreen
 import com.offlinecyberdeck.media.MediaPlayerScreen
 import com.offlinecyberdeck.media.MediaVaultScreen
-import com.offlinecyberdeck.music.MusicPlayerScreen
+import com.offlinecyberdeck.music.FloatingMp3PlayerOverlay
+import com.offlinecyberdeck.music.FloatingMp3WindowMode
 import com.offlinecyberdeck.search.UnifiedSearchScreen
 import com.offlinecyberdeck.settings.SettingsScreen
 import com.offlinecyberdeck.ui.theme.CyberDeckTheme
 import com.offlinecyberdeck.ui.theme.DeckAmber
 import com.offlinecyberdeck.ui.theme.DeckGreen
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -141,28 +159,109 @@ class MainActivity : ComponentActivity() {
     private var hardwareBackspaceHandler: (() -> Boolean)? = null
     private var isComposeTextInputFocused: Boolean = false
 
+    private var hwKeyPopupVisible by mutableStateOf(false)
+    private var hwKeyBuffer by mutableStateOf("")
+    private var hwKeyEnterTriggered by mutableStateOf(false)
+    private var hwKeyDeviceName by mutableStateOf("Keyboard Fisik")
+    private var hwKeyHideJob: Job? = null
+
     private val startupPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { _ -> }
 
+    private fun isAnyTextboxFocused(): Boolean {
+        val focusedView = currentFocus
+        if (focusedView is android.widget.EditText) return true
+        if (focusedView?.onCheckIsTextEditor() == true) return true
+        if (isComposeTextInputFocused) return true
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        return imm != null && imm.isAcceptingText && focusedView != null
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val fromPhysicalKeyboard = event.device?.let { !it.isVirtual } != false
-        if (fromPhysicalKeyboard && event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-            when (event.keyCode) {
-                KeyEvent.KEYCODE_TAB -> {
-                    val hasModifiers = event.isAltPressed || event.isCtrlPressed || event.isMetaPressed || event.isShiftPressed
-                    if (!hasModifiers) {
-                        hardwareTabTerminalHandler?.let { handler ->
-                            handler.invoke()
-                            return true
+        val dev = event.device
+        val fromPhysicalKeyboard = dev != null &&
+            !dev.isVirtual &&
+            event.deviceId > 0 &&
+            (event.source and InputDevice.SOURCE_KEYBOARD) != 0
+
+        if (fromPhysicalKeyboard && event.action == KeyEvent.ACTION_DOWN) {
+            if (event.repeatCount == 0) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_TAB -> {
+                        val hasModifiers = event.isAltPressed || event.isCtrlPressed || event.isMetaPressed || event.isShiftPressed
+                        if (!hasModifiers) {
+                            hardwareTabTerminalHandler?.let { handler ->
+                                handler.invoke()
+                                return true
+                            }
+                        }
+                    }
+                    KeyEvent.KEYCODE_DEL -> {
+                        if (!isAnyTextboxFocused()) {
+                            if (hardwareBackspaceHandler?.invoke() == true) {
+                                return true
+                            }
                         }
                     }
                 }
-                KeyEvent.KEYCODE_DEL -> {
-                    val viewTextFocus = currentFocus is android.widget.EditText
-                    if (!viewTextFocus && !isComposeTextInputFocused) {
-                        if (hardwareBackspaceHandler?.invoke() == true) {
-                            return true
+            }
+
+            val popupEnabled = (application as? CyberDeckApplication)
+                ?.settingsRepository
+                ?.isHardwareKeyboardPopupEnabledSync() == true
+            val hasShortcutModifier = event.isCtrlPressed || event.isAltPressed || event.isMetaPressed
+            if (popupEnabled && !hasShortcutModifier && event.keyCode != KeyEvent.KEYCODE_TAB && isAnyTextboxFocused()) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                        if (event.repeatCount == 0 && (hwKeyPopupVisible || hwKeyBuffer.isNotEmpty())) {
+                            hwKeyEnterTriggered = true
+                            hwKeyHideJob?.cancel()
+                            hwKeyHideJob = lifecycleScope.launch {
+                                delay(300L)
+                                hwKeyPopupVisible = false
+                                hwKeyBuffer = ""
+                                hwKeyEnterTriggered = false
+                            }
+                        }
+                    }
+                    KeyEvent.KEYCODE_DEL -> {
+                        hwKeyHideJob?.cancel()
+                        hwKeyEnterTriggered = false
+                        if (hwKeyBuffer.isNotEmpty()) {
+                            hwKeyBuffer = hwKeyBuffer.dropLast(1)
+                            hwKeyPopupVisible = true
+                        }
+                    }
+                    KeyEvent.KEYCODE_ESCAPE -> {
+                        hwKeyHideJob?.cancel()
+                        hwKeyEnterTriggered = false
+                        hwKeyPopupVisible = false
+                        hwKeyBuffer = ""
+                    }
+                    else -> {
+                        val unicode = event.getUnicodeChar(event.metaState)
+                        val isPrintable = unicode != 0 &&
+                            !Character.isISOControl(unicode) &&
+                            (unicode and KeyCharacterMap.COMBINING_ACCENT) == 0
+                        if (isPrintable) {
+                            val ch = unicode.toChar()
+                            hwKeyHideJob?.cancel()
+                            if (hwKeyEnterTriggered) {
+                                hwKeyBuffer = ""
+                                hwKeyEnterTriggered = false
+                            }
+                            val next = hwKeyBuffer + ch
+                            hwKeyBuffer = if (next.length > 240) next.takeLast(240) else next
+                            val devName = dev?.name?.trim().orEmpty()
+                            hwKeyDeviceName = when {
+                                devName.contains("usb", ignoreCase = true) -> "USB Keyboard"
+                                devName.contains("bluetooth", ignoreCase = true) ||
+                                    devName.contains("bt", ignoreCase = true) -> "BT Keyboard"
+                                devName.isNotBlank() -> devName.take(22)
+                                else -> "Keyboard Fisik"
+                            }
+                            hwKeyPopupVisible = true
                         }
                     }
                 }
@@ -182,7 +281,18 @@ class MainActivity : ComponentActivity() {
         setContent {
             val settings by app.settingsRepository.settingsFlow
                 .collectAsStateWithLifecycle(initialValue = AppSettingsEntity())
+            val hwPopupEnabled by app.settingsRepository.hardwareKeyboardPopupEnabledFlow
+                .collectAsStateWithLifecycle(initialValue = true)
             val browserVm: BrowserViewModel = viewModel(factory = BrowserViewModel.Factory(this))
+
+            LaunchedEffect(hwPopupEnabled) {
+                if (!hwPopupEnabled) {
+                    hwKeyHideJob?.cancel()
+                    hwKeyPopupVisible = false
+                    hwKeyBuffer = ""
+                    hwKeyEnterTriggered = false
+                }
+            }
 
             LaunchedEffect(pendingExternalUrl) {
                 val url = pendingExternalUrl
@@ -224,7 +334,8 @@ class MainActivity : ComponentActivity() {
                 accentPreset = settings.accentPreset,
                 uiFontScale = settings.uiFontScale
             ) {
-                Box(modifier = Modifier.fillMaxSize()) {
+                BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                    val screenH = maxHeight
                     CyberDeckRootShell(
                         app = app,
                         browserViewModel = browserVm,
@@ -239,6 +350,25 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(Color.Black.copy(alpha = alpha))
+                        )
+                    }
+
+                    // Real-time Physical Keyboard (BT / USB) Input Popup at bottom-right (~3/4 down from top)
+                    val targetTopOffset = (screenH * 0.72f).coerceIn(16.dp, (screenH - 96.dp).coerceAtLeast(16.dp))
+                    AnimatedVisibility(
+                        visible = hwPopupEnabled && hwKeyPopupVisible,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .offset(y = targetTopOffset)
+                            .padding(end = 16.dp)
+                            .zIndex(99999f)
+                    ) {
+                        HardwareKeyboardInputPopup(
+                            deviceLabel = hwKeyDeviceName,
+                            typedText = hwKeyBuffer,
+                            enterTriggered = hwKeyEnterTriggered
                         )
                     }
                 }
@@ -324,6 +454,8 @@ private fun CyberDeckRootShell(
     var currentDest by remember { mutableStateOf(MainDestination.BROWSER) }
     var libraryInitialTab by remember { mutableIntStateOf(0) }
     var overlay by remember { mutableStateOf<OverlayReader?>(null) }
+    var mp3PlayerOpen by remember { mutableStateOf(false) }
+    var mp3WindowMode by remember { mutableStateOf(FloatingMp3WindowMode.FLOATING) }
 
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -571,7 +703,6 @@ private fun CyberDeckRootShell(
         MainDestination.BROWSER to Icons.Filled.Public,
         MainDestination.LIBRARY to Icons.Filled.MenuBook,
         MainDestination.MEDIA to Icons.Filled.VideoLibrary,
-        MainDestination.MUSIC to Icons.Filled.LibraryMusic,
         MainDestination.FILES to Icons.Filled.Folder,
         MainDestination.TASK_MANAGER to Icons.Filled.Speed,
         MainDestination.DOWNLOADS to Icons.Filled.Download,
@@ -581,6 +712,7 @@ private fun CyberDeckRootShell(
         MainDestination.SETTINGS to Icons.Filled.Settings
     )
 
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -591,7 +723,6 @@ private fun CyberDeckRootShell(
                         MainDestination.BROWSER to Icons.Filled.Public,
                         MainDestination.LIBRARY to Icons.Filled.MenuBook,
                         MainDestination.MEDIA to Icons.Filled.VideoLibrary,
-                        MainDestination.MUSIC to Icons.Filled.LibraryMusic,
                         MainDestination.FILES to Icons.Filled.Folder,
                         MainDestination.SETTINGS to Icons.Filled.Settings
                     )
@@ -622,7 +753,11 @@ private fun CyberDeckRootShell(
                     onShowMessage = showMessage,
                     onRegisterToggleTerminal = { handler -> onRegisterTerminalTabHandler(handler) },
                     onRegisterActiveBackHandler = { handler -> onRegisterBackspaceHandler(handler) },
-                    onTextInputFocusChanged = onTextInputFocusChanged
+                    onTextInputFocusChanged = onTextInputFocusChanged,
+                    onOpenFloatingMp3Player = {
+                        mp3PlayerOpen = true
+                        mp3WindowMode = FloatingMp3WindowMode.FLOATING
+                    }
                 )
             }
         } else {
@@ -639,6 +774,15 @@ private fun CyberDeckRootShell(
                             },
                             icon = { Icon(Icons.Filled.GridView, contentDescription = "DeX Launcher") },
                             label = { Text("Launcher") }
+                        )
+                        NavigationRailItem(
+                            selected = mp3PlayerOpen,
+                            onClick = {
+                                mp3PlayerOpen = true
+                                mp3WindowMode = FloatingMp3WindowMode.FLOATING
+                            },
+                            icon = { Icon(Icons.Filled.LibraryMusic, contentDescription = "MP3 Player") },
+                            label = { Text("MP3") }
                         )
                         navItems.forEach { (dest, icon) ->
                             NavigationRailItem(
@@ -719,6 +863,7 @@ private fun CyberDeckRootShell(
                                             app.settingsRepository.updateSettings { it.copy(desktopLauncherMode = true) }
                                         }
                                     },
+                                    onTextInputFocusChanged = onTextInputFocusChanged,
                                     onShowMessage = showMessage
                                 )
                             }
@@ -739,12 +884,6 @@ private fun CyberDeckRootShell(
                             MediaVaultScreen(
                                 app = app,
                                 onPlayMedia = { id -> overlay = OverlayReader.MediaPlayer(id) },
-                                onShowMessage = showMessage
-                            )
-                        }
-                        MainDestination.MUSIC -> {
-                            MusicPlayerScreen(
-                                app = app,
                                 onShowMessage = showMessage
                             )
                         }
@@ -870,6 +1009,27 @@ private fun CyberDeckRootShell(
             }
         }
         }
+    }
+
+    if (mp3PlayerOpen) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .zIndex(6000f)
+        ) {
+            FloatingMp3PlayerOverlay(
+                app = app,
+                windowMode = mp3WindowMode,
+                onChangeWindowMode = { mode -> mp3WindowMode = mode },
+                onClose = {
+                    mp3PlayerOpen = false
+                    mp3WindowMode = FloatingMp3WindowMode.FLOATING
+                },
+                onTextInputFocusChanged = onTextInputFocusChanged,
+                onShowMessage = showMessage
+            )
+        }
+    }
     }
 
     if (showFirstOnlineSetupDialog) {
@@ -1069,6 +1229,78 @@ private fun CyberDeckRootShell(
                 TextButton(onClick = { showExternalRemovedDialog = false }) { Text("Biarkan") }
             }
         )
+    }
+}
+
+@Composable
+private fun HardwareKeyboardInputPopup(
+    deviceLabel: String,
+    typedText: String,
+    enterTriggered: Boolean
+) {
+    val displayText = if (typedText.isBlank()) {
+        if (enterTriggered) "↵ Enter" else "..."
+    } else {
+        typedText
+    }
+    Surface(
+        color = Color(0xEC0D1524),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(
+            width = 1.dp,
+            color = if (enterTriggered) DeckGreen else Color(0xFF38BDF8).copy(alpha = 0.78f)
+        ),
+        shadowElevation = 10.dp,
+        modifier = Modifier.widthIn(min = 190.dp, max = 360.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    Icons.Filled.Keyboard,
+                    contentDescription = null,
+                    tint = if (enterTriggered) DeckGreen else Color(0xFF38BDF8),
+                    modifier = Modifier.size(14.dp)
+                )
+                Text(
+                    text = deviceLabel,
+                    color = Color(0xFF94A3B8),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                if (enterTriggered) {
+                    Surface(
+                        color = DeckGreen.copy(alpha = 0.2f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = "↵ ENTER",
+                            color = DeckGreen,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+            Text(
+                text = displayText,
+                color = Color(0xFFF8FAFC),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }
 
