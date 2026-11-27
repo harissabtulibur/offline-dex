@@ -12,8 +12,8 @@ android {
         applicationId = "com.offlinecyberdeck"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3.0-dex"
+        versionCode = 5
+        versionName = "1.4.0-dex"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {

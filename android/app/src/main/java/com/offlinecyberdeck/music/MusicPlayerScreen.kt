@@ -119,8 +119,6 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
-import androidx.media3.extractor.DefaultExtractorsFactory
 import com.offlinecyberdeck.CyberDeckApplication
 import com.offlinecyberdeck.core.database.entity.AppSettingsEntity
 import com.offlinecyberdeck.core.database.entity.MusicTrackEntity
@@ -211,16 +209,15 @@ fun MusicPlayerScreen(
     var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
     var showSpeedMenu by remember { mutableStateOf(false) }
     var playRequestToken by remember { mutableLongStateOf(0L) }
+    var candidateQueue by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var candidateIndex by remember { mutableIntStateOf(0) }
     var cacheFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
     var mediaPlayerFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
     var fallbackPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
     var usingFallbackPlayer by remember { mutableStateOf(false) }
 
     val exoPlayer = remember {
-        val extractorsFactory = DefaultExtractorsFactory()
-            .setConstantBitrateSeekingEnabled(true)
         ExoPlayer.Builder(context)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(context, extractorsFactory))
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -294,6 +291,8 @@ fun MusicPlayerScreen(
         currentIndex = startIdx
         positionMs = 0L
         durationMs = target.durationMs.coerceAtLeast(0L)
+        candidateQueue = emptyList()
+        candidateIndex = 0
         cacheFallbackTriedTrackId = null
         mediaPlayerFallbackTriedTrackId = null
         releaseFallbackPlayer()
@@ -305,23 +304,26 @@ fun MusicPlayerScreen(
         val extraSaf = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
 
         scope.launch {
-            val resolvedRes = app.musicRepository.resolvePlayableUri(
+            val candidates = app.musicRepository.resolvePlayableCandidates(
                 track = target,
                 deckDriveTreeUri = settings.deckDriveTreeUri,
                 extraSafUris = extraSaf
             )
             if (token != playRequestToken) return@launch
 
-            resolvedRes.onSuccess { playUri ->
-                usingFallbackPlayer = false
-                exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
-                exoPlayer.prepare()
-                exoPlayer.setPlaybackSpeed(playbackSpeed)
-                exoPlayer.playWhenReady = true
-                app.musicRepository.recordPlay(target)
-            }.onFailure { err ->
-                onShowMessage(err.message ?: "Gagal memutar '${target.title}'. Coba Refresh Import.")
+            if (candidates.isEmpty()) {
+                onShowMessage("File audio '${target.fileName}' tidak ditemukan. Coba Scan Folder SD / Refresh.")
+                return@launch
             }
+            candidateQueue = candidates
+            candidateIndex = 0
+            val playUri = candidates[0]
+            usingFallbackPlayer = false
+            exoPlayer.setMediaItem(MediaItem.fromUri(playUri))
+            exoPlayer.prepare()
+            exoPlayer.setPlaybackSpeed(playbackSpeed)
+            exoPlayer.playWhenReady = true
+            app.musicRepository.recordPlay(target)
         }
     }
 
@@ -383,11 +385,22 @@ fun MusicPlayerScreen(
                     .setContentType(AndroidAudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
-            if (uri.scheme == "file" || uri.scheme.isNullOrBlank()) {
-                val p = uri.path ?: uri.toString()
-                mp.setDataSource(p)
-            } else {
-                mp.setDataSource(context, uri)
+            when (uri.scheme) {
+                "file", null, "" -> {
+                    val p = uri.path ?: uri.toString()
+                    mp.setDataSource(p)
+                }
+                else -> {
+                    val setViaFd = runCatching {
+                        context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                            mp.setDataSource(pfd.fileDescriptor)
+                            true
+                        } ?: false
+                    }.getOrDefault(false)
+                    if (!setViaFd) {
+                        mp.setDataSource(context, uri)
+                    }
+                }
             }
             mp.prepare()
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && playbackSpeed != 1.0f) {
@@ -497,38 +510,55 @@ fun MusicPlayerScreen(
                 if (usingFallbackPlayer) return
                 val track = queue.getOrNull(currentIndex)
                 val failedUri = exoPlayer.currentMediaItem?.localConfiguration?.uri
-                if (track != null && failedUri != null && cacheFallbackTriedTrackId != track.id) {
-                    cacheFallbackTriedTrackId = track.id
-                    scope.launch {
-                        val extraSaf = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
-                        val cachedUri = app.musicRepository.cacheUriOrFileForPlayback(track, failedUri)
-                        val resolvedUri = cachedUri ?: app.musicRepository.resolvePlayableUri(
-                            track = track,
-                            deckDriveTreeUri = settings.deckDriveTreeUri,
-                            extraSafUris = extraSaf
-                        ).getOrNull()?.let { resolved ->
-                            app.musicRepository.cacheUriOrFileForPlayback(track, resolved) ?: resolved
-                        }
+                val nextCandidateIdx = candidateIndex + 1
 
-                        if (resolvedUri != null && resolvedUri != failedUri) {
-                            exoPlayer.setMediaItem(MediaItem.fromUri(resolvedUri))
+                if (track != null && nextCandidateIdx < candidateQueue.size) {
+                    candidateIndex = nextCandidateIdx
+                    val altUri = candidateQueue[nextCandidateIdx]
+                    exoPlayer.setMediaItem(MediaItem.fromUri(altUri))
+                    exoPlayer.prepare()
+                    exoPlayer.setPlaybackSpeed(playbackSpeed)
+                    exoPlayer.playWhenReady = true
+                } else if (track != null && cacheFallbackTriedTrackId != track.id) {
+                    cacheFallbackTriedTrackId = track.id
+                    val errorToken = playRequestToken
+                    scope.launch {
+                        val toCache = buildList {
+                            failedUri?.let { add(it) }
+                            addAll(candidateQueue)
+                        }.distinct()
+                        val cachedUri = toCache.firstNotNullOfOrNull { src ->
+                            app.musicRepository.cacheUriOrFileForPlayback(track, src)
+                        }
+                        if (errorToken != playRequestToken) return@launch
+                        if (cachedUri != null && cachedUri != failedUri) {
+                            exoPlayer.setMediaItem(MediaItem.fromUri(cachedUri))
                             exoPlayer.prepare()
                             exoPlayer.setPlaybackSpeed(playbackSpeed)
                             exoPlayer.playWhenReady = true
-                        } else if (resolvedUri != null && mediaPlayerFallbackTriedTrackId != track.id) {
+                        } else if (mediaPlayerFallbackTriedTrackId != track.id) {
                             mediaPlayerFallbackTriedTrackId = track.id
-                            if (!startAndroidMediaPlayerFallback(track, resolvedUri)) {
+                            val mpSource = cachedUri ?: candidateQueue.firstOrNull() ?: failedUri
+                            if (mpSource == null || !startAndroidMediaPlayerFallback(track, mpSource)) {
                                 onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
                             }
                         } else {
                             onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
                         }
                     }
-                } else if (track != null && failedUri != null && mediaPlayerFallbackTriedTrackId != track.id) {
+                } else if (track != null && mediaPlayerFallbackTriedTrackId != track.id) {
                     mediaPlayerFallbackTriedTrackId = track.id
+                    val errorToken = playRequestToken
                     scope.launch {
-                        val mpUri = app.musicRepository.cacheUriOrFileForPlayback(track, failedUri) ?: failedUri
-                        if (!startAndroidMediaPlayerFallback(track, mpUri)) {
+                        val toTry = buildList {
+                            failedUri?.let { add(it) }
+                            addAll(candidateQueue)
+                        }.distinct()
+                        val mpUri = toTry.firstNotNullOfOrNull { src ->
+                            app.musicRepository.cacheUriOrFileForPlayback(track, src)
+                        } ?: toTry.firstOrNull()
+                        if (errorToken != playRequestToken) return@launch
+                        if (mpUri == null || !startAndroidMediaPlayerFallback(track, mpUri)) {
                             onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
                         }
                     }

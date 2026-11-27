@@ -41,7 +41,12 @@ class MusicRepository(
         val ref = track.fileUri
         if (ref.isBlank()) return false
         if (ref.startsWith("content://")) {
-            return driveManager.isUriOrFileAccessible(ref) || findMediaStoreUriForTrack(track) != null
+            if (driveManager.isUriOrFileAccessible(ref)) return true
+            val parsed = Uri.parse(ref)
+            if (driveManager.resolveDirectFileFromContentUri(parsed)?.let { isDirectFileReadable(it) } == true) {
+                return true
+            }
+            return findMediaStoreUriForTrack(track) != null
         }
         val path = if (ref.startsWith("file://")) Uri.parse(ref).path.orEmpty() else ref
         val file = File(path)
@@ -74,11 +79,10 @@ class MusicRepository(
         for (collection in candidates) {
             val match = runCatching {
                 context.contentResolver.query(collection, proj, sel, args, null)?.use { cursor ->
-                    val idIdx = cursor.getColumnIndex(MediaStore.Audio.Media._ID)
+                    val idIdx = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
                     val sizeIdx = cursor.getColumnIndex(MediaStore.Audio.Media.SIZE)
                     var fallbackId: Long? = null
                     while (cursor.moveToNext()) {
-                        if (idIdx < 0) continue
                         val id = cursor.getLong(idIdx)
                         val sz = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
                         if (track.sizeBytes > 0L && sz == track.sizeBytes) {
@@ -116,19 +120,6 @@ class MusicRepository(
         }.getOrDefault(false)
     }
 
-    private fun resolveContentUriOrCache(track: MusicTrackEntity, uri: Uri): Uri? {
-        driveManager.resolveDirectFileFromContentUri(uri)?.takeIf { isDirectFileReadable(it) }?.let { file ->
-            return Uri.fromFile(file)
-        }
-        if (isSeekableContentUri(uri)) {
-            return uri
-        }
-        if (driveManager.isUriOrFileAccessible(uri.toString())) {
-            return cacheUriOrFileForPlaybackSync(track, uri) ?: uri
-        }
-        return null
-    }
-
     private fun findSafUriInTree(treeUri: Uri, fileName: String, sizeBytes: Long): Uri? {
         val root = runCatching { DocumentFile.fromTreeUri(context, treeUri) }.getOrNull() ?: return null
         val queue = ArrayDeque<DocumentFile>()
@@ -146,7 +137,8 @@ class MusicRepository(
                         queue.add(child)
                     }
                 } else if (child.isFile && name.equals(fileName, ignoreCase = true)) {
-                    if (sizeBytes <= 0L || child.length() == sizeBytes) {
+                    val cLen = child.length()
+                    if (sizeBytes <= 0L || cLen <= 0L || cLen == sizeBytes) {
                         return child.uri
                     }
                 }
@@ -155,65 +147,88 @@ class MusicRepository(
         return null
     }
 
+    private fun collectSafTreeStrings(deckDriveTreeUri: String?, extraSafUris: List<String>): List<String> {
+        val persistedTreeUris = runCatching {
+            context.contentResolver.persistedUriPermissions
+                .filter { it.isReadPermission }
+                .map { it.uri.toString() }
+        }.getOrDefault(emptyList())
+        return (listOfNotNull(deckDriveTreeUri) + extraSafUris + persistedTreeUris)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
+    suspend fun resolvePlayableCandidates(
+        track: MusicTrackEntity,
+        deckDriveTreeUri: String?,
+        extraSafUris: List<String>
+    ): List<Uri> = withContext(Dispatchers.IO) {
+        val candidates = LinkedHashSet<Uri>()
+        val raw = track.fileUri.trim()
+
+        // 1. Primary stored content:// URI FIRST (matches OfflineTube reliable ExoPlayer playback!)
+        if (raw.startsWith("content://")) {
+            val parsed = Uri.parse(raw)
+            if (parsed.authority == MediaStore.AUTHORITY) {
+                val id = runCatching { ContentUris.parseId(parsed) }.getOrDefault(-1L)
+                if (id > 0L) {
+                    val canonical = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
+                    if (driveManager.isUriOrFileAccessible(canonical.toString())) {
+                        candidates += canonical
+                    }
+                }
+            }
+            if (driveManager.isUriOrFileAccessible(raw) || isSeekableContentUri(parsed)) {
+                candidates += parsed
+            }
+        }
+
+        // 2. MediaStore lookup by fileName + size (rescues legacy file-path records on SD/OTG too)
+        findMediaStoreUriForTrack(track)?.let { resolved ->
+            candidates += resolved
+        }
+
+        // 3. Direct POSIX file candidate (secondary fallback after content://)
+        if (raw.isNotBlank() && !raw.startsWith("content://")) {
+            val path = if (raw.startsWith("file://")) Uri.parse(raw).path.orEmpty() else raw
+            val file = File(path)
+            if (isDirectFileReadable(file)) {
+                candidates += Uri.fromFile(file)
+            }
+        } else if (raw.startsWith("content://")) {
+            driveManager.resolveDirectFileFromContentUri(Uri.parse(raw))
+                ?.takeIf { isDirectFileReadable(it) }
+                ?.let { candidates += Uri.fromFile(it) }
+        }
+
+        // 4. Configured SAF trees + persisted SAF folder permissions (SD / USB OTG)
+        val trees = collectSafTreeStrings(deckDriveTreeUri, extraSafUris)
+        for (treeStr in trees) {
+            val safUri = findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
+            if (safUri != null && driveManager.isUriOrFileAccessible(safUri.toString())) {
+                candidates += safUri
+            }
+        }
+
+        candidates.toList()
+    }
+
     suspend fun resolvePlayableUri(
         track: MusicTrackEntity,
         deckDriveTreeUri: String?,
         extraSafUris: List<String>
     ): Result<Uri> = withContext(Dispatchers.IO) {
         runCatching {
-            val raw = track.fileUri
-            // Tier 1: Direct readable File path (verified by opening bytes)
-            if (!raw.startsWith("content://")) {
-                val path = if (raw.startsWith("file://")) Uri.parse(raw).path.orEmpty() else raw
-                val file = File(path)
-                if (isDirectFileReadable(file)) {
-                    return@runCatching Uri.fromFile(file)
+            val candidates = resolvePlayableCandidates(track, deckDriveTreeUri, extraSafUris)
+            for (cand in candidates) {
+                if (cand.scheme == "file" || isSeekableContentUri(cand) || driveManager.isUriOrFileAccessible(cand.toString())) {
+                    return@runCatching cand
                 }
             }
-
-            // Tier 2: Existing content:// URI — prefer direct POSIX file, canonical MediaStore, or seekable SAF / cached file
-            if (raw.startsWith("content://")) {
-                val parsed = Uri.parse(raw)
-                driveManager.resolveDirectFileFromContentUri(parsed)?.takeIf { isDirectFileReadable(it) }?.let { file ->
-                    return@runCatching Uri.fromFile(file)
-                }
-                if (parsed.authority == MediaStore.AUTHORITY) {
-                    val id = runCatching { ContentUris.parseId(parsed) }.getOrDefault(-1L)
-                    if (id > 0L) {
-                        val canonical = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
-                        if (driveManager.isUriOrFileAccessible(canonical.toString())) {
-                            if (canonical.toString() != raw) {
-                                musicDao.upsert(track.copy(fileUri = canonical.toString()))
-                            }
-                            resolveContentUriOrCache(track, canonical)?.let { return@runCatching it }
-                        }
-                    }
-                }
-                resolveContentUriOrCache(track, parsed)?.let { return@runCatching it }
+            for (cand in candidates) {
+                cacheUriOrFileForPlaybackSync(track, cand)?.let { return@runCatching it }
             }
-
-            // Tier 3: Re-locate via MediaStore.Audio by filename + size
-            findMediaStoreUriForTrack(track)?.let { resolved ->
-                musicDao.upsert(track.copy(fileUri = resolved.toString()))
-                resolveContentUriOrCache(track, resolved)?.let { return@runCatching it }
-            }
-
-            // Tier 4: Re-locate inside configured SAF trees + any persisted SAF folder permissions
-            val persistedTreeUris = context.contentResolver.persistedUriPermissions
-                .filter { it.isReadPermission }
-                .map { it.uri.toString() }
-            val trees = (listOfNotNull(deckDriveTreeUri) + extraSafUris + persistedTreeUris)
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
-                .distinct()
-            for (treeStr in trees) {
-                val safUri = findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
-                if (safUri != null && driveManager.isUriOrFileAccessible(safUri.toString())) {
-                    musicDao.upsert(track.copy(fileUri = safUri.toString()))
-                    resolveContentUriOrCache(track, safUri)?.let { return@runCatching it }
-                }
-            }
-
             error("File audio '${track.fileName}' tidak dapat dibuka. Pastikan izin Audio / Folder SD aktif.")
         }
     }
@@ -301,27 +316,54 @@ class MusicRepository(
                 var skipped = 0
 
                 for (uri in uris) {
-                    runCatching {
+                    val persisted = runCatching {
                         context.contentResolver.takePersistableUriPermission(
                             uri,
                             Intent.FLAG_GRANT_READ_URI_PERMISSION
                         )
-                    }
-                    val uriStr = uri.toString()
+                        context.contentResolver.persistedUriPermissions.any { it.uri == uri && it.isReadPermission }
+                    }.getOrDefault(false)
+
                     val (fileName, sizeBytes) = driveManager.queryDisplayNameAndSize(uri)
                     val key = dedupKey(fileName, sizeBytes)
-                    if (seenUris.contains(uriStr) || seenKeys.contains(key)) {
+                    val originalUriStr = uri.toString()
+                    if (seenUris.contains(originalUriStr) || seenKeys.contains(key)) {
                         skipped++
                         continue
                     }
-                    val target = if (uriStr.contains("external", true) || uriStr.contains("primary", true).not()) {
+
+                    // If picker provider didn't grant persistable URI (common with OTG / Samsung MyFiles single pick),
+                    // copy into private imported_music folder so playback always stays reliable!
+                    val storedPathOrUri: String = if (persisted || uri.authority == MediaStore.AUTHORITY) {
+                        originalUriStr
+                    } else {
+                        val importedDir = File(context.filesDir, "imported_music").apply { mkdirs() }
+                        val ext = fileName.substringAfterLast('.', "mp3").lowercase(Locale.US).ifBlank { "mp3" }
+                        val localCopy = File(importedDir, "${UUID.randomUUID()}.$ext")
+                        val copied = runCatching {
+                            context.contentResolver.openInputStream(uri)?.use { input ->
+                                FileOutputStream(localCopy).use { output ->
+                                    input.copyTo(output, bufferSize = 64 * 1024) > 0L
+                                }
+                            } ?: false
+                        }.getOrDefault(false)
+                        if (copied && localCopy.exists() && localCopy.length() > 0L) {
+                            localCopy.absolutePath
+                        } else {
+                            runCatching { localCopy.delete() }
+                            originalUriStr
+                        }
+                    }
+
+                    val target = if (originalUriStr.contains("external", true) || !originalUriStr.contains("primary", true)) {
                         StorageTarget.DECK_DRIVE
                     } else {
                         StorageTarget.INTERNAL
                     }
                     val volumeLabel = if (target == StorageTarget.DECK_DRIVE) "External / SD" else "Internal"
-                    val track = extractTrackFromUri(uri, uriStr, fileName, sizeBytes, target, volumeLabel)
-                    seenUris += uriStr
+                    val track = extractTrackFromUri(uri, storedPathOrUri, fileName, sizeBytes, target, volumeLabel)
+                    seenUris += storedPathOrUri
+                    seenUris += originalUriStr
                     seenKeys += key
                     toInsert += track
                 }
@@ -373,6 +415,7 @@ class MusicRepository(
         extraSafUris: List<String>
     ): Result<MusicRefreshSummary> = withContext(Dispatchers.IO) {
         runCatching {
+            val safTrees = collectSafTreeStrings(deckDriveTreeUri, extraSafUris)
             var removed = 0
             for (track in musicDao.getAllSnapshot()) {
                 val raw = track.fileUri
@@ -384,11 +427,20 @@ class MusicRepository(
                 }
                 if (!directOk) {
                     val relinked = findMediaStoreUriForTrack(track)
+                        ?: safTrees.firstNotNullOfOrNull { treeStr ->
+                            findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
+                                ?.takeIf { driveManager.isUriOrFileAccessible(it.toString()) }
+                        }
                     if (relinked != null) {
                         musicDao.upsert(track.copy(fileUri = relinked.toString()))
                     } else {
                         musicDao.delete(track)
                         removed++
+                    }
+                } else if (!raw.startsWith("content://")) {
+                    // Upgrade legacy raw /storage/... paths to canonical MediaStore content:// URIs when available
+                    findMediaStoreUriForTrack(track)?.let { canonicalMs ->
+                        musicDao.upsert(track.copy(fileUri = canonicalMs.toString()))
                     }
                 }
             }
@@ -434,11 +486,7 @@ class MusicRepository(
                 )
             }
 
-            // 3. Persisted SAF Trees (Deck Drive + extra user-granted SD/USB music folders)
-            val safTrees = (listOfNotNull(deckDriveTreeUri) + extraSafUris)
-                .map { it.trim() }
-                .filter { it.isNotBlank() }
-                .distinct()
+            // 3. Persisted SAF Trees (Deck Drive + extra user-granted SD/USB music folders + system persisted trees)
             for (treeStr in safTrees) {
                 runCatching {
                     val uri = Uri.parse(treeStr)
@@ -538,7 +586,6 @@ class MusicRepository(
                         if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
 
                         val directFile = filePath.takeIf { it.startsWith("/") }?.let { File(it) }
-                        val canUseDirectPath = directFile != null && isDirectFileReadable(directFile)
                         val canonicalUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
                         val volumeUri = ContentUris.withAppendedId(collectionUri, id)
                         val contentUri = if (canonicalUri != volumeUri && driveManager.isUriOrFileAccessible(canonicalUri.toString())) {
@@ -546,10 +593,14 @@ class MusicRepository(
                         } else {
                             volumeUri
                         }
-                        val preferredUriStr = if (canUseDirectPath) directFile!!.absolutePath else contentUri.toString()
+                        // Store content:// URI (identical to OfflineTube!) instead of raw /storage/... FUSE paths
+                        val preferredUriStr = contentUri.toString()
 
                         val key = dedupKey(fileName, sizeBytes)
-                        if (seenUris.contains(preferredUriStr) || seenUris.contains(contentUri.toString()) || seenKeys.contains(key)) {
+                        if (seenUris.contains(preferredUriStr) ||
+                            (directFile != null && seenUris.contains(directFile.absolutePath)) ||
+                            seenKeys.contains(key)
+                        ) {
                             onSkipped()
                             continue
                         }

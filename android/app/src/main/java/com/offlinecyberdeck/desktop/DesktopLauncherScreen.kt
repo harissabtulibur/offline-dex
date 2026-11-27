@@ -22,9 +22,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -79,6 +79,7 @@ import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -149,6 +150,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -158,6 +160,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -184,6 +187,7 @@ import com.offlinecyberdeck.core.model.DesktopBackgroundPreset
 import com.offlinecyberdeck.core.model.DownloadStatus
 import com.offlinecyberdeck.core.model.LibraryFileType
 import com.offlinecyberdeck.core.model.StorageTarget
+import com.offlinecyberdeck.core.settings.SettingsRepository
 import com.offlinecyberdeck.core.storage.ExternalVolumeInfo
 import com.offlinecyberdeck.downloads.DownloadsScreen
 import com.offlinecyberdeck.files.FileManagerScreen
@@ -251,6 +255,21 @@ data class DesktopWindowState(
     val zIndex: Int = 1
 )
 
+private data class DesktopEntrySpec(
+    val id: String,
+    val label: String,
+    val description: String,
+    val categoryLabel: String,
+    val targetDetail: String,
+    val terminalHint: String,
+    val isInApp: Boolean,
+    val installedPackageName: String? = null,
+    val drawerIcon: ImageVector? = null,
+    val accentColor: Color = Color(0xFF38BDF8),
+    val onOpen: () -> Unit,
+    val iconContent: @Composable (boxSizeDp: Int, innerIconDp: Int) -> Unit
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DesktopLauncherScreen(
@@ -291,11 +310,19 @@ fun DesktopLauncherScreen(
     val downloads by app.database.downloadDao().observeAll().collectAsStateWithLifecycle(initialValue = emptyList())
     val driveStatus by app.driveManager.status.collectAsStateWithLifecycle()
     val desktopIconSizeDp by app.settingsRepository.desktopIconSizeDpFlow.collectAsStateWithLifecycle(initialValue = 46)
+    val desktopGridCols by app.settingsRepository.desktopGridColsFlow.collectAsStateWithLifecycle(initialValue = 6)
+    val desktopGridRows by app.settingsRepository.desktopGridRowsFlow.collectAsStateWithLifecycle(initialValue = 4)
+    val appDrawerIconSizeDp by app.settingsRepository.appDrawerIconSizeDpFlow.collectAsStateWithLifecycle(initialValue = 26)
+    val pinnedInAppDesktopIds by app.settingsRepository.pinnedInAppDesktopIdsFlow.collectAsStateWithLifecycle(
+        initialValue = SettingsRepository.DEFAULT_PINNED_INAPP_DESKTOP_IDS
+    )
     val desktopIconPositions by app.settingsRepository.desktopIconPositionsFlow.collectAsStateWithLifecycle(initialValue = emptyMap())
     val desktopSnapToGrid by app.settingsRepository.desktopSnapToGridFlow.collectAsStateWithLifecycle(initialValue = true)
     val terminalCustomCommands by app.settingsRepository.terminalCustomCommandsFlow.collectAsStateWithLifecycle(initialValue = emptyList())
 
     var isEditingDesktopIcons by remember { mutableStateOf(false) }
+    var desktopContextMenuId by remember { mutableStateOf<String?>(null) }
+    var propertiesDesktopEntry by remember { mutableStateOf<DesktopEntrySpec?>(null) }
     var mountedPartitions by remember { mutableStateOf(app.driveManager.detectAllMountedRemovablePartitions()) }
     var isGestureNavEnabled by remember { mutableStateOf(DesktopLauncherManager.isGestureNavigationEnabled(context)) }
     var isBlinkingNetIndicator by remember { mutableStateOf(false) }
@@ -310,6 +337,7 @@ fun DesktopLauncherScreen(
     var floatingNotif by remember { mutableStateOf<DeckNotificationItem?>(null) }
     var filesGoBackHandler by remember { mutableStateOf<(() -> Boolean)?>(null) }
     val notifSoundEnabledState by rememberUpdatedState(settings.notificationSoundEnabled)
+    val haptic = LocalHapticFeedback.current
     val launchAiOfflineActivity: () -> Unit = {
         runCatching {
             context.startActivity(Intent(context, AiChatActivity::class.java))
@@ -604,7 +632,8 @@ fun DesktopLauncherScreen(
         activeTrayPopup != null ||
         showOfflineHubDialog ||
         showSavedHubDialog ||
-        showWallpaperDialog
+        showWallpaperDialog ||
+        propertiesDesktopEntry != null
 
     LaunchedEffect(topFrontWinId, desktopOverlayBlocking) {
         focusManager.clearFocus(force = true)
@@ -739,17 +768,242 @@ fun DesktopLauncherScreen(
                 val deskHeightDp = maxHeight.value
                 val density = LocalDensity.current
 
-                // Desktop Shortcuts Grid (always underneath windows)
-                val builtInShortcuts = listOf(
-                    Triple(DesktopWindowKind.BROWSER, "Cyber Browser", Icons.Filled.Public),
-                    Triple(DesktopWindowKind.LIBRARY, "Knowledge Vault", Icons.Filled.MenuBook),
-                    Triple(DesktopWindowKind.MUSIC, "Cyber Music", Icons.Filled.LibraryMusic),
-                    Triple(DesktopWindowKind.FILES, "File Explorer", Icons.Filled.Folder),
-                    Triple(DesktopWindowKind.TASK_MANAGER, "Task Manager", Icons.Filled.Speed),
-                    Triple(DesktopWindowKind.TERMINAL, "Terminal", Icons.Filled.Terminal),
-                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings),
-                    Triple(DesktopWindowKind.GUIDE, "Panduan", Icons.Filled.HelpOutline)
-                )
+                // Full catalog of Cyber Deck in-app features (all pinnable to Desktop from App Drawer)
+                val primaryColor = MaterialTheme.colorScheme.primary
+                val allInAppCatalog = remember(primaryColor) {
+                    fun makeBuiltIn(
+                        id: String,
+                        label: String,
+                        desc: String,
+                        hint: String,
+                        icon: ImageVector,
+                        tint: Color,
+                        target: String,
+                        onOpen: () -> Unit
+                    ): DesktopEntrySpec = DesktopEntrySpec(
+                        id = id,
+                        label = label,
+                        description = desc,
+                        categoryLabel = "Aplikasi Bawaan Cyber Deck",
+                        targetDetail = target,
+                        terminalHint = hint,
+                        isInApp = true,
+                        drawerIcon = icon,
+                        accentColor = tint,
+                        onOpen = onOpen,
+                        iconContent = { boxDp, innerDp ->
+                            Box(
+                                modifier = Modifier
+                                    .size(boxDp.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(tint.copy(alpha = 0.2f)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    icon,
+                                    contentDescription = label,
+                                    tint = tint,
+                                    modifier = Modifier.size(innerDp.dp)
+                                )
+                            }
+                        }
+                    )
+
+                    listOf(
+                        makeBuiltIn(
+                            id = "builtin_BROWSER",
+                            label = "Cyber Browser",
+                            desc = "Browser desktop multi-tab hemat RAM (4 GB RAM tuned) dengan mode Incognito, User-Agent Desktop, dan Archive Web Page offline.",
+                            hint = "browser",
+                            icon = Icons.Filled.Public,
+                            tint = primaryColor,
+                            target = "cyberdeck://window/${DesktopWindowKind.BROWSER.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.BROWSER) }
+                        ),
+                        makeBuiltIn(
+                            id = "unified_offline_hub",
+                            label = "Offline",
+                            desc = "Hub terpadu berisi Offline Wiki (Kiwix PWA), OfflineTube (video SD/USB), Offline Search, dan AI Offline (Qwen2.5-1.5B via OTG SSD).",
+                            hint = "wiki / tube / search / ai",
+                            icon = Icons.Filled.CloudOff,
+                            tint = Color(0xFF38BDF8),
+                            target = "cyberdeck://hub/offline",
+                            onOpen = { showOfflineHubDialog = true }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_LIBRARY",
+                            label = "Knowledge Vault",
+                            desc = "Pustaka e-book dan dokumen offline untuk membuka file ZIM Wikipedia/Kiwix, PDF, EPUB, HTML, dan catatan TXT/Markdown.",
+                            hint = "vault",
+                            icon = Icons.Filled.MenuBook,
+                            tint = primaryColor,
+                            target = "cyberdeck://window/${DesktopWindowKind.LIBRARY.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.LIBRARY) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_MEDIA",
+                            label = "OfflineTube",
+                            desc = "Pemutar video lokal bergaya YouTube untuk memutar MP4/MKV/WebM dari Internal, SD Card, dan SSD eksternal secara 100% offline.",
+                            hint = "tube",
+                            icon = Icons.Filled.VideoLibrary,
+                            tint = Color(0xFFFB7185),
+                            target = "cyberdeck://window/${DesktopWindowKind.MEDIA.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.MEDIA) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_OFFLINE_WIKI",
+                            label = "Offline Wiki",
+                            desc = "Kiwix PWA Viewer & penyimpan halaman ensiklopedia agar artikel web wiki tetap bisa dibaca tanpa internet.",
+                            hint = "wiki",
+                            icon = Icons.Filled.CloudOff,
+                            tint = Color(0xFF38BDF8),
+                            target = "cyberdeck://window/${DesktopWindowKind.OFFLINE_WIKI.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.OFFLINE_WIKI) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_SEARCH",
+                            label = "Offline Search",
+                            desc = "Mesin pencari instan di seluruh indeks lokal: arsip web, pustaka ZIM/PDF, video OfflineTube, lagu Cyber Music, dan bookmark.",
+                            hint = "search",
+                            icon = Icons.Filled.Search,
+                            tint = Color(0xFF34D399),
+                            target = "cyberdeck://window/${DesktopWindowKind.SEARCH.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.SEARCH) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_AI_OFFLINE",
+                            label = "AI Offline",
+                            desc = "Asisten AI Chat 100% lokal (Qwen2.5-1.5B-Instruct Q4_K_M GGUF via llama.cpp mmap) yang membaca model langsung dari SSD/AI_Models.",
+                            hint = "ai",
+                            icon = Icons.Filled.SmartToy,
+                            tint = Color(0xFF00FF41),
+                            target = "com.offlinecyberdeck.ai.AiChatActivity",
+                            onOpen = { launchAiOfflineActivity() }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_MUSIC",
+                            label = "Cyber Music",
+                            desc = "Pemutar musik offline dengan dukungan auto-import MP3/FLAC/M4A dari Internal, SD Card, dan USB OTG serta popup kontrol cepat.",
+                            hint = "music",
+                            icon = Icons.Filled.LibraryMusic,
+                            tint = Color(0xFFF43F5E),
+                            target = "cyberdeck://window/${DesktopWindowKind.MUSIC.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.MUSIC) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_FILES",
+                            label = "File Explorer",
+                            desc = "Pengelola berkas desktop untuk Internal Storage, App Vault, SD Card, dan partisi USB/SSD OTG (support copy/paste & shortcut Backspace).",
+                            hint = "files",
+                            icon = Icons.Filled.Folder,
+                            tint = Color(0xFFFBBF24),
+                            target = "cyberdeck://window/${DesktopWindowKind.FILES.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.FILES) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_TASK_MANAGER",
+                            label = "Task Manager",
+                            desc = "Pemantau RAM, beban CPU, suhu chipset Helio G99, trafik jaringan per-aplikasi, serta fitur langsung Kill Recent & Background Apps.",
+                            hint = "ram / taskmgr",
+                            icon = Icons.Filled.Speed,
+                            tint = Color(0xFF60A5FA),
+                            target = "cyberdeck://window/${DesktopWindowKind.TASK_MANAGER.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.TASK_MANAGER) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_TERMINAL",
+                            label = "Terminal",
+                            desc = "PowerShell Terminal bergaya desktop dengan shortcut keyboard Bluetooth (Tab) untuk membuka aplikasi, cek info sistem, RAM, & custom command.",
+                            hint = "help (tekan Tab)",
+                            icon = Icons.Filled.Terminal,
+                            tint = Color(0xFF22D3EE),
+                            target = "cyberdeck://window/${DesktopWindowKind.TERMINAL.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.TERMINAL) }
+                        ),
+                        makeBuiltIn(
+                            id = "unified_saved_downloads",
+                            label = "Tersimpan & Unduhan",
+                            desc = "Menu ringkas untuk membuka Bookmarks web tersimpan, Riwayat kunjungan History, dan antrean Downloads offline.",
+                            hint = "downloads / bookmarks",
+                            icon = Icons.Filled.Bookmarks,
+                            tint = DeckGreen,
+                            target = "cyberdeck://hub/saved_downloads",
+                            onOpen = { showSavedHubDialog = true }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_DOWNLOADS",
+                            label = "Downloads",
+                            desc = "Daftar unduhan file dari Cyber Browser beserta status progres latar belakang menuju Internal atau Deck Drive.",
+                            hint = "downloads",
+                            icon = Icons.Filled.Download,
+                            tint = DeckGreen,
+                            target = "cyberdeck://window/${DesktopWindowKind.DOWNLOADS.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.DOWNLOADS) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_BOOKMARKS",
+                            label = "Bookmarks",
+                            desc = "Kumpulan tautan web favorit dan halaman arsip penting yang tersimpan secara lokal di perangkat.",
+                            hint = "bookmarks",
+                            icon = Icons.Filled.Bookmark,
+                            tint = primaryColor,
+                            target = "cyberdeck://window/${DesktopWindowKind.BOOKMARKS.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.BOOKMARKS) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_HISTORY",
+                            label = "History",
+                            desc = "Catatan riwayat kunjungan halaman web Cyber Browser (tab Incognito tidak pernah dicatat di sini).",
+                            hint = "history",
+                            icon = Icons.Filled.History,
+                            tint = Color(0xFF94A3B8),
+                            target = "cyberdeck://window/${DesktopWindowKind.HISTORY.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.HISTORY) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_ARCHIVES",
+                            label = "Web Archives",
+                            desc = "Arsip halaman web lengkap beserta CSS/gambar yang telah disimpan untuk dibaca ulang tanpa koneksi internet.",
+                            hint = "archives",
+                            icon = Icons.Filled.MenuBook,
+                            tint = Color(0xFF38BDF8),
+                            target = "cyberdeck://window/${DesktopWindowKind.ARCHIVES.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.ARCHIVES) }
+                        ),
+                        makeBuiltIn(
+                            id = "wallpaper_selector",
+                            label = "Wallpaper & Latar",
+                            desc = "Kustomisasi latar belakang Desktop Cyber Deck dengan 6 preset gradien maupun 4 slot gambar/foto dari perangkat.",
+                            hint = "settings",
+                            icon = Icons.Filled.Wallpaper,
+                            tint = Color(0xFFC084FC),
+                            target = "cyberdeck://dialog/wallpaper",
+                            onOpen = { showWallpaperDialog = true }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_SETTINGS",
+                            label = "Settings",
+                            desc = "Pusat pengaturan tema, grid & ukuran ikon desktop, App Drawer, Deck Drive SSD, performa WebView 4 GB RAM, & custom command.",
+                            hint = "settings",
+                            icon = Icons.Filled.Settings,
+                            tint = primaryColor,
+                            target = "cyberdeck://window/${DesktopWindowKind.SETTINGS.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.SETTINGS) }
+                        ),
+                        makeBuiltIn(
+                            id = "builtin_GUIDE",
+                            label = "Panduan",
+                            desc = "Panduan lengkap penggunaan Offline Cyber Deck, tips keyboard Bluetooth, format SSD AI_Models, dan shortcut mode DeX.",
+                            hint = "guide",
+                            icon = Icons.Filled.HelpOutline,
+                            tint = DeckAmber,
+                            target = "cyberdeck://window/${DesktopWindowKind.GUIDE.name}",
+                            onOpen = { openOrFocusWindow(DesktopWindowKind.GUIDE) }
+                        )
+                    )
+                }
+
+                val inAppById = remember(allInAppCatalog) { allInAppCatalog.associateBy { it.id } }
 
                 val pinnedInfos = remember(installedApps, pinnedPackages) {
                     pinnedPackages.mapNotNull { pkg -> installedApps.firstOrNull { it.packageName == pkg } }
@@ -828,7 +1082,7 @@ fun DesktopLauncherScreen(
                                             modifier = Modifier.size(14.dp)
                                         )
                                         Text(
-                                            text = if (desktopSnapToGrid) "Snap: ON" else "Bebas",
+                                            text = if (desktopSnapToGrid) "Snap ${desktopGridCols}×${desktopGridRows}" else "Bebas",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = Color.White,
                                             fontFamily = FontFamily.Monospace
@@ -841,7 +1095,7 @@ fun DesktopLauncherScreen(
                                     border = BorderStroke(1.dp, DeckAmber.copy(alpha = 0.65f)),
                                     modifier = Modifier.clickable {
                                         app.settingsRepository.resetDesktopIconPositions()
-                                        onShowMessage("Posisi ikon desktop dirapikan ke grid awal.")
+                                        onShowMessage("Posisi ikon desktop dirapikan ke grid ${desktopGridCols}×${desktopGridRows}.")
                                     }
                                 ) {
                                     Row(
@@ -875,7 +1129,7 @@ fun DesktopLauncherScreen(
                                 modifier = Modifier.clickable {
                                     isEditingDesktopIcons = !isEditingDesktopIcons
                                     if (isEditingDesktopIcons) {
-                                        onShowMessage("Mode Atur Ikon aktif — geser ikon ke posisi yang diinginkan.")
+                                        onShowMessage("Mode Atur Ikon (${desktopGridCols}×${desktopGridRows}) aktif — geser ikon ke kotak grid.")
                                     }
                                 }
                             ) {
@@ -939,119 +1193,35 @@ fun DesktopLauncherScreen(
                         }
                     }
 
-                    Spacer(Modifier.height(12.dp))
+                    Spacer(Modifier.height(10.dp))
 
-                    val iconBoxSize = desktopIconSizeDp.coerceIn(36, 68)
-                    val innerIconSize = (iconBoxSize * 0.56f).roundToInt().coerceIn(20, 40)
-                    val tileWidthDp = (iconBoxSize + 44).toFloat()
-                    val tileHeightDp = (iconBoxSize + 48).toFloat()
-                    val cellStepX = tileWidthDp + 12f
-                    val cellStepY = tileHeightDp + 12f
-
-                    val desktopEntries = buildList<Pair<String, Triple<String, () -> Unit, @Composable () -> Unit>>> {
-                        builtInShortcuts.forEach { (kind, label, icon) ->
-                            add(
-                                "builtin_${kind.name}" to Triple(
-                                    label,
-                                    { openOrFocusWindow(kind) },
-                                    {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(iconBoxSize.dp)
-                                                .clip(RoundedCornerShape(12.dp))
-                                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Icon(
-                                                icon,
-                                                contentDescription = label,
-                                                tint = MaterialTheme.colorScheme.primary,
-                                                modifier = Modifier.size(innerIconSize.dp)
+                    val desktopEntries = remember(pinnedInAppDesktopIds, pinnedInfos, inAppById) {
+                        buildList {
+                            pinnedInAppDesktopIds.forEach { inAppId ->
+                                inAppById[inAppId]?.let { add(it) }
+                            }
+                            pinnedInfos.forEach { extApp ->
+                                add(
+                                    DesktopEntrySpec(
+                                        id = "pin_${extApp.packageName}",
+                                        label = extApp.label,
+                                        description = "Pintasan aplikasi Android '${extApp.label}' yang disematkan ke Desktop Cyber Deck (dapat dibuka mode Floating Freeform maupun Fullscreen).",
+                                        categoryLabel = if (extApp.isSystemApp) "Aplikasi Sistem Android" else "Aplikasi Android Terinstall",
+                                        targetDetail = extApp.packageName,
+                                        terminalHint = "Buat custom command di Settings untuk buka cepat via Terminal",
+                                        isInApp = false,
+                                        installedPackageName = extApp.packageName,
+                                        accentColor = Color(0xFF94A3B8),
+                                        onOpen = { launchExternalPackage(extApp.packageName) },
+                                        iconContent = { boxDp, _ ->
+                                            InstalledAppIcon(
+                                                packageName = extApp.packageName,
+                                                modifier = Modifier.size(boxDp.dp)
                                             )
                                         }
-                                    }
+                                    )
                                 )
-                            )
-                        }
-                        add(
-                            "unified_offline_hub" to Triple(
-                                "Offline",
-                                { showOfflineHubDialog = true },
-                                {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(iconBoxSize.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(Color(0xFF0EA5E9).copy(alpha = 0.22f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.CloudOff,
-                                            contentDescription = "Offline Wiki, OfflineTube, AI Offline & Offline Search",
-                                            tint = Color(0xFF38BDF8),
-                                            modifier = Modifier.size(innerIconSize.dp)
-                                        )
-                                    }
-                                }
-                            )
-                        )
-                        add(
-                            "unified_saved_downloads" to Triple(
-                                "Tersimpan & Unduhan",
-                                { showSavedHubDialog = true },
-                                {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(iconBoxSize.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(DeckGreen.copy(alpha = 0.2f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.Bookmarks,
-                                            contentDescription = "Bookmarks, History & Downloads",
-                                            tint = DeckGreen,
-                                            modifier = Modifier.size(innerIconSize.dp)
-                                        )
-                                    }
-                                }
-                            )
-                        )
-                        add(
-                            "wallpaper_selector" to Triple(
-                                "Wallpaper & Latar",
-                                { showWallpaperDialog = true },
-                                {
-                                    Box(
-                                        modifier = Modifier
-                                            .size(iconBoxSize.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(Color(0xFFA855F7).copy(alpha = 0.22f)),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.Wallpaper,
-                                            contentDescription = "Wallpaper & Latar",
-                                            tint = Color(0xFFC084FC),
-                                            modifier = Modifier.size(innerIconSize.dp)
-                                        )
-                                    }
-                                }
-                            )
-                        )
-                        pinnedInfos.forEach { extApp ->
-                            add(
-                                "pin_${extApp.packageName}" to Triple(
-                                    extApp.label,
-                                    { launchExternalPackage(extApp.packageName) },
-                                    {
-                                        InstalledAppIcon(
-                                            packageName = extApp.packageName,
-                                            modifier = Modifier.size(iconBoxSize.dp)
-                                        )
-                                    }
-                                )
-                            )
+                            }
                         }
                     }
 
@@ -1063,9 +1233,19 @@ fun DesktopLauncherScreen(
                     ) {
                         val canvasWidthDp = maxWidth.value
                         val canvasHeightDp = maxHeight.value
-                        val rowsPerCol = ((canvasHeightDp / cellStepY).toInt()).coerceAtLeast(1)
-                        val maxX = (canvasWidthDp - tileWidthDp).coerceAtLeast(0f)
-                        val maxY = (canvasHeightDp - tileHeightDp).coerceAtLeast(0f)
+                        val cols = desktopGridCols.coerceIn(4, 10)
+                        val rows = desktopGridRows.coerceIn(3, 7)
+
+                        // Uniform snap-grid cell dimensions so horizontal/vertical spacing & padding are 100% consistent
+                        val cellWidthDp = (canvasWidthDp / cols.toFloat()).coerceAtLeast(62f)
+                        val cellHeightDp = (canvasHeightDp / rows.toFloat()).coerceAtLeast(62f)
+                        val effectiveIconBoxSize = desktopIconSizeDp
+                            .coerceIn(36, 68)
+                            .coerceAtMost((minOf(cellWidthDp, cellHeightDp) - 36f).roundToInt().coerceAtLeast(28))
+                        val effectiveInnerIconSize = (effectiveIconBoxSize * 0.56f).roundToInt().coerceIn(18, 40)
+
+                        val maxX = (canvasWidthDp - cellWidthDp).coerceAtLeast(0f)
+                        val maxY = (canvasHeightDp - cellHeightDp).coerceAtLeast(0f)
 
                         val liveDragPos = remember { mutableStateMapOf<String, Pair<Float, Float>>() }
                         var activeDragId by remember { mutableStateOf<String?>(null) }
@@ -1077,27 +1257,65 @@ fun DesktopLauncherScreen(
                             }
                         }
 
-                        desktopEntries.forEachIndexed { idx, (id, meta) ->
-                            val (label, onTileClick, iconContent) = meta
-                            val col = idx / rowsPerCol
-                            val row = idx % rowsPerCol
-                            val defaultX = (col * cellStepX).coerceIn(0f, maxX)
-                            val defaultY = (row * cellStepY).coerceIn(0f, maxY)
-                            val currentPos = liveDragPos[id]
+                        // Subtle visual snap-grid guides while dragging/editing desktop icons
+                        if (isEditingDesktopIcons) {
+                            for (r in 0 until rows) {
+                                for (c in 0 until cols) {
+                                    Box(
+                                        modifier = Modifier
+                                            .offset {
+                                                with(density) {
+                                                    IntOffset((c * cellWidthDp).dp.roundToPx(), (r * cellHeightDp).dp.roundToPx())
+                                                }
+                                            }
+                                            .size(width = cellWidthDp.dp, height = cellHeightDp.dp)
+                                            .padding(3.dp)
+                                            .border(
+                                                width = 1.dp,
+                                                color = Color.White.copy(alpha = 0.14f),
+                                                shape = RoundedCornerShape(10.dp)
+                                            )
+                                    )
+                                }
+                            }
+                        }
+
+                        desktopEntries.forEachIndexed { idx, entry ->
+                            val id = entry.id
+                            val slotCount = (cols * rows).coerceAtLeast(1)
+                            val wrappedIdx = idx % slotCount
+                            val defaultCol = (wrappedIdx / rows).coerceIn(0, cols - 1)
+                            val defaultRow = (wrappedIdx % rows).coerceIn(0, rows - 1)
+                            val defaultX = (defaultCol * cellWidthDp).coerceIn(0f, maxX)
+                            val defaultY = (defaultRow * cellHeightDp).coerceIn(0f, maxY)
+
+                            val rawPos = liveDragPos[id]
                                 ?: desktopIconPositions[id]?.let { it.xDp to it.yDp }
                                 ?: (defaultX to defaultY)
-                            val posX = currentPos.first.coerceIn(0f, maxX)
-                            val posY = currentPos.second.coerceIn(0f, maxY)
+                            val posX = if (desktopSnapToGrid && activeDragId != id) {
+                                ((rawPos.first / cellWidthDp).roundToInt().coerceIn(0, cols - 1) * cellWidthDp)
+                                    .coerceIn(0f, maxX)
+                            } else {
+                                rawPos.first.coerceIn(0f, maxX)
+                            }
+                            val posY = if (desktopSnapToGrid && activeDragId != id) {
+                                ((rawPos.second / cellHeightDp).roundToInt().coerceIn(0, rows - 1) * cellHeightDp)
+                                    .coerceIn(0f, maxY)
+                            } else {
+                                rawPos.second.coerceIn(0f, maxY)
+                            }
                             val isBeingDragged = activeDragId == id
 
                             fun commitDraggedPosition(rawX: Float, rawY: Float) {
                                 val finalX = if (desktopSnapToGrid) {
-                                    ((rawX / cellStepX).roundToInt() * cellStepX).coerceIn(0f, maxX)
+                                    val c = (rawX / cellWidthDp).roundToInt().coerceIn(0, cols - 1)
+                                    (c * cellWidthDp).coerceIn(0f, maxX)
                                 } else {
                                     rawX.coerceIn(0f, maxX)
                                 }
                                 val finalY = if (desktopSnapToGrid) {
-                                    ((rawY / cellStepY).roundToInt() * cellStepY).coerceIn(0f, maxY)
+                                    val r = (rawY / cellHeightDp).roundToInt().coerceIn(0, rows - 1)
+                                    (r * cellHeightDp).coerceIn(0f, maxY)
                                 } else {
                                     rawY.coerceIn(0f, maxY)
                                 }
@@ -1107,7 +1325,7 @@ fun DesktopLauncherScreen(
 
                             key(id) {
                                 val dragModifier = if (isEditingDesktopIcons) {
-                                    Modifier.pointerInput(id, desktopSnapToGrid, maxX, maxY) {
+                                    Modifier.pointerInput(id, desktopSnapToGrid, cellWidthDp, cellHeightDp, cols, rows, maxX, maxY) {
                                         detectDragGestures(
                                             onDragStart = {
                                                 activeDragId = id
@@ -1133,31 +1351,7 @@ fun DesktopLauncherScreen(
                                         )
                                     }
                                 } else {
-                                    Modifier.pointerInput(id, desktopSnapToGrid, maxX, maxY) {
-                                        detectDragGesturesAfterLongPress(
-                                            onDragStart = {
-                                                activeDragId = id
-                                                if (!liveDragPos.containsKey(id)) {
-                                                    liveDragPos[id] = posX to posY
-                                                }
-                                            },
-                                            onDragEnd = {
-                                                val p = liveDragPos[id] ?: (posX to posY)
-                                                commitDraggedPosition(p.first, p.second)
-                                                activeDragId = null
-                                            },
-                                            onDragCancel = {
-                                                activeDragId = null
-                                            },
-                                            onDrag = { change, dragAmount ->
-                                                change.consume()
-                                                val cur = liveDragPos[id] ?: (posX to posY)
-                                                val nx = (cur.first + dragAmount.x / density.density).coerceIn(0f, maxX)
-                                                val ny = (cur.second + dragAmount.y / density.density).coerceIn(0f, maxY)
-                                                liveDragPos[id] = nx to ny
-                                            }
-                                        )
-                                    }
+                                    Modifier
                                 }
 
                                 Box(
@@ -1167,7 +1361,8 @@ fun DesktopLauncherScreen(
                                                 IntOffset(posX.dp.roundToPx(), posY.dp.roundToPx())
                                             }
                                         }
-                                        .width(tileWidthDp.dp)
+                                        .size(width = cellWidthDp.dp, height = cellHeightDp.dp)
+                                        .padding(4.dp)
                                         .zIndex(if (isBeingDragged) 10f else 1f)
                                         .then(
                                             if (isBeingDragged || isEditingDesktopIcons) {
@@ -1176,7 +1371,7 @@ fun DesktopLauncherScreen(
                                                     .border(
                                                         width = if (isBeingDragged) 1.5.dp else 1.dp,
                                                         color = if (isBeingDragged) DeckGreen
-                                                        else MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+                                                        else MaterialTheme.colorScheme.primary.copy(alpha = 0.55f),
                                                         shape = RoundedCornerShape(10.dp)
                                                     )
                                                     .background(
@@ -1189,17 +1384,71 @@ fun DesktopLauncherScreen(
                                         .then(dragModifier)
                                 ) {
                                     DesktopShortcutTile(
-                                        label = label,
+                                        label = entry.label,
                                         labelColor = desktopTextColor,
                                         onClick = {
                                             if (isEditingDesktopIcons) {
-                                                onShowMessage("Tahan & geser '$label' untuk memindahkan posisinya.")
+                                                onShowMessage("Tahan & geser '${entry.label}' ke kotak grid tujuan.")
                                             } else {
-                                                onTileClick()
+                                                entry.onOpen()
                                             }
                                         },
-                                        iconContent = iconContent
+                                        onLongClick = {
+                                            if (!isEditingDesktopIcons) {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                desktopContextMenuId = id
+                                            }
+                                        },
+                                        iconContent = { entry.iconContent(effectiveIconBoxSize, effectiveInnerIconSize) }
                                     )
+
+                                    DropdownMenu(
+                                        expanded = desktopContextMenuId == id,
+                                        onDismissRequest = { desktopContextMenuId = null }
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("Buka") },
+                                            leadingIcon = { Icon(Icons.Filled.OpenInFull, contentDescription = null) },
+                                            onClick = {
+                                                desktopContextMenuId = null
+                                                entry.onOpen()
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Properties") },
+                                            leadingIcon = { Icon(Icons.Filled.Info, contentDescription = null) },
+                                            onClick = {
+                                                desktopContextMenuId = null
+                                                propertiesDesktopEntry = entry
+                                            }
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Atur Posisi Ikon") },
+                                            leadingIcon = { Icon(Icons.Filled.OpenWith, contentDescription = null) },
+                                            onClick = {
+                                                desktopContextMenuId = null
+                                                isEditingDesktopIcons = true
+                                                onShowMessage("Mode Atur Ikon (${desktopGridCols}×${desktopGridRows}) aktif — geser ikon di desktop.")
+                                            }
+                                        )
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text("Hapus dari Desktop", color = Color(0xFFEF4444)) },
+                                            leadingIcon = {
+                                                Icon(Icons.Filled.Delete, contentDescription = null, tint = Color(0xFFEF4444))
+                                            },
+                                            onClick = {
+                                                desktopContextMenuId = null
+                                                if (entry.isInApp) {
+                                                    app.settingsRepository.removePinnedInAppDesktopId(entry.id)
+                                                    onShowMessage("'${entry.label}' dihapus dari Desktop (masih ada di App Drawer).")
+                                                } else if (entry.installedPackageName != null) {
+                                                    togglePinExternalApp(entry.installedPackageName)
+                                                    app.settingsRepository.removeDesktopIconPosition(entry.id)
+                                                }
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -1623,12 +1872,17 @@ fun DesktopLauncherScreen(
 
             // APP DRAWER (START MENU) OVERLAY
             if (appDrawerOpen) {
+                val drawerBackdropInteraction = remember { MutableInteractionSource() }
+                val drawerCardInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(9999f)
                         .background(Color.Black.copy(alpha = 0.5f))
-                        .clickable { appDrawerOpen = false }
+                        .clickable(
+                            interactionSource = drawerBackdropInteraction,
+                            indication = null
+                        ) { appDrawerOpen = false }
                 ) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
@@ -1641,13 +1895,16 @@ fun DesktopLauncherScreen(
                             .widthIn(max = 760.dp)
                             .fillMaxWidth(0.95f)
                             .heightIn(max = (deskHeightDp * 0.85f).dp)
-                            .clickable(enabled = false) {}
+                            .clickable(
+                                interactionSource = drawerCardInteraction,
+                                indication = null
+                            ) {}
                     ) {
                         Column(
                             modifier = Modifier.padding(14.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            // Header: "App Drawer & Cyber Deck" + [Floating | Fullscreen | Tampilkan App Sistem] + [X]
+                            // Header: "App Drawer & Cyber Deck" + [Floating | Fullscreen | Tampilkan App Sistem | Ikon Bawaan] + [X]
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -1680,6 +1937,19 @@ fun DesktopLauncherScreen(
                                         onClick = { showSystemApps = !showSystemApps },
                                         label = { Text("Tampilkan App Sistem", maxLines = 1) }
                                     )
+                                    FilterChip(
+                                        selected = false,
+                                        onClick = {
+                                            val nextDp = when {
+                                                appDrawerIconSizeDp < 24 -> 26
+                                                appDrawerIconSizeDp < 30 -> 32
+                                                appDrawerIconSizeDp < 38 -> 40
+                                                else -> 22
+                                            }
+                                            app.settingsRepository.setAppDrawerIconSizeDp(nextDp)
+                                        },
+                                        label = { Text("Ikon Bawaan: ${appDrawerIconSizeDp}dp", maxLines = 1) }
+                                    )
                                 }
                                 IconButton(
                                     onClick = { appDrawerOpen = false },
@@ -1702,25 +1972,13 @@ fun DesktopLauncherScreen(
 
                             HorizontalDivider()
 
-                            val builtInDrawerApps = remember(appSearchQuery) {
-                                listOf(
-                                    Triple(DesktopWindowKind.BROWSER, "Cyber Browser", Icons.Filled.Public),
-                                    Triple(DesktopWindowKind.MEDIA, "OfflineTube", Icons.Filled.VideoLibrary),
-                                    Triple(DesktopWindowKind.OFFLINE_WIKI, "Offline Wiki", Icons.Filled.CloudOff),
-                                    Triple(DesktopWindowKind.SEARCH, "Offline Search", Icons.Filled.Search),
-                                    Triple(DesktopWindowKind.MUSIC, "Cyber Music", Icons.Filled.LibraryMusic),
-                                    Triple(DesktopWindowKind.LIBRARY, "Knowledge Vault", Icons.Filled.MenuBook),
-                                    Triple(DesktopWindowKind.FILES, "File Explorer", Icons.Filled.Folder),
-                                    Triple(DesktopWindowKind.TASK_MANAGER, "Task Manager", Icons.Filled.Speed),
-                                    Triple(DesktopWindowKind.TERMINAL, "Terminal PowerShell", Icons.Filled.Terminal),
-                                    Triple(DesktopWindowKind.DOWNLOADS, "Unduhan", Icons.Filled.Download),
-                                    Triple(DesktopWindowKind.BOOKMARKS, "Bookmarks", Icons.Filled.Bookmark),
-                                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings),
-                                    Triple(DesktopWindowKind.GUIDE, "Panduan", Icons.Filled.HelpOutline)
-                                ).filter { (kind, label, _) ->
-                                    appSearchQuery.isBlank() ||
-                                        label.contains(appSearchQuery, true) ||
-                                        kind.name.contains(appSearchQuery, true)
+                            val filteredInAppEntries = remember(allInAppCatalog, appSearchQuery) {
+                                val q = appSearchQuery.trim()
+                                if (q.isBlank()) allInAppCatalog
+                                else allInAppCatalog.filter { entry ->
+                                    entry.label.contains(q, true) ||
+                                        entry.description.contains(q, true) ||
+                                        entry.id.contains(q, true)
                                 }
                             }
 
@@ -1739,11 +1997,10 @@ fun DesktopLauncherScreen(
                                 }
                             }
 
-                            val showAiOfflineInDrawer = appSearchQuery.isBlank() ||
-                                "ai offline".contains(appSearchQuery, true) ||
-                                "qwen".contains(appSearchQuery, true) ||
-                                "llm".contains(appSearchQuery, true)
-                            val builtInCount = builtInDrawerApps.size + (if (showAiOfflineInDrawer) 1 else 0)
+                            val inAppBoxSize = (appDrawerIconSizeDp + 10).coerceIn(28, 52)
+                            val inAppIconSize = appDrawerIconSizeDp.coerceIn(20, 44)
+                            val pinnedInAppSet = remember(pinnedInAppDesktopIds) { pinnedInAppDesktopIds.toHashSet() }
+                            val pinnedPkgSet = remember(pinnedPackages) { pinnedPackages.toHashSet() }
 
                             LazyVerticalGrid(
                                 columns = GridCells.Adaptive(minSize = 112.dp),
@@ -1751,50 +2008,113 @@ fun DesktopLauncherScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
-                                if (builtInCount > 0) {
+                                if (filteredInAppEntries.isNotEmpty()) {
                                     item(
                                         key = "header_builtin_drawer",
-                                        span = { GridItemSpan(maxLineSpan) }
+                                        span = { GridItemSpan(maxLineSpan) },
+                                        contentType = "header"
                                     ) {
-                                        Text(
-                                            "Aplikasi Cyber Deck ($builtInCount)",
-                                            style = MaterialTheme.typography.labelLarge,
-                                            color = MaterialTheme.colorScheme.primary
-                                        )
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                "Fitur Bawaan Cyber Deck (${filteredInAppEntries.size})",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                            Text(
+                                                "Tekan Pin untuk sematkan ke Desktop",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
                                     }
-                                    if (showAiOfflineInDrawer) {
-                                        item(key = "builtin_ai_offline") {
-                                            Card(
-                                                colors = CardDefaults.cardColors(
-                                                    containerColor = Color(0xFF00FF41).copy(alpha = 0.14f)
-                                                ),
-                                                modifier = Modifier.clickable {
+
+                                    items(
+                                        items = filteredInAppEntries,
+                                        key = { "inapp_${it.id}" },
+                                        contentType = { "inapp_tile" }
+                                    ) { entry ->
+                                        val isPinned = entry.id in pinnedInAppSet
+                                        Surface(
+                                            shape = RoundedCornerShape(12.dp),
+                                            color = Color(0xFF0A1628),
+                                            border = BorderStroke(
+                                                1.dp,
+                                                entry.accentColor.copy(alpha = if (isPinned) 0.7f else 0.32f)
+                                            ),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .clickable {
                                                     appDrawerOpen = false
-                                                    launchAiOfflineActivity()
+                                                    entry.onOpen()
                                                 }
-                                            ) {
+                                        ) {
+                                            Box(modifier = Modifier.fillMaxWidth().padding(7.dp)) {
+                                                // Distinct IN-APP badge (top-left) vs Android installed apps
+                                                Surface(
+                                                    color = entry.accentColor.copy(alpha = 0.16f),
+                                                    shape = RoundedCornerShape(4.dp),
+                                                    modifier = Modifier.align(Alignment.TopStart)
+                                                ) {
+                                                    Text(
+                                                        text = "IN-APP",
+                                                        fontSize = 8.sp,
+                                                        fontFamily = FontFamily.Monospace,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = entry.accentColor,
+                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                                    )
+                                                }
+
+                                                IconButton(
+                                                    onClick = {
+                                                        val nowPinned = app.settingsRepository.togglePinnedInAppDesktopId(entry.id)
+                                                        onShowMessage(
+                                                            if (nowPinned) "'${entry.label}' disematkan ke Desktop."
+                                                            else "'${entry.label}' dilepas dari Desktop."
+                                                        )
+                                                    },
+                                                    modifier = Modifier
+                                                        .align(Alignment.TopEnd)
+                                                        .size(22.dp)
+                                                ) {
+                                                    Icon(
+                                                        Icons.Filled.PushPin,
+                                                        contentDescription = "Pin ke Desktop",
+                                                        tint = if (isPinned) entry.accentColor
+                                                        else Color(0xFF94A3B8).copy(alpha = 0.45f),
+                                                        modifier = Modifier.size(13.dp)
+                                                    )
+                                                }
+
                                                 Column(
                                                     horizontalAlignment = Alignment.CenterHorizontally,
-                                                    modifier = Modifier.fillMaxWidth().padding(10.dp)
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(top = 14.dp, bottom = 2.dp)
                                                 ) {
                                                     Box(
                                                         modifier = Modifier
-                                                            .size(40.dp)
-                                                            .clip(RoundedCornerShape(10.dp))
-                                                            .background(Color(0xFF00FF41).copy(alpha = 0.22f)),
+                                                            .size(inAppBoxSize.dp)
+                                                            .clip(RoundedCornerShape(8.dp))
+                                                            .background(entry.accentColor.copy(alpha = 0.16f)),
                                                         contentAlignment = Alignment.Center
                                                     ) {
                                                         Icon(
-                                                            Icons.Filled.SmartToy,
-                                                            contentDescription = "AI Offline",
-                                                            tint = Color(0xFF00FF41),
-                                                            modifier = Modifier.size(24.dp)
+                                                            entry.drawerIcon ?: Icons.Filled.Apps,
+                                                            contentDescription = entry.label,
+                                                            tint = entry.accentColor,
+                                                            modifier = Modifier.size(inAppIconSize.dp)
                                                         )
                                                     }
-                                                    Spacer(Modifier.height(6.dp))
+                                                    Spacer(Modifier.height(5.dp))
                                                     Text(
-                                                        text = "AI Offline",
-                                                        style = MaterialTheme.typography.labelMedium,
+                                                        text = entry.label,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = Color(0xFFF1F5F9),
                                                         maxLines = 2,
                                                         overflow = TextOverflow.Ellipsis,
                                                         textAlign = TextAlign.Center
@@ -1803,50 +2123,12 @@ fun DesktopLauncherScreen(
                                             }
                                         }
                                     }
-                                    items(builtInDrawerApps, key = { "builtin_${it.first.name}" }) { (kind, label, icon) ->
-                                        Card(
-                                            colors = CardDefaults.cardColors(
-                                                containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f)
-                                            ),
-                                            modifier = Modifier.clickable {
-                                                appDrawerOpen = false
-                                                openOrFocusWindow(kind)
-                                            }
-                                        ) {
-                                            Column(
-                                                horizontalAlignment = Alignment.CenterHorizontally,
-                                                modifier = Modifier.fillMaxWidth().padding(10.dp)
-                                            ) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .size(40.dp)
-                                                        .clip(RoundedCornerShape(10.dp))
-                                                        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)),
-                                                    contentAlignment = Alignment.Center
-                                                ) {
-                                                    Icon(
-                                                        icon,
-                                                        contentDescription = label,
-                                                        tint = MaterialTheme.colorScheme.primary,
-                                                        modifier = Modifier.size(24.dp)
-                                                    )
-                                                }
-                                                Spacer(Modifier.height(6.dp))
-                                                Text(
-                                                    text = label,
-                                                    style = MaterialTheme.typography.labelMedium,
-                                                    maxLines = 2,
-                                                    overflow = TextOverflow.Ellipsis,
-                                                    textAlign = TextAlign.Center
-                                                )
-                                            }
-                                        }
-                                    }
                                 }
 
                                 item(
                                     key = "header_installed_drawer",
-                                    span = { GridItemSpan(maxLineSpan) }
+                                    span = { GridItemSpan(maxLineSpan) },
+                                    contentType = "header"
                                 ) {
                                     Text(
                                         "Aplikasi Android Terinstall (${filteredApps.size})",
@@ -1856,32 +2138,42 @@ fun DesktopLauncherScreen(
                                     )
                                 }
 
-                                items(filteredApps, key = { it.packageName }) { extApp ->
-                                    val isPinned = extApp.packageName in pinnedPackages
-                                    Card(
-                                        colors = CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                                items(
+                                    items = filteredApps,
+                                    key = { it.packageName },
+                                    contentType = { "installed_tile" }
+                                ) { extApp ->
+                                    val isPinned = extApp.packageName in pinnedPkgSet
+                                    Surface(
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (isPinned) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                                            else Color.Transparent
                                         ),
-                                        modifier = Modifier.clickable { launchExternalPackage(extApp.packageName) }
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .clickable { launchExternalPackage(extApp.packageName) }
                                     ) {
                                         Box(modifier = Modifier.fillMaxWidth().padding(8.dp)) {
                                             IconButton(
                                                 onClick = { togglePinExternalApp(extApp.packageName) },
                                                 modifier = Modifier
                                                     .align(Alignment.TopEnd)
-                                                    .size(24.dp)
+                                                    .size(22.dp)
                                             ) {
                                                 Icon(
                                                     Icons.Filled.PushPin,
                                                     contentDescription = "Pin to Desktop",
                                                     tint = if (isPinned) MaterialTheme.colorScheme.primary
                                                     else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                                                    modifier = Modifier.size(14.dp)
+                                                    modifier = Modifier.size(13.dp)
                                                 )
                                             }
                                             Column(
                                                 horizontalAlignment = Alignment.CenterHorizontally,
-                                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                                             ) {
                                                 InstalledAppIcon(
                                                     packageName = extApp.packageName,
@@ -1911,12 +2203,17 @@ fun DesktopLauncherScreen(
                         it.status == DownloadStatus.QUEUED ||
                         it.status == DownloadStatus.FAILED
                 }.take(3)
+                val notifBackdropInteraction = remember { MutableInteractionSource() }
+                val notifCardInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(9998f)
                         .background(Color.Black.copy(alpha = 0.4f))
-                        .clickable { notifPanelOpen = false }
+                        .clickable(
+                            interactionSource = notifBackdropInteraction,
+                            indication = null
+                        ) { notifPanelOpen = false }
                 ) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
@@ -1929,7 +2226,10 @@ fun DesktopLauncherScreen(
                             .widthIn(max = 420.dp)
                             .fillMaxWidth(0.92f)
                             .heightIn(max = (deskHeightDp * 0.82f).dp)
-                            .clickable(enabled = false) {}
+                            .clickable(
+                                interactionSource = notifCardInteraction,
+                                indication = null
+                            ) {}
                     ) {
                         Column(
                             modifier = Modifier.padding(14.dp),
@@ -2161,12 +2461,17 @@ fun DesktopLauncherScreen(
 
             // CLICKABLE TASKBAR TRAY POPUPS (Net / Battery / Clock + Calendar)
             if (activeTrayPopup != null) {
+                val trayBackdropInteraction = remember { MutableInteractionSource() }
+                val trayCardInteraction = remember { MutableInteractionSource() }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .zIndex(9997f)
                         .background(Color.Black.copy(alpha = 0.28f))
-                        .clickable { activeTrayPopup = null }
+                        .clickable(
+                            interactionSource = trayBackdropInteraction,
+                            indication = null
+                        ) { activeTrayPopup = null }
                 ) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
@@ -2177,7 +2482,10 @@ fun DesktopLauncherScreen(
                             .align(Alignment.BottomEnd)
                             .padding(12.dp)
                             .widthIn(min = 290.dp, max = 380.dp)
-                            .clickable(enabled = false) {}
+                            .clickable(
+                                interactionSource = trayCardInteraction,
+                                indication = null
+                            ) {}
                     ) {
                         Column(
                             modifier = Modifier.padding(14.dp),
@@ -3575,6 +3883,142 @@ fun DesktopLauncherScreen(
         )
     }
 
+    // DESKTOP ICON PROPERTIES DIALOG
+    propertiesDesktopEntry?.let { entry ->
+        val savedPos = desktopIconPositions[entry.id]
+        val appDetails = remember(entry.installedPackageName) {
+            entry.installedPackageName?.let { pkg ->
+                DesktopLauncherManager.readInstalledAppDetails(context, pkg)
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { propertiesDesktopEntry = null },
+            title = {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    entry.iconContent(34, 20)
+                    Column {
+                        Text(entry.label, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(
+                            text = entry.categoryLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                "Ini Tuh Apa?",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                entry.description,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+
+                    DesktopPropertyRow("Nama Pintasan", entry.label)
+                    DesktopPropertyRow("Kategori", entry.categoryLabel)
+                    DesktopPropertyRow("Target / ID", entry.targetDetail)
+                    DesktopPropertyRow("Shortcut Terminal", entry.terminalHint)
+                    DesktopPropertyRow(
+                        "Konfigurasi Grid",
+                        "${desktopGridCols} Kolom × ${desktopGridRows} Baris (Snap: ${if (desktopSnapToGrid) "ON" else "Bebas"})"
+                    )
+                    DesktopPropertyRow(
+                        "Posisi Tersimpan",
+                        if (savedPos != null) {
+                            "Custom (${savedPos.xDp.roundToInt()}dp, ${savedPos.yDp.roundToInt()}dp)"
+                        } else {
+                            "Otomatis mengikuti urutan Grid Desktop"
+                        }
+                    )
+
+                    if (appDetails != null) {
+                        HorizontalDivider()
+                        DesktopPropertyRow("Versi Aplikasi", "${appDetails.versionName} (Build ${appDetails.versionCode})")
+                        DesktopPropertyRow("Ukuran APK", Formatters.formatBytes(appDetails.apkSizeBytes))
+                        DesktopPropertyRow("Tipe Paket", if (appDetails.isSystemApp) "Aplikasi Sistem" else "Aplikasi Pengguna")
+                        DesktopPropertyRow(
+                            "Target / Min SDK",
+                            "Target API ${appDetails.targetSdk}" + (appDetails.minSdk?.let { " • Min API $it" }.orEmpty())
+                        )
+                        DesktopPropertyRow(
+                            "Pertama Diinstall",
+                            DateFormat.format("dd MMM yyyy, HH:mm", Date(appDetails.firstInstallTimeMs)).toString()
+                        )
+                        DesktopPropertyRow(
+                            "Terakhir Diperbarui",
+                            DateFormat.format("dd MMM yyyy, HH:mm", Date(appDetails.lastUpdateTimeMs)).toString()
+                        )
+                        if (appDetails.sourceDir.isNotBlank()) {
+                            DesktopPropertyRow("Lokasi Paket", appDetails.sourceDir)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (entry.installedPackageName != null) {
+                        OutlinedButton(onClick = {
+                            onShowMessage(DesktopLauncherManager.openExternalAppDetailsSettings(context, entry.installedPackageName))
+                            propertiesDesktopEntry = null
+                        }) {
+                            Text("Info App")
+                        }
+                    }
+                    Button(onClick = {
+                        propertiesDesktopEntry = null
+                        entry.onOpen()
+                    }) {
+                        Text("Buka")
+                    }
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = {
+                        propertiesDesktopEntry = null
+                        if (entry.isInApp) {
+                            app.settingsRepository.removePinnedInAppDesktopId(entry.id)
+                            onShowMessage("'${entry.label}' dihapus dari Desktop.")
+                        } else if (entry.installedPackageName != null) {
+                            togglePinExternalApp(entry.installedPackageName)
+                            app.settingsRepository.removeDesktopIconPosition(entry.id)
+                        }
+                    }) {
+                        Text("Hapus", color = Color(0xFFEF4444))
+                    }
+                    TextButton(onClick = { propertiesDesktopEntry = null }) {
+                        Text("Tutup")
+                    }
+                }
+            }
+        )
+    }
+
     // WALLPAPER & BACKGROUND PICKER DIALOG (6 Simple Presets + 4 Device Wallpapers)
     if (showWallpaperDialog) {
         AlertDialog(
@@ -4055,18 +4499,25 @@ private fun MiniMonthCalendarCard() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun DesktopShortcutTile(
     label: String,
     labelColor: Color = Color.White,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
     iconContent: @Composable () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
         modifier = Modifier
+            .fillMaxSize()
             .clip(RoundedCornerShape(10.dp))
-            .clickable { onClick() }
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .padding(6.dp)
     ) {
         iconContent()
@@ -4083,16 +4534,42 @@ private fun DesktopShortcutTile(
 }
 
 @Composable
+private fun DesktopPropertyRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(0.38f)
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.weight(0.62f)
+        )
+    }
+}
+
+@Composable
 private fun InstalledAppIcon(
     packageName: String,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    var bitmap by remember(packageName) { mutableStateOf<ImageBitmap?>(null) }
+    var bitmap by remember(packageName) {
+        mutableStateOf(DesktopLauncherManager.getCachedAppIconBitmap(packageName))
+    }
 
     LaunchedEffect(packageName) {
-        bitmap = withContext(Dispatchers.IO) {
-            DesktopLauncherManager.loadAppIconBitmap(context, packageName)
+        if (bitmap == null) {
+            bitmap = withContext(Dispatchers.IO) {
+                DesktopLauncherManager.loadAppIconBitmap(context, packageName)
+            }
         }
     }
 

@@ -87,6 +87,24 @@ class SettingsRepository(
     )
     val desktopSnapToGridFlow: StateFlow<Boolean> = _desktopSnapToGrid.asStateFlow()
 
+    private val _desktopGridCols = MutableStateFlow(
+        uiPrefs.getInt(KEY_DESKTOP_GRID_COLS, 6).coerceIn(4, 10)
+    )
+    val desktopGridColsFlow: StateFlow<Int> = _desktopGridCols.asStateFlow()
+
+    private val _desktopGridRows = MutableStateFlow(
+        uiPrefs.getInt(KEY_DESKTOP_GRID_ROWS, 4).coerceIn(3, 7)
+    )
+    val desktopGridRowsFlow: StateFlow<Int> = _desktopGridRows.asStateFlow()
+
+    private val _appDrawerIconSizeDp = MutableStateFlow(
+        uiPrefs.getInt(KEY_APP_DRAWER_ICON_SIZE_DP, 26).coerceIn(20, 44)
+    )
+    val appDrawerIconSizeDpFlow: StateFlow<Int> = _appDrawerIconSizeDp.asStateFlow()
+
+    private val _pinnedInAppDesktopIds = MutableStateFlow(loadPinnedInAppDesktopIdsFromPrefs())
+    val pinnedInAppDesktopIdsFlow: StateFlow<List<String>> = _pinnedInAppDesktopIds.asStateFlow()
+
     private val _terminalCustomCommands = MutableStateFlow(loadTerminalCommandsFromPrefs())
     val terminalCustomCommandsFlow: StateFlow<List<TerminalCustomCommand>> = _terminalCustomCommands.asStateFlow()
 
@@ -120,9 +138,67 @@ class SettingsRepository(
         _desktopSnapToGrid.value = enabled
     }
 
+    fun setDesktopGrid(cols: Int, rows: Int) {
+        val c = cols.coerceIn(4, 10)
+        val r = rows.coerceIn(3, 7)
+        uiPrefs.edit()
+            .putInt(KEY_DESKTOP_GRID_COLS, c)
+            .putInt(KEY_DESKTOP_GRID_ROWS, r)
+            .apply()
+        _desktopGridCols.value = c
+        _desktopGridRows.value = r
+    }
+
+    fun setAppDrawerIconSizeDp(sizeDp: Int) {
+        val clamped = sizeDp.coerceIn(20, 44)
+        uiPrefs.edit().putInt(KEY_APP_DRAWER_ICON_SIZE_DP, clamped).apply()
+        _appDrawerIconSizeDp.value = clamped
+    }
+
+    fun togglePinnedInAppDesktopId(id: String): Boolean {
+        val cur = _pinnedInAppDesktopIds.value.toMutableList()
+        val pinnedNow = if (id in cur) {
+            cur.removeAll { it == id }
+            false
+        } else {
+            cur.add(id)
+            true
+        }
+        savePinnedInAppDesktopIdsToPrefs(cur)
+        _pinnedInAppDesktopIds.value = cur
+        return pinnedNow
+    }
+
+    fun removePinnedInAppDesktopId(id: String) {
+        val next = _pinnedInAppDesktopIds.value.filterNot { it == id }
+        savePinnedInAppDesktopIdsToPrefs(next)
+        _pinnedInAppDesktopIds.value = next
+        removeDesktopIconPosition(id)
+    }
+
+    private fun loadPinnedInAppDesktopIdsFromPrefs(): List<String> {
+        if (!uiPrefs.contains(KEY_PINNED_INAPP_DESKTOP_IDS)) {
+            return DEFAULT_PINNED_INAPP_DESKTOP_IDS
+        }
+        val raw = uiPrefs.getString(KEY_PINNED_INAPP_DESKTOP_IDS, "").orEmpty()
+        return raw.split(',').map { it.trim() }.filter { it.isNotBlank() }.distinct()
+    }
+
+    private fun savePinnedInAppDesktopIdsToPrefs(ids: List<String>) {
+        uiPrefs.edit().putString(KEY_PINNED_INAPP_DESKTOP_IDS, ids.joinToString(",")).apply()
+    }
+
     fun saveDesktopIconPosition(id: String, xDp: Float, yDp: Float) {
         val next = _desktopIconPositions.value.toMutableMap()
         next[id] = DesktopIconPosition(id = id, xDp = xDp, yDp = yDp)
+        saveDesktopIconPositionsToPrefs(next)
+        _desktopIconPositions.value = next
+    }
+
+    fun removeDesktopIconPosition(id: String) {
+        if (!_desktopIconPositions.value.containsKey(id)) return
+        val next = _desktopIconPositions.value.toMutableMap()
+        next.remove(id)
         saveDesktopIconPositionsToPrefs(next)
         _desktopIconPositions.value = next
     }
@@ -211,7 +287,25 @@ class SettingsRepository(
         private const val KEY_DESKTOP_ICON_SIZE_DP = "desktop_icon_size_dp"
         private const val KEY_DESKTOP_ICON_POSITIONS = "desktop_icon_positions_json"
         private const val KEY_DESKTOP_SNAP_TO_GRID = "desktop_snap_to_grid"
+        private const val KEY_DESKTOP_GRID_COLS = "desktop_grid_cols"
+        private const val KEY_DESKTOP_GRID_ROWS = "desktop_grid_rows"
+        private const val KEY_APP_DRAWER_ICON_SIZE_DP = "app_drawer_icon_size_dp"
+        private const val KEY_PINNED_INAPP_DESKTOP_IDS = "pinned_inapp_desktop_ids"
         private const val KEY_TERMINAL_CUSTOM_COMMANDS = "terminal_custom_commands_json"
+
+        val DEFAULT_PINNED_INAPP_DESKTOP_IDS = listOf(
+            "builtin_BROWSER",
+            "builtin_LIBRARY",
+            "builtin_MUSIC",
+            "builtin_FILES",
+            "builtin_TASK_MANAGER",
+            "builtin_TERMINAL",
+            "builtin_SETTINGS",
+            "builtin_GUIDE",
+            "unified_offline_hub",
+            "unified_saved_downloads",
+            "wallpaper_selector"
+        )
     }
 
     suspend fun computeStorageDashboard(): StorageDashboardStats = withContext(Dispatchers.IO) {

@@ -137,10 +137,24 @@
             android:textSize="12sp" />
 
         <Button
+            android:id="@+id/btnAllFilesAccess"
+            android:layout_width="wrap_content"
+            android:layout_height="38dp"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#1E293B"
+            android:fontFamily="monospace"
+            android:paddingHorizontal="10dp"
+            android:text="IZIN SSD"
+            android:textColor="#00FF41"
+            android:textSize="11sp"
+            android:textStyle="bold"
+            android:visibility="gone" />
+
+        <Button
             android:id="@+id/btnPickFolderPrompt"
             android:layout_width="wrap_content"
             android:layout_height="38dp"
-            android:layout_marginStart="10dp"
+            android:layout_marginStart="8dp"
             android:backgroundTint="#00FF41"
             android:fontFamily="monospace"
             android:paddingHorizontal="12dp"

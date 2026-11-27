@@ -2,8 +2,10 @@ package com.offlinecyberdeck.ai
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import com.llamatik.core.platform.GenStream
 import com.llamatik.core.platform.LlamaBridge
@@ -63,29 +65,61 @@ object LlamaHelper {
 
                 unloadInternal()
 
-                // Prioritaskan jalur langsung /storage/<UUID>/AI_Models/... (0 copy, pure mmap ke exFAT SSD)
-                // Jika tidak terbaca langsung oleh POSIX, gunakan FileDescriptor /proc/self/fd/<fd> tanpa menyalin ke internal.
-                val resolvedPath = resolveZeroCopyMmapPath(context, modelUri)
-                    ?: error("Gagal mengakses file model di SSD secara langsung tanpa menyalin ke internal.")
+                // Prioritaskan jalur POSIX langsung (/storage/<UUID>/AI_Models/...) agar mmap zero-copy
+                // berjalan stabil di exFAT SSD tanpa copy ke internal, lalu fallback ke /proc/self/fd/<fd>.
+                val candidates = resolveZeroCopyMmapCandidates(context, modelUri, fileName)
+                if (candidates.isEmpty()) {
+                    val hasAllFiles = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        Environment.isExternalStorageManager()
+                    } else true
+                    error(
+                        if (!hasAllFiles) {
+                            "Tidak dapat membuka FD/path model '$fileName'. Aktifkan 'Izinkan pengelolaan semua file' agar SSD exFAT bisa dibaca langsung via mmap."
+                        } else {
+                            "Gagal membuka '$fileName' di SSD eksternal (SAF/POSIX tidak dapat diakses)."
+                        }
+                    )
+                }
 
-                LlamaBridge.updateGenerateParams(
-                    temperature = 0.7f,
-                    maxTokens = 512,
-                    topP = 0.9f,
-                    topK = 40,
-                    repeatPenalty = 1.1f,
-                    contextLength = TARGET_N_CTX,
-                    numThreads = TARGET_N_THREADS,
-                    useMmap = true,
-                    flashAttention = false,
-                    batchSize = 256,
-                    gpuLayers = 0
-                )
+                var initOk = false
+                var usedLabel = ""
+                for ((label, path) in candidates) {
+                    LlamaBridge.updateGenerateParams(
+                        temperature = 0.7f,
+                        maxTokens = 512,
+                        topP = 0.9f,
+                        topK = 40,
+                        repeatPenalty = 1.1f,
+                        contextLength = TARGET_N_CTX,
+                        numThreads = TARGET_N_THREADS,
+                        useMmap = true,
+                        flashAttention = false,
+                        batchSize = 256,
+                        gpuLayers = 0
+                    )
+                    if (LlamaBridge.initGenerateModel(path)) {
+                        initOk = true
+                        usedLabel = label
+                        break
+                    }
+                    runCatching { LlamaBridge.shutdown() }
+                }
 
-                val ok = LlamaBridge.initGenerateModel(resolvedPath)
-                if (!ok) {
+                if (!initOk) {
                     closePfdQuietly()
-                    error("llama.cpp gagal memuat model GGUF '$fileName' dengan mmap.")
+                    val allFilesOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        Environment.isExternalStorageManager()
+                    } else true
+                    error(
+                        buildString {
+                            append("llama.cpp gagal memuat '$fileName' ($usedLabel")
+                            append(candidates.joinToString { it.first })
+                            append(").")
+                            if (!allFilesOk) {
+                                append(" Coba aktifkan Izin Akses Semua File untuk membaca langsung file .gguf di SSD OTG via mmap.")
+                            }
+                        }
+                    )
                 }
 
                 loaded = true
@@ -182,27 +216,87 @@ object LlamaHelper {
         closePfdQuietly()
     }
 
-    private fun resolveZeroCopyMmapPath(context: Context, modelUri: Uri): String? {
-        if (modelUri.scheme == "file") {
-            val path = modelUri.path.orEmpty()
-            val f = File(path)
-            if (f.exists() && f.isFile && f.canRead()) {
-                return f.absolutePath
+    private fun resolveZeroCopyMmapCandidates(
+        context: Context,
+        modelUri: Uri,
+        fileName: String
+    ): List<Pair<String, String>> {
+        val candidates = ArrayList<Pair<String, String>>()
+        val seenPaths = HashSet<String>()
+
+        fun addFileCandidate(label: String, file: File?) {
+            if (file != null && file.exists() && file.isFile && file.canRead() && file.length() > 0L) {
+                if (seenPaths.add(file.absolutePath)) {
+                    candidates.add(label to file.absolutePath)
+                }
             }
         }
 
-        val directFile = resolveDirectFileFromDocumentUri(modelUri)
-        if (directFile != null && directFile.exists() && directFile.isFile && directFile.canRead()) {
-            return directFile.absolutePath
+        if (modelUri.scheme == "file") {
+            addFileCandidate("POSIX", File(modelUri.path.orEmpty()))
         }
 
-        val pfd = runCatching {
-            context.contentResolver.openFileDescriptor(modelUri, "r")
-        }.getOrNull() ?: return null
+        // 1. Direct path parsed from SAF Document ID
+        addFileCandidate("SAF->POSIX", resolveDirectFileFromDocumentUri(modelUri))
 
-        activePfd = pfd
-        val fdPath = "/proc/self/fd/${pfd.fd}"
-        return fdPath
+        // 2. Direct scan of mounted external volumes under /storage/* & StorageManager for AI_Models/<fileName>
+        findFileInMountedAiModelsDirs(context, fileName)?.let { mountedFile ->
+            addFileCandidate("SSD-Mount", mountedFile)
+        }
+
+        // 3. Fallback zero-copy descriptor /proc/self/fd/<fd>
+        if (modelUri.scheme == "content") {
+            val pfd = runCatching {
+                context.contentResolver.openFileDescriptor(modelUri, "r")
+            }.getOrNull()
+            if (pfd != null) {
+                activePfd = pfd
+                val fdPath = "/proc/self/fd/${pfd.fd}"
+                if (seenPaths.add(fdPath)) {
+                    candidates.add("FD-mmap" to fdPath)
+                }
+            }
+        }
+
+        return candidates
+    }
+
+    private fun findFileInMountedAiModelsDirs(context: Context, fileName: String): File? {
+        val roots = LinkedHashSet<File>()
+        runCatching {
+            val sm = context.getSystemService(StorageManager::class.java)
+            sm?.storageVolumes?.forEach { vol ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    runCatching { vol.directory }.getOrNull()?.let { roots.add(it) }
+                }
+                vol.uuid?.takeIf { it.isNotBlank() }?.let { uuid ->
+                    roots.add(File("/storage/$uuid"))
+                    roots.add(File("/mnt/media_rw/$uuid"))
+                }
+            }
+        }
+        runCatching {
+            File("/storage").listFiles()?.forEach { dir ->
+                if (dir.isDirectory && dir.name !in setOf("emulated", "self")) {
+                    roots.add(dir)
+                }
+            }
+        }
+        for (root in roots) {
+            if (!root.exists() || !root.isDirectory) continue
+            val directAiModels = root.listFiles()?.firstOrNull {
+                it.isDirectory && it.name.trim().equals("AI_Models", ignoreCase = true)
+            } ?: File(root, "AI_Models")
+            if (directAiModels.exists() && directAiModels.isDirectory) {
+                val exact = File(directAiModels, fileName)
+                if (exact.exists() && exact.isFile && exact.canRead()) return exact
+                val ciMatch = directAiModels.listFiles()?.firstOrNull {
+                    it.isFile && it.canRead() && it.name.equals(fileName, ignoreCase = true)
+                }
+                if (ciMatch != null) return ciMatch
+            }
+        }
+        return null
     }
 
     private fun resolveDirectFileFromDocumentUri(uri: Uri): File? {
@@ -212,13 +306,16 @@ object LlamaHelper {
             if (splitIdx <= 0) return@runCatching null
             val volume = docId.substring(0, splitIdx)
             val relPath = docId.substring(splitIdx + 1).trimStart('/')
-            val baseDir = if (volume.equals("primary", ignoreCase = true)) {
-                Environment.getExternalStorageDirectory()
+            val baseDirs = if (volume.equals("primary", ignoreCase = true)) {
+                listOf(Environment.getExternalStorageDirectory())
             } else {
-                File("/storage/$volume")
+                listOf(File("/storage/$volume"), File("/mnt/media_rw/$volume"))
             }
-            val candidate = if (relPath.isEmpty()) baseDir else File(baseDir, relPath)
-            if (candidate.exists() && candidate.isFile && candidate.canRead()) candidate else null
+            for (baseDir in baseDirs) {
+                val candidate = if (relPath.isEmpty()) baseDir else File(baseDir, relPath)
+                if (candidate.exists() && candidate.isFile && candidate.canRead()) return@runCatching candidate
+            }
+            null
         }.getOrNull()
     }
 

@@ -112,6 +112,12 @@ fun SettingsScreen(
 
     val desktopIconSizeDp by app.settingsRepository.desktopIconSizeDpFlow
         .collectAsStateWithLifecycle()
+    val desktopGridCols by app.settingsRepository.desktopGridColsFlow
+        .collectAsStateWithLifecycle()
+    val desktopGridRows by app.settingsRepository.desktopGridRowsFlow
+        .collectAsStateWithLifecycle()
+    val appDrawerIconSizeDp by app.settingsRepository.appDrawerIconSizeDpFlow
+        .collectAsStateWithLifecycle()
     val terminalCustomCommands by app.settingsRepository.terminalCustomCommandsFlow
         .collectAsStateWithLifecycle()
 
@@ -884,6 +890,8 @@ fun SettingsScreen(
                                 )
                             }
                             app.settingsRepository.setDesktopIconSizeDp(46)
+                            app.settingsRepository.setDesktopGrid(6, 4)
+                            app.settingsRepository.setAppDrawerIconSizeDp(26)
                             onShowMessage("Display & developer options reset to defaults (95% UI scale)")
                         }
                     }) {
@@ -893,9 +901,57 @@ fun SettingsScreen(
             }
         }
 
-        // DESKTOP ICON SIZE & TERMINAL CUSTOM COMMANDS (GUI)
+        // DESKTOP GRID, ICON SIZES & TERMINAL CUSTOM COMMANDS (GUI)
         item {
-            SectionCard("Desktop Icon Size & Terminal Custom Commands (GUI)") {
+            SectionCard("Desktop Grid, Ukuran Ikon & Terminal Custom Commands (GUI)") {
+                Text(
+                    "Grid Desktop: $desktopGridCols Kolom × $desktopGridRows Baris (Total ${desktopGridCols * desktopGridRows} slot)",
+                    style = MaterialTheme.typography.titleSmall
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(
+                        "5×4" to (5 to 4),
+                        "6×4 (Standar)" to (6 to 4),
+                        "7×4" to (7 to 4),
+                        "8×5" to (8 to 5)
+                    ).forEach { (label, pair) ->
+                        FilterChip(
+                            selected = desktopGridCols == pair.first && desktopGridRows == pair.second,
+                            onClick = { app.settingsRepository.setDesktopGrid(pair.first, pair.second) },
+                            label = { Text(label) }
+                        )
+                    }
+                }
+                Text("Jumlah Kolom Grid: $desktopGridCols kolom")
+                Slider(
+                    value = desktopGridCols.toFloat(),
+                    onValueChange = { v ->
+                        app.settingsRepository.setDesktopGrid(v.roundToInt().coerceIn(4, 10), desktopGridRows)
+                    },
+                    valueRange = 4f..10f,
+                    steps = 5
+                )
+                Text("Jumlah Baris Grid: $desktopGridRows baris")
+                Slider(
+                    value = desktopGridRows.toFloat(),
+                    onValueChange = { v ->
+                        app.settingsRepository.setDesktopGrid(desktopGridCols, v.roundToInt().coerceIn(3, 7))
+                    },
+                    valueRange = 3f..7f,
+                    steps = 3
+                )
+                OutlinedButton(onClick = {
+                    app.settingsRepository.resetDesktopIconPositions()
+                    onShowMessage("Posisi ikon desktop dirapikan mengikuti grid ${desktopGridCols}×${desktopGridRows}.")
+                }) {
+                    Text("Rapikan Posisi Ikon ke Grid ${desktopGridCols}×${desktopGridRows}")
+                }
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+
                 Text(
                     "Ukuran Ikon Desktop: $desktopIconSizeDp dp",
                     style = MaterialTheme.typography.titleSmall
@@ -918,6 +974,38 @@ fun SettingsScreen(
                         app.settingsRepository.setDesktopIconSizeDp(v.roundToInt().coerceIn(36, 68))
                     },
                     valueRange = 36f..68f
+                )
+
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+
+                Text(
+                    "Ukuran Ikon Bawaan di App Drawer: $appDrawerIconSizeDp dp",
+                    style = MaterialTheme.typography.titleSmall
+                )
+                Text(
+                    "Atur ukuran ikon fitur Cyber Deck di App Drawer agar ringkas & berbeda dari aplikasi Android terinstall.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf("Kecil" to 22, "Ringkas" to 26, "Sedang" to 32, "Besar" to 40).forEach { (label, dpVal) ->
+                        FilterChip(
+                            selected = appDrawerIconSizeDp == dpVal,
+                            onClick = { app.settingsRepository.setAppDrawerIconSizeDp(dpVal) },
+                            label = { Text("$label (${dpVal}dp)") }
+                        )
+                    }
+                }
+                Slider(
+                    value = appDrawerIconSizeDp.toFloat(),
+                    onValueChange = { v ->
+                        app.settingsRepository.setAppDrawerIconSizeDp(v.roundToInt().coerceIn(20, 44))
+                    },
+                    valueRange = 20f..44f,
+                    steps = 5
                 )
 
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))

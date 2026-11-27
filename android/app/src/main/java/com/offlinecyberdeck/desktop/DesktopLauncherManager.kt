@@ -44,6 +44,20 @@ data class InstalledAppInfo(
     val isSystemApp: Boolean
 )
 
+data class InstalledAppDetails(
+    val packageName: String,
+    val label: String,
+    val versionName: String,
+    val versionCode: Long,
+    val apkSizeBytes: Long,
+    val isSystemApp: Boolean,
+    val targetSdk: Int,
+    val minSdk: Int?,
+    val firstInstallTimeMs: Long,
+    val lastUpdateTimeMs: Long,
+    val sourceDir: String
+)
+
 data class DesktopPermissionStatus(
     val isDefaultHomeLauncher: Boolean,
     val canDrawOverlays: Boolean,
@@ -130,8 +144,8 @@ data class BluetoothStatusInfo(
 
 object DesktopLauncherManager {
 
-    // Capped at 64 app icons (~1.3 MB max) so App Drawer stays ultra-light on 4 GB RAM tablets
-    private val iconCache = LruCache<String, ImageBitmap>(64)
+    // Capped at 96 app icons (~2 MB max) so App Drawer stays ultra-light and snag-free on 4 GB RAM tablets
+    private val iconCache = LruCache<String, ImageBitmap>(96)
 
     // Tracks external Android apps launched from Cyber Deck during the active session
     private val recentLaunchedPackages: MutableMap<String, Long> =
@@ -441,6 +455,59 @@ object DesktopLauncherManager {
         }
         byPackage.values.sortedBy { it.label.lowercase() }
     }
+
+    fun openExternalAppDetailsSettings(context: Context, packageName: String): String {
+        val candidates = listOf(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")),
+            Intent(Settings.ACTION_MANAGE_ALL_APPLICATIONS_SETTINGS),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        return launchFirstWorkingSettings(
+            context,
+            candidates,
+            "Membuka Info Aplikasi Android untuk '$packageName'."
+        )
+    }
+
+    fun readInstalledAppDetails(context: Context, packageName: String): InstalledAppDetails? {
+        return runCatching {
+            val pm = context.packageManager
+            val pkgInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0L))
+            } else {
+                @Suppress("DEPRECATION")
+                pm.getPackageInfo(packageName, 0)
+            }
+            val appInfo = pkgInfo.applicationInfo
+            val label = appInfo?.let { runCatching { pm.getApplicationLabel(it).toString() }.getOrNull() }
+                ?.takeIf { it.isNotBlank() } ?: packageName
+            val srcDir = appInfo?.sourceDir.orEmpty()
+            val apkSize = if (srcDir.isNotBlank()) runCatching { File(srcDir).length().coerceAtLeast(0L) }.getOrDefault(0L) else 0L
+            val verCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                pkgInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                pkgInfo.versionCode.toLong()
+            }
+            val isSystem = ((appInfo?.flags ?: 0) and ApplicationInfo.FLAG_SYSTEM) != 0
+            val minSdkVal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) appInfo?.minSdkVersion else null
+            InstalledAppDetails(
+                packageName = packageName,
+                label = label,
+                versionName = pkgInfo.versionName ?: "-",
+                versionCode = verCode,
+                apkSizeBytes = apkSize,
+                isSystemApp = isSystem,
+                targetSdk = appInfo?.targetSdkVersion ?: 0,
+                minSdk = minSdkVal,
+                firstInstallTimeMs = pkgInfo.firstInstallTime,
+                lastUpdateTimeMs = pkgInfo.lastUpdateTime,
+                sourceDir = srcDir
+            )
+        }.getOrNull()
+    }
+
+    fun getCachedAppIconBitmap(packageName: String): ImageBitmap? = iconCache.get(packageName)
 
     fun loadAppIconBitmap(context: Context, packageName: String): ImageBitmap? {
         iconCache.get(packageName)?.let { return it }
