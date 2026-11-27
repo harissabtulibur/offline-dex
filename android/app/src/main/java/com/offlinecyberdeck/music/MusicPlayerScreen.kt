@@ -211,6 +211,7 @@ fun MusicPlayerScreen(
     var playRequestToken by remember { mutableLongStateOf(0L) }
     var candidateQueue by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var candidateIndex by remember { mutableIntStateOf(0) }
+    var deepSafFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
     var cacheFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
     var mediaPlayerFallbackTriedTrackId by remember { mutableStateOf<String?>(null) }
     var fallbackPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
@@ -223,7 +224,7 @@ fun MusicPlayerScreen(
                     .setUsage(C.USAGE_MEDIA)
                     .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                     .build(),
-                true
+                false
             )
             .build()
     }
@@ -293,6 +294,7 @@ fun MusicPlayerScreen(
         durationMs = target.durationMs.coerceAtLeast(0L)
         candidateQueue = emptyList()
         candidateIndex = 0
+        deepSafFallbackTriedTrackId = null
         cacheFallbackTriedTrackId = null
         mediaPlayerFallbackTriedTrackId = null
         releaseFallbackPlayer()
@@ -307,7 +309,8 @@ fun MusicPlayerScreen(
             val candidates = app.musicRepository.resolvePlayableCandidates(
                 track = target,
                 deckDriveTreeUri = settings.deckDriveTreeUri,
-                extraSafUris = extraSaf
+                extraSafUris = extraSaf,
+                includeDeepSafSearch = false
             )
             if (token != playRequestToken) return@launch
 
@@ -511,6 +514,12 @@ fun MusicPlayerScreen(
                 val track = queue.getOrNull(currentIndex)
                 val failedUri = exoPlayer.currentMediaItem?.localConfiguration?.uri
                 val nextCandidateIdx = candidateIndex + 1
+                val srcTag = failedUri?.scheme ?: "unknown"
+
+                fun reportPlayFailure() {
+                    val detail = error.localizedMessage ?: error.errorCodeName
+                    onShowMessage("Gagal memutar audio ($srcTag / ${error.errorCodeName}): $detail. Coba Scan Folder SD / Refresh.")
+                }
 
                 if (track != null && nextCandidateIdx < candidateQueue.size) {
                     candidateIndex = nextCandidateIdx
@@ -519,6 +528,54 @@ fun MusicPlayerScreen(
                     exoPlayer.prepare()
                     exoPlayer.setPlaybackSpeed(playbackSpeed)
                     exoPlayer.playWhenReady = true
+                } else if (track != null && deepSafFallbackTriedTrackId != track.id) {
+                    deepSafFallbackTriedTrackId = track.id
+                    val errorToken = playRequestToken
+                    val extraSaf = settings.extraMediaSafUris.split('\n').map { it.trim() }.filter { it.isNotBlank() }
+                    scope.launch {
+                        val deepCandidates = app.musicRepository.resolvePlayableCandidates(
+                            track = track,
+                            deckDriveTreeUri = settings.deckDriveTreeUri,
+                            extraSafUris = extraSaf,
+                            includeDeepSafSearch = true
+                        ).filter { it !in candidateQueue && it != failedUri }
+                        if (errorToken != playRequestToken) return@launch
+                        if (deepCandidates.isNotEmpty()) {
+                            val startIdx = candidateQueue.size
+                            candidateQueue = candidateQueue + deepCandidates
+                            candidateIndex = startIdx
+                            exoPlayer.setMediaItem(MediaItem.fromUri(deepCandidates.first()))
+                            exoPlayer.prepare()
+                            exoPlayer.setPlaybackSpeed(playbackSpeed)
+                            exoPlayer.playWhenReady = true
+                        } else if (cacheFallbackTriedTrackId != track.id) {
+                            cacheFallbackTriedTrackId = track.id
+                            val toCache = buildList {
+                                failedUri?.let { add(it) }
+                                addAll(candidateQueue)
+                            }.distinct()
+                            val cachedUri = toCache.firstNotNullOfOrNull { src ->
+                                app.musicRepository.cacheUriOrFileForPlayback(track, src)
+                            }
+                            if (errorToken != playRequestToken) return@launch
+                            if (cachedUri != null && cachedUri != failedUri) {
+                                exoPlayer.setMediaItem(MediaItem.fromUri(cachedUri))
+                                exoPlayer.prepare()
+                                exoPlayer.setPlaybackSpeed(playbackSpeed)
+                                exoPlayer.playWhenReady = true
+                            } else if (mediaPlayerFallbackTriedTrackId != track.id) {
+                                mediaPlayerFallbackTriedTrackId = track.id
+                                val mpSource = cachedUri ?: candidateQueue.firstOrNull() ?: failedUri
+                                if (mpSource == null || !startAndroidMediaPlayerFallback(track, mpSource)) {
+                                    reportPlayFailure()
+                                }
+                            } else {
+                                reportPlayFailure()
+                            }
+                        } else {
+                            reportPlayFailure()
+                        }
+                    }
                 } else if (track != null && cacheFallbackTriedTrackId != track.id) {
                     cacheFallbackTriedTrackId = track.id
                     val errorToken = playRequestToken
@@ -540,10 +597,10 @@ fun MusicPlayerScreen(
                             mediaPlayerFallbackTriedTrackId = track.id
                             val mpSource = cachedUri ?: candidateQueue.firstOrNull() ?: failedUri
                             if (mpSource == null || !startAndroidMediaPlayerFallback(track, mpSource)) {
-                                onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                                reportPlayFailure()
                             }
                         } else {
-                            onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                            reportPlayFailure()
                         }
                     }
                 } else if (track != null && mediaPlayerFallbackTriedTrackId != track.id) {
@@ -559,11 +616,11 @@ fun MusicPlayerScreen(
                         } ?: toTry.firstOrNull()
                         if (errorToken != playRequestToken) return@launch
                         if (mpUri == null || !startAndroidMediaPlayerFallback(track, mpUri)) {
-                            onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                            reportPlayFailure()
                         }
                     }
                 } else {
-                    onShowMessage("Gagal memutar audio SD/USB: ${error.localizedMessage ?: error.errorCodeName}. Coba Scan Folder SD / Refresh.")
+                    reportPlayFailure()
                 }
             }
         }
@@ -769,7 +826,7 @@ fun MusicPlayerScreen(
                         Icon(Icons.Filled.Settings, contentDescription = "Pengaturan Musik", tint = YtmInk)
                     }
                     Button(
-                        onClick = { audioFilePicker.launch(arrayOf("audio/*")) },
+                        onClick = { audioFilePicker.launch(arrayOf("audio/*", "application/ogg")) },
                         colors = ButtonDefaults.buttonColors(containerColor = YtmRed, contentColor = Color.White),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
                     ) {

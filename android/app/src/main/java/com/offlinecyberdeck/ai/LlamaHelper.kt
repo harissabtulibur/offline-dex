@@ -2,11 +2,9 @@ package com.offlinecyberdeck.ai
 
 import android.content.Context
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
 import android.os.ParcelFileDescriptor
-import android.os.storage.StorageManager
-import android.provider.DocumentsContract
+import android.system.Os
+import android.system.OsConstants
 import com.llamatik.core.platform.GenStream
 import com.llamatik.core.platform.LlamaBridge
 import kotlinx.coroutines.CoroutineScope
@@ -17,8 +15,18 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * Singleton manager for offline llama.cpp inference via SAF + ParcelFileDescriptor.
+ *
+ * Design guarantees (GitHub-friendly & Scoped Storage compliant):
+ * - Zero MANAGE_EXTERNAL_STORAGE / All Files Access usage.
+ * - Zero copying of .gguf files into internal storage or getExternalFilesDir().
+ * - Opens content:// URI via ContentResolver.openFileDescriptor(uri, "r") and passes
+ *   "/proc/self/fd/<fd>" to llama.cpp while keeping [activePfd] alive until unloadModel().
+ */
 object LlamaHelper {
 
     const val SYSTEM_PROMPT =
@@ -26,6 +34,13 @@ object LlamaHelper {
 
     const val TARGET_N_CTX = 2048
     const val TARGET_N_THREADS = 4
+
+    private data class LoadProfile(
+        val label: String,
+        val useMmap: Boolean,
+        val contextLength: Int,
+        val batchSize: Int
+    )
 
     private val modelMutex = Mutex()
     private val helperScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -41,6 +56,13 @@ object LlamaHelper {
     private var currentModelUri: String? = null
 
     @Volatile
+    private var currentLoadModeLabel: String = "FD"
+
+    /**
+     * Global ParcelFileDescriptor held open for the entire lifetime of the loaded model.
+     * Closing this while native llama.cpp still holds mmap/file pointers would invalidate /proc/self/fd/<fd>.
+     */
+    @Volatile
     private var activePfd: ParcelFileDescriptor? = null
 
     fun isModelLoaded(): Boolean = loaded
@@ -51,6 +73,12 @@ object LlamaHelper {
 
     fun getActiveModelUri(): String? = currentModelUri
 
+    fun getActiveLoadMode(): String = currentLoadModeLabel
+
+    /**
+     * Loads a GGUF model directly from an external SAF content:// URI using /proc/self/fd/<fd>.
+     * Never uses raw /storage/xxxx-xxxx/ paths and never copies the model to internal storage.
+     */
     suspend fun loadModel(
         context: Context,
         modelUri: Uri,
@@ -59,72 +87,77 @@ object LlamaHelper {
         modelMutex.withLock {
             runCatching {
                 val uriStr = modelUri.toString()
-                if (loaded && currentModelUri == uriStr) {
+                if (loaded && currentModelUri == uriStr && activePfd != null) {
                     return@runCatching fileName
                 }
 
                 unloadInternal()
 
-                // Prioritaskan jalur POSIX langsung (/storage/<UUID>/AI_Models/...) agar mmap zero-copy
-                // berjalan stabil di exFAT SSD tanpa copy ke internal, lalu fallback ke /proc/self/fd/<fd>.
-                val candidates = resolveZeroCopyMmapCandidates(context, modelUri, fileName)
-                if (candidates.isEmpty()) {
-                    val hasAllFiles = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        Environment.isExternalStorageManager()
-                    } else true
-                    error(
-                        if (!hasAllFiles) {
-                            "Tidak dapat membuka FD/path model '$fileName'. Aktifkan 'Izinkan pengelolaan semua file' agar SSD exFAT bisa dibaca langsung via mmap."
-                        } else {
-                            "Gagal membuka '$fileName' di SSD eksternal (SAF/POSIX tidak dapat diakses)."
-                        }
-                    )
+                val resolver = context.applicationContext.contentResolver
+                val probePfd = runCatching { resolver.openFileDescriptor(modelUri, "r") }.getOrNull()
+                    ?: error("Gagal membuka File Descriptor untuk '$fileName'. Pastikan izin SAF masih aktif dan SSD terhubung.")
+
+                // Validate FD readability and GGUF magic header ("GGUF") before handing to native llama.cpp
+                val validation = validateGgufFileDescriptor(probePfd)
+                runCatching { probePfd.close() }
+
+                if (!validation.isValidGguf) {
+                    error(validation.diagnosticMessage)
                 }
 
+                // Attempt mmap first for speed/low RAM, then fallback to useMmap = false for FUSE/OTG FDs
+                // where Android's kernel/FUSE proxy rejects mmap().
+                val profiles = listOf(
+                    LoadProfile("FD-MMAP", useMmap = true, contextLength = TARGET_N_CTX, batchSize = 256),
+                    LoadProfile("FD-RAM", useMmap = false, contextLength = TARGET_N_CTX, batchSize = 128),
+                    LoadProfile("FD-RAM-1K", useMmap = false, contextLength = 1024, batchSize = 64)
+                )
+
                 var initOk = false
-                var usedLabel = ""
-                for ((label, path) in candidates) {
+                var succeededMode = ""
+
+                for (profile in profiles) {
+                    closePfdQuietly()
+                    val pfd = runCatching { resolver.openFileDescriptor(modelUri, "r") }.getOrNull()
+                        ?: continue
+                    activePfd = pfd
+                    runCatching { Os.lseek(pfd.fileDescriptor, 0L, OsConstants.SEEK_SET) }
+
+                    val fdPath = "/proc/self/fd/${pfd.fd}"
+
                     LlamaBridge.updateGenerateParams(
                         temperature = 0.7f,
                         maxTokens = 512,
                         topP = 0.9f,
                         topK = 40,
                         repeatPenalty = 1.1f,
-                        contextLength = TARGET_N_CTX,
+                        contextLength = profile.contextLength,
                         numThreads = TARGET_N_THREADS,
-                        useMmap = true,
+                        useMmap = profile.useMmap,
                         flashAttention = false,
-                        batchSize = 256,
+                        batchSize = profile.batchSize,
                         gpuLayers = 0
                     )
-                    if (LlamaBridge.initGenerateModel(path)) {
+
+                    if (LlamaBridge.initGenerateModel(fdPath)) {
                         initOk = true
-                        usedLabel = label
+                        succeededMode = profile.label
                         break
                     }
+
                     runCatching { LlamaBridge.shutdown() }
+                    closePfdQuietly()
                 }
 
                 if (!initOk) {
                     closePfdQuietly()
-                    val allFilesOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        Environment.isExternalStorageManager()
-                    } else true
-                    error(
-                        buildString {
-                            append("llama.cpp gagal memuat '$fileName' ($usedLabel")
-                            append(candidates.joinToString { it.first })
-                            append(").")
-                            if (!allFilesOk) {
-                                append(" Coba aktifkan Izin Akses Semua File untuk membaca langsung file .gguf di SSD OTG via mmap.")
-                            }
-                        }
-                    )
+                    error(buildFailureDiagnostic(fileName, validation))
                 }
 
                 loaded = true
                 currentModelName = fileName
                 currentModelUri = uriStr
+                currentLoadModeLabel = succeededMode
                 fileName
             }.onFailure {
                 unloadInternal()
@@ -132,6 +165,9 @@ object LlamaHelper {
         }
     }
 
+    /**
+     * Streams tokens from the loaded model on a background IO coroutine.
+     */
     fun generateResponse(
         userPrompt: String,
         conversationHistory: List<Pair<String, String>>,
@@ -139,7 +175,7 @@ object LlamaHelper {
         onComplete: () -> Unit,
         onError: (String) -> Unit
     ) {
-        if (!loaded) {
+        if (!loaded || activePfd == null) {
             onError("Model belum dimuat.")
             return
         }
@@ -197,6 +233,9 @@ object LlamaHelper {
         }
     }
 
+    /**
+     * Unloads native llama.cpp context and releases the held ParcelFileDescriptor.
+     */
     fun unloadModel() {
         stopGeneration()
         runCatching { unloadInternal() }
@@ -213,115 +252,65 @@ object LlamaHelper {
         loaded = false
         currentModelName = null
         currentModelUri = null
+        currentLoadModeLabel = "FD"
         closePfdQuietly()
-    }
-
-    private fun resolveZeroCopyMmapCandidates(
-        context: Context,
-        modelUri: Uri,
-        fileName: String
-    ): List<Pair<String, String>> {
-        val candidates = ArrayList<Pair<String, String>>()
-        val seenPaths = HashSet<String>()
-
-        fun addFileCandidate(label: String, file: File?) {
-            if (file != null && file.exists() && file.isFile && file.canRead() && file.length() > 0L) {
-                if (seenPaths.add(file.absolutePath)) {
-                    candidates.add(label to file.absolutePath)
-                }
-            }
-        }
-
-        if (modelUri.scheme == "file") {
-            addFileCandidate("POSIX", File(modelUri.path.orEmpty()))
-        }
-
-        // 1. Direct path parsed from SAF Document ID
-        addFileCandidate("SAF->POSIX", resolveDirectFileFromDocumentUri(modelUri))
-
-        // 2. Direct scan of mounted external volumes under /storage/* & StorageManager for AI_Models/<fileName>
-        findFileInMountedAiModelsDirs(context, fileName)?.let { mountedFile ->
-            addFileCandidate("SSD-Mount", mountedFile)
-        }
-
-        // 3. Fallback zero-copy descriptor /proc/self/fd/<fd>
-        if (modelUri.scheme == "content") {
-            val pfd = runCatching {
-                context.contentResolver.openFileDescriptor(modelUri, "r")
-            }.getOrNull()
-            if (pfd != null) {
-                activePfd = pfd
-                val fdPath = "/proc/self/fd/${pfd.fd}"
-                if (seenPaths.add(fdPath)) {
-                    candidates.add("FD-mmap" to fdPath)
-                }
-            }
-        }
-
-        return candidates
-    }
-
-    private fun findFileInMountedAiModelsDirs(context: Context, fileName: String): File? {
-        val roots = LinkedHashSet<File>()
-        runCatching {
-            val sm = context.getSystemService(StorageManager::class.java)
-            sm?.storageVolumes?.forEach { vol ->
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    runCatching { vol.directory }.getOrNull()?.let { roots.add(it) }
-                }
-                vol.uuid?.takeIf { it.isNotBlank() }?.let { uuid ->
-                    roots.add(File("/storage/$uuid"))
-                    roots.add(File("/mnt/media_rw/$uuid"))
-                }
-            }
-        }
-        runCatching {
-            File("/storage").listFiles()?.forEach { dir ->
-                if (dir.isDirectory && dir.name !in setOf("emulated", "self")) {
-                    roots.add(dir)
-                }
-            }
-        }
-        for (root in roots) {
-            if (!root.exists() || !root.isDirectory) continue
-            val directAiModels = root.listFiles()?.firstOrNull {
-                it.isDirectory && it.name.trim().equals("AI_Models", ignoreCase = true)
-            } ?: File(root, "AI_Models")
-            if (directAiModels.exists() && directAiModels.isDirectory) {
-                val exact = File(directAiModels, fileName)
-                if (exact.exists() && exact.isFile && exact.canRead()) return exact
-                val ciMatch = directAiModels.listFiles()?.firstOrNull {
-                    it.isFile && it.canRead() && it.name.equals(fileName, ignoreCase = true)
-                }
-                if (ciMatch != null) return ciMatch
-            }
-        }
-        return null
-    }
-
-    private fun resolveDirectFileFromDocumentUri(uri: Uri): File? {
-        return runCatching {
-            val docId = DocumentsContract.getDocumentId(uri)
-            val splitIdx = docId.indexOf(':')
-            if (splitIdx <= 0) return@runCatching null
-            val volume = docId.substring(0, splitIdx)
-            val relPath = docId.substring(splitIdx + 1).trimStart('/')
-            val baseDirs = if (volume.equals("primary", ignoreCase = true)) {
-                listOf(Environment.getExternalStorageDirectory())
-            } else {
-                listOf(File("/storage/$volume"), File("/mnt/media_rw/$volume"))
-            }
-            for (baseDir in baseDirs) {
-                val candidate = if (relPath.isEmpty()) baseDir else File(baseDir, relPath)
-                if (candidate.exists() && candidate.isFile && candidate.canRead()) return@runCatching candidate
-            }
-            null
-        }.getOrNull()
     }
 
     private fun closePfdQuietly() {
         runCatching { activePfd?.close() }
         activePfd = null
+    }
+
+    private data class FdValidation(
+        val isValidGguf: Boolean,
+        val fileSizeBytes: Long,
+        val procSelfFdReadable: Boolean,
+        val diagnosticMessage: String
+    )
+
+    private fun validateGgufFileDescriptor(pfd: ParcelFileDescriptor): FdValidation {
+        val fd = pfd.fileDescriptor
+        val sizeBytes = runCatching { Os.fstat(fd).st_size }.getOrDefault(pfd.statSize)
+        val header = ByteArray(4)
+        val readBytes = runCatching { Os.pread(fd, header, 0, 4, 0L) }.getOrDefault(-1)
+        val magic = if (readBytes == 4) String(header, Charsets.US_ASCII) else ""
+
+        if (readBytes < 4 || magic != "GGUF") {
+            return FdValidation(
+                isValidGguf = false,
+                fileSizeBytes = sizeBytes,
+                procSelfFdReadable = false,
+                diagnosticMessage = "File bukan format GGUF valid (header='$magic', size=$sizeBytes)."
+            )
+        }
+
+        // Check whether reopening /proc/self/fd/<fd> via POSIX open() succeeds under Android SELinux
+        val procSelfFdPath = "/proc/self/fd/${pfd.fd}"
+        val procReadable = runCatching {
+            FileInputStream(File(procSelfFdPath)).use { fis ->
+                fis.read() >= 0
+            }
+        }.getOrDefault(false)
+
+        return FdValidation(
+            isValidGguf = true,
+            fileSizeBytes = sizeBytes,
+            procSelfFdReadable = procReadable,
+            diagnosticMessage = "OK"
+        )
+    }
+
+    private fun buildFailureDiagnostic(fileName: String, validation: FdValidation): String {
+        val sizeMb = if (validation.fileSizeBytes > 0L) {
+            "${validation.fileSizeBytes / (1024 * 1024)} MB"
+        } else {
+            "unknown"
+        }
+        return if (!validation.procSelfFdReadable) {
+            "FD SAF terbaca ($sizeMb GGUF), tetapi SELinux/FUSE Android menolak pembukaan ulang symlink /proc/self/fd oleh library native. Coba pilih ulang file .gguf lewat tombol 'PILIH FILE .GGUF'."
+        } else {
+            "llama.cpp gagal memuat '$fileName' ($sizeMb) via /proc/self/fd (MMAP & RAM fallback). Pastikan file GGUF tidak korup dan RAM tersedia cukup."
+        }
     }
 
     private fun buildCompactHistoryBlock(history: List<Pair<String, String>>): String {

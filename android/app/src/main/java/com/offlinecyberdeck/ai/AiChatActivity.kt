@@ -3,11 +3,9 @@ package com.offlinecyberdeck.ai
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.DocumentsContract
-import android.provider.Settings
+import android.provider.OpenableColumns
 import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
@@ -30,14 +28,28 @@ import com.offlinecyberdeck.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 import java.util.Locale
 
+/**
+ * Offline AI terminal activity for Cyber Deck.
+ *
+ * Storage & Security Design:
+ * - Strictly uses Android Storage Access Framework (SAF):
+ *   1. ACTION_OPEN_DOCUMENT_TREE to pick the "AI_Models" directory on USB OTG SSD.
+ *   2. ACTION_OPEN_DOCUMENT (MIME all types) to pick a ".gguf" model file directly.
+ * - Persists URI permissions via takePersistableUriPermission + SharedPreferences so the user
+ *   does not need to re-pick the model or folder after restarting the app.
+ * - Never requests MANAGE_EXTERNAL_STORAGE and never copies .gguf files to internal storage.
+ *   Models are opened directly as a ParcelFileDescriptor (/proc/self/fd/<fd>) in [LlamaHelper].
+ */
 class AiChatActivity : AppCompatActivity() {
 
     companion object {
         private const val PREFS_NAME = "ai_models_prefs"
         private const val KEY_AI_MODELS_TREE_URI = "ai_models_tree_uri"
+        private const val KEY_MODEL_DOC_URI = "ai_model_doc_uri"
+        private const val KEY_MODEL_FILE_NAME = "ai_model_file_name"
+
         private const val REQUIRED_FOLDER_NAME = "AI_Models"
         private const val PREFERRED_MODEL_NAME = "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
         private const val MSG_MISSING_FOLDER =
@@ -70,12 +82,14 @@ class AiChatActivity : AppCompatActivity() {
 
     private lateinit var btnBack: Button
     private lateinit var tvActiveModel: TextView
+    private lateinit var btnPickFile: Button
     private lateinit var btnSelectFolder: Button
     private lateinit var btnClearChat: Button
     private lateinit var tvModelStatus: TextView
+    private lateinit var tvLoadMode: TextView
     private lateinit var layoutMissingFolder: LinearLayout
     private lateinit var tvMissingFolderMessage: TextView
-    private lateinit var btnAllFilesAccess: Button
+    private lateinit var btnPickFilePrompt: Button
     private lateinit var btnPickFolderPrompt: Button
     private lateinit var rvChatHistory: RecyclerView
     private lateinit var etPrompt: EditText
@@ -85,17 +99,33 @@ class AiChatActivity : AppCompatActivity() {
     private val chatMessages = mutableListOf<ChatMessage>()
     private lateinit var chatAdapter: CyberDeckChatAdapter
     private var initialPickerPrompted = false
+    private var isLoadingModel = false
 
+    /**
+     * SAF folder picker (ACTION_OPEN_DOCUMENT_TREE) for selecting "AI_Models" on USB OTG SSD.
+     */
     private val folderPickerLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocumentTree()
     ) { treeUri: Uri? ->
         if (treeUri != null) {
             onFolderPicked(treeUri)
-        } else {
-            if (!LlamaHelper.isModelLoaded()) {
-                showBannerState(MSG_MISSING_FOLDER, offerAllFilesButton = false)
-                updateModelStatus("MODEL: BELUM DIMUAT")
-            }
+        } else if (!LlamaHelper.isModelLoaded() && !isLoadingModel) {
+            showBannerState(MSG_MISSING_FOLDER)
+            updateModelStatus("MODEL: BELUM DIMUAT")
+        }
+    }
+
+    /**
+     * SAF single-file picker (ACTION_OPEN_DOCUMENT) for selecting a .gguf file directly.
+     */
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { docUri: Uri? ->
+        if (docUri != null) {
+            onModelFilePicked(docUri)
+        } else if (!LlamaHelper.isModelLoaded() && !isLoadingModel) {
+            showBannerState(MSG_MISSING_FOLDER)
+            updateModelStatus("MODEL: BELUM DIMUAT")
         }
     }
 
@@ -108,25 +138,17 @@ class AiChatActivity : AppCompatActivity() {
         setupRecyclerView()
         setupListeners()
 
-        appendSystemLog("Terminal AI Offline diinisialisasi (n_ctx=${LlamaHelper.TARGET_N_CTX}, threads=${LlamaHelper.TARGET_N_THREADS}, mmap=true).")
-        checkSavedFolderAndLoadModel()
+        appendSystemLog(
+            "Terminal AI Offline siap (SAF FD • n_ctx=${LlamaHelper.TARGET_N_CTX}, threads=${LlamaHelper.TARGET_N_THREADS})."
+        )
+        restorePersistedModelOrPrompt()
     }
 
     override fun onResume() {
         super.onResume()
-        if (!LlamaHelper.isModelLoaded()) {
-            val savedUri = getSavedTreeUri()
-            if (savedUri != null && hasPersistedReadPermission(savedUri)) {
-                lifecycleScope.launch {
-                    val scan = withContext(Dispatchers.IO) {
-                        findModelInsideAiModelsTree(savedUri)
-                    }
-                    if (scan is FolderScanResult.Found) {
-                        hideBannerState()
-                        loadGgufModel(scan.modelUri, scan.fileName)
-                    }
-                }
-            }
+        // If user plugged the SSD back in while activity was paused, re-attempt loading from persisted URI
+        if (!LlamaHelper.isModelLoaded() && !isLoadingModel) {
+            restorePersistedUriQuietly()
         }
     }
 
@@ -141,12 +163,14 @@ class AiChatActivity : AppCompatActivity() {
     private fun bindViews() {
         btnBack = findViewById(R.id.btnBack)
         tvActiveModel = findViewById(R.id.tvActiveModel)
+        btnPickFile = findViewById(R.id.btnPickFile)
         btnSelectFolder = findViewById(R.id.btnSelectFolder)
         btnClearChat = findViewById(R.id.btnClearChat)
         tvModelStatus = findViewById(R.id.tvModelStatus)
+        tvLoadMode = findViewById(R.id.tvLoadMode)
         layoutMissingFolder = findViewById(R.id.layoutMissingFolder)
         tvMissingFolderMessage = findViewById(R.id.tvMissingFolderMessage)
-        btnAllFilesAccess = findViewById(R.id.btnAllFilesAccess)
+        btnPickFilePrompt = findViewById(R.id.btnPickFilePrompt)
         btnPickFolderPrompt = findViewById(R.id.btnPickFolderPrompt)
         rvChatHistory = findViewById(R.id.rvChatHistory)
         etPrompt = findViewById(R.id.etPrompt)
@@ -168,16 +192,20 @@ class AiChatActivity : AppCompatActivity() {
             finish()
         }
 
+        btnPickFile.setOnClickListener {
+            openGgufFilePicker()
+        }
+
+        btnPickFilePrompt.setOnClickListener {
+            openGgufFilePicker()
+        }
+
         btnSelectFolder.setOnClickListener {
             openAiModelsFolderPicker()
         }
 
         btnPickFolderPrompt.setOnClickListener {
             openAiModelsFolderPicker()
-        }
-
-        btnAllFilesAccess.setOnClickListener {
-            openAllFilesAccessSettings()
         }
 
         btnClearChat.setOnClickListener {
@@ -220,16 +248,8 @@ class AiChatActivity : AppCompatActivity() {
         folderPickerLauncher.launch(null)
     }
 
-    private fun openAllFilesAccessSettings() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            runCatching { startActivity(intent) }.onFailure {
-                runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
-            }
-        }
+    private fun openGgufFilePicker() {
+        filePickerLauncher.launch(arrayOf("*/*"))
     }
 
     private fun getSavedTreeUri(): Uri? {
@@ -237,14 +257,32 @@ class AiChatActivity : AppCompatActivity() {
             .getString(KEY_AI_MODELS_TREE_URI, null)
             ?.trim()
             .orEmpty()
+        return if (raw.isEmpty()) null else runCatching { Uri.parse(raw) }.getOrNull()
+    }
+
+    private fun getSavedModelDocUri(): Pair<Uri, String>? {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val raw = prefs.getString(KEY_MODEL_DOC_URI, null)?.trim().orEmpty()
         if (raw.isEmpty()) return null
-        return runCatching { Uri.parse(raw) }.getOrNull()
+        val uri = runCatching { Uri.parse(raw) }.getOrNull() ?: return null
+        val savedName = prefs.getString(KEY_MODEL_FILE_NAME, null)?.trim().orEmpty()
+        return uri to savedName.ifBlank { PREFERRED_MODEL_NAME }
     }
 
     private fun saveTreeUri(uri: Uri) {
         getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .edit()
             .putString(KEY_AI_MODELS_TREE_URI, uri.toString())
+            .remove(KEY_MODEL_DOC_URI)
+            .remove(KEY_MODEL_FILE_NAME)
+            .apply()
+    }
+
+    private fun saveModelDocUri(uri: Uri, fileName: String) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putString(KEY_MODEL_DOC_URI, uri.toString())
+            .putString(KEY_MODEL_FILE_NAME, fileName)
             .apply()
     }
 
@@ -252,6 +290,29 @@ class AiChatActivity : AppCompatActivity() {
         return contentResolver.persistedUriPermissions.any { perm ->
             perm.uri == uri && perm.isReadPermission
         }
+    }
+
+    private fun onModelFilePicked(docUri: Uri) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(
+                docUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+
+        val resolvedName = resolveDocumentDisplayName(docUri)
+        if (!resolvedName.lowercase(Locale.US).endsWith(".gguf")) {
+            val msg = "File '$resolvedName' bukan model .gguf. Pilih file berformat .gguf di SSD Anda."
+            showBannerState(msg)
+            updateModelStatus("MODEL: BELUM DIMUAT")
+            appendSystemLog(msg)
+            return
+        }
+
+        saveModelDocUri(docUri, resolvedName)
+        hideBannerState()
+        appendSystemLog("File GGUF dipilih via SAF: $resolvedName")
+        loadGgufModel(docUri, resolvedName)
     }
 
     private fun onFolderPicked(treeUri: Uri) {
@@ -274,16 +335,18 @@ class AiChatActivity : AppCompatActivity() {
                     loadGgufModel(scan.modelUri, scan.fileName)
                 }
                 is FolderScanResult.WrongFolder -> {
-                    showBannerState(MSG_MISSING_FOLDER, offerAllFilesButton = false)
+                    showBannerState(MSG_MISSING_FOLDER)
                     updateModelStatus("MODEL: BELUM DIMUAT")
                     tvActiveModel.text = "Model Aktif: Belum Ada"
-                    appendSystemLog("Folder terpilih '${scan.pickedName}' bukan '$REQUIRED_FOLDER_NAME' (dan tidak memiliki subfolder '$REQUIRED_FOLDER_NAME').")
+                    appendSystemLog(
+                        "Folder terpilih '${scan.pickedName}' bukan '$REQUIRED_FOLDER_NAME' (dan tidak memiliki subfolder '$REQUIRED_FOLDER_NAME')."
+                    )
                 }
                 is FolderScanResult.NoGgufInFolder -> {
                     saveTreeUri(treeUri)
                     val sample = if (scan.seenEntries.isEmpty()) "(folder kosong / tidak terbaca)" else scan.seenEntries.take(6).joinToString(", ")
                     val msg = "Tidak ditemukan file .gguf di folder '${scan.folderName}'. Isi terbaca: $sample"
-                    showBannerState(msg, offerAllFilesButton = false)
+                    showBannerState(msg)
                     updateModelStatus("MODEL: BELUM DIMUAT")
                     tvActiveModel.text = "Model Aktif: Belum Ada"
                     appendSystemLog(msg)
@@ -292,55 +355,102 @@ class AiChatActivity : AppCompatActivity() {
         }
     }
 
-    private fun checkSavedFolderAndLoadModel() {
+    /**
+     * Restores the previously persisted SAF document or AI_Models folder URI on launch.
+     * Prompts the SAF folder picker automatically only on the very first run when no URI is saved.
+     */
+    private fun restorePersistedModelOrPrompt() {
         if (LlamaHelper.isModelLoaded()) {
             val activeName = LlamaHelper.getActiveModelName() ?: PREFERRED_MODEL_NAME
             tvActiveModel.text = "Model Aktif: $activeName"
+            tvLoadMode.text = "100% OFFLINE • ${LlamaHelper.getActiveLoadMode()}"
             updateModelStatus("MODEL: SIAP")
             hideBannerState()
             return
         }
 
-        val savedUri = getSavedTreeUri()
-        if (savedUri == null || !hasPersistedReadPermission(savedUri)) {
-            showBannerState(MSG_MISSING_FOLDER, offerAllFilesButton = false)
-            updateModelStatus("MODEL: BELUM DIMUAT")
-            tvActiveModel.text = "Model Aktif: Belum Ada"
-            if (!initialPickerPrompted) {
-                initialPickerPrompted = true
-                openAiModelsFolderPicker()
+        val savedDoc = getSavedModelDocUri()
+        if (savedDoc != null && hasPersistedReadPermission(savedDoc.first)) {
+            hideBannerState()
+            loadGgufModel(savedDoc.first, savedDoc.second)
+            return
+        }
+
+        val savedTree = getSavedTreeUri()
+        if (savedTree != null && hasPersistedReadPermission(savedTree)) {
+            lifecycleScope.launch {
+                when (val scan = withContext(Dispatchers.IO) { findModelInsideAiModelsTree(savedTree) }) {
+                    is FolderScanResult.Found -> {
+                        hideBannerState()
+                        loadGgufModel(scan.modelUri, scan.fileName)
+                    }
+                    is FolderScanResult.WrongFolder -> {
+                        showBannerState(MSG_MISSING_FOLDER)
+                        updateModelStatus("MODEL: BELUM DIMUAT")
+                        tvActiveModel.text = "Model Aktif: Belum Ada"
+                    }
+                    is FolderScanResult.NoGgufInFolder -> {
+                        val sample = if (scan.seenEntries.isEmpty()) "(kosong)" else scan.seenEntries.take(5).joinToString(", ")
+                        showBannerState("Tidak ditemukan file .gguf di folder '${scan.folderName}'. File terbaca: $sample")
+                        updateModelStatus("MODEL: BELUM DIMUAT")
+                        tvActiveModel.text = "Model Aktif: Belum Ada"
+                    }
+                }
             }
             return
         }
 
-        lifecycleScope.launch {
-            when (val scan = withContext(Dispatchers.IO) { findModelInsideAiModelsTree(savedUri) }) {
-                is FolderScanResult.Found -> {
+        // First-time launch with no saved SAF permission
+        showBannerState(MSG_MISSING_FOLDER)
+        updateModelStatus("MODEL: BELUM DIMUAT")
+        tvActiveModel.text = "Model Aktif: Belum Ada"
+        if (!initialPickerPrompted) {
+            initialPickerPrompted = true
+            openAiModelsFolderPicker()
+        }
+    }
+
+    private fun restorePersistedUriQuietly() {
+        val savedDoc = getSavedModelDocUri()
+        if (savedDoc != null && hasPersistedReadPermission(savedDoc.first)) {
+            hideBannerState()
+            loadGgufModel(savedDoc.first, savedDoc.second)
+            return
+        }
+
+        val savedTree = getSavedTreeUri()
+        if (savedTree != null && hasPersistedReadPermission(savedTree)) {
+            lifecycleScope.launch {
+                val scan = withContext(Dispatchers.IO) { findModelInsideAiModelsTree(savedTree) }
+                if (scan is FolderScanResult.Found) {
                     hideBannerState()
                     loadGgufModel(scan.modelUri, scan.fileName)
-                }
-                is FolderScanResult.WrongFolder -> {
-                    showBannerState(MSG_MISSING_FOLDER, offerAllFilesButton = false)
-                    updateModelStatus("MODEL: BELUM DIMUAT")
-                    tvActiveModel.text = "Model Aktif: Belum Ada"
-                }
-                is FolderScanResult.NoGgufInFolder -> {
-                    val sample = if (scan.seenEntries.isEmpty()) "(kosong)" else scan.seenEntries.take(5).joinToString(", ")
-                    showBannerState(
-                        "Tidak ditemukan file .gguf di folder '${scan.folderName}'. File terbaca: $sample",
-                        offerAllFilesButton = false
-                    )
-                    updateModelStatus("MODEL: BELUM DIMUAT")
-                    tvActiveModel.text = "Model Aktif: Belum Ada"
                 }
             }
         }
     }
 
+    private fun resolveDocumentDisplayName(uri: Uri): String {
+        runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) {
+                        val name = cursor.getString(idx)?.trim().orEmpty()
+                        if (name.isNotEmpty()) return name
+                    }
+                }
+            }
+        }
+        val docName = runCatching { DocumentFile.fromSingleUri(this, uri)?.name?.trim() }.getOrNull().orEmpty()
+        if (docName.isNotEmpty()) return docName
+        return uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':').orEmpty()
+            .ifBlank { PREFERRED_MODEL_NAME }
+    }
+
     /**
-     * Wajib hanya mencari di dalam folder "AI_Models" di SSD (tidak mencari ke root SSD atau Download).
-     * Jika user menunjuk ke parent/root SSD yang di dalamnya terdapat folder "AI_Models", otomatis masuk ke folder AI_Models tersebut.
-     * Menggunakan 3 lapis pembacaan (DocumentsContract cursor + DocumentFile + direct POSIX jika diizinkan) agar exFAT OTG Android 14 selalu terbaca.
+     * Scans strictly inside the "AI_Models" directory via SAF (DocumentsContract + DocumentFile).
+     * If the user selects an SSD root containing an "AI_Models" subfolder, descends 1 level into it.
      */
     private fun findModelInsideAiModelsTree(treeUri: Uri): FolderScanResult {
         val treeDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull().orEmpty()
@@ -362,7 +472,6 @@ class AiChatActivity : AppCompatActivity() {
             targetFolderDoc = folderDoc
             targetDisplayName = REQUIRED_FOLDER_NAME
         } else {
-            // Check 1 level down for an explicit "AI_Models" subfolder (never scans root files!)
             val subChildDoc = folderDoc?.listFiles()?.firstOrNull {
                 it.isDirectory && it.name.orEmpty().trim().equals(REQUIRED_FOLDER_NAME, ignoreCase = true)
             }
@@ -376,8 +485,7 @@ class AiChatActivity : AppCompatActivity() {
                 }
                 if (childInfo != null) {
                     targetDirDocId = childInfo.docId
-                    targetFolderDoc = DocumentFile.fromTreeUri(this, treeUri)
-                        ?.findFile(childInfo.name)
+                    targetFolderDoc = DocumentFile.fromTreeUri(this, treeUri)?.findFile(childInfo.name)
                     targetDisplayName = REQUIRED_FOLDER_NAME
                 }
             }
@@ -391,7 +499,7 @@ class AiChatActivity : AppCompatActivity() {
         val foundGgufs = ArrayList<GgufCandidate>()
         val seenEntries = ArrayList<String>()
 
-        // Layer 1: Direct DocumentsContract child cursor (very reliable on Android 14 exFAT OTG SAF)
+        // Layer 1: Direct DocumentsContract child cursor
         if (!targetDirDocId.isNullOrBlank()) {
             val entries = queryDirectChildren(treeUri, targetDirDocId)
             for (entry in entries) {
@@ -421,14 +529,6 @@ class AiChatActivity : AppCompatActivity() {
                     val cleanName = if (n.lowercase(Locale.US).endsWith(".gguf")) n else PREFERRED_MODEL_NAME
                     foundGgufs += GgufCandidate(file.uri, cleanName)
                 }
-            }
-        }
-
-        // Layer 3: Direct POSIX /storage/<vol>/AI_Models scan if MANAGE_EXTERNAL_STORAGE is active
-        if (foundGgufs.isEmpty()) {
-            findDirectPosixAiModelsGguf(treeDocId)?.let { (file, name) ->
-                foundGgufs += GgufCandidate(Uri.fromFile(file), name)
-                if (!seenEntries.contains(name)) seenEntries += name
             }
         }
 
@@ -482,65 +582,38 @@ class AiChatActivity : AppCompatActivity() {
         return out
     }
 
-    private fun findDirectPosixAiModelsGguf(treeDocId: String): Pair<File, String>? {
-        val splitIdx = treeDocId.indexOf(':')
-        val volId = if (splitIdx > 0) treeDocId.substring(0, splitIdx) else ""
-        val candidateDirs = buildList {
-            if (volId.isNotBlank()) {
-                if (volId.equals("primary", ignoreCase = true)) {
-                    add(File(Environment.getExternalStorageDirectory(), REQUIRED_FOLDER_NAME))
-                } else {
-                    add(File("/storage/$volId/$REQUIRED_FOLDER_NAME"))
-                    add(File("/mnt/media_rw/$volId/$REQUIRED_FOLDER_NAME"))
-                }
-            }
-            File("/storage").listFiles()?.forEach { volDir ->
-                if (volDir.isDirectory && volDir.name !in setOf("emulated", "self")) {
-                    add(File(volDir, REQUIRED_FOLDER_NAME))
-                }
-            }
-        }
-        for (dir in candidateDirs.distinct()) {
-            if (dir.exists() && dir.isDirectory && dir.canRead()) {
-                val files = dir.listFiles().orEmpty().filter {
-                    it.isFile && it.canRead() && it.name.lowercase(Locale.US).endsWith(".gguf")
-                }
-                if (files.isNotEmpty()) {
-                    val pref = files.firstOrNull { it.name.equals(PREFERRED_MODEL_NAME, true) } ?: files.first()
-                    return pref to pref.name
-                }
-            }
-        }
-        return null
-    }
-
     private fun loadGgufModel(modelUri: Uri, fileName: String) {
+        if (isLoadingModel) return
+        isLoadingModel = true
         tvActiveModel.text = "Model Aktif: Memuat $fileName..."
         updateModelStatus("MODEL: MEMUAT...")
         setInputEnabled(false)
 
         lifecycleScope.launch {
-            val result = LlamaHelper.loadModel(
-                context = applicationContext,
-                modelUri = modelUri,
-                fileName = fileName
-            )
+            val result = try {
+                LlamaHelper.loadModel(
+                    context = applicationContext,
+                    modelUri = modelUri,
+                    fileName = fileName
+                )
+            } finally {
+                isLoadingModel = false
+            }
 
             result.onSuccess { loadedName ->
+                val mode = LlamaHelper.getActiveLoadMode()
                 tvActiveModel.text = "Model Aktif: $loadedName"
+                tvLoadMode.text = "100% OFFLINE • $mode"
                 updateModelStatus("MODEL: SIAP")
                 hideBannerState()
                 setInputEnabled(true)
-                appendSystemLog("Model dimuat langsung dari SSD (useMmap=true): $loadedName")
+                appendSystemLog("Model dimuat langsung dari SSD ($mode, tanpa copy ke internal): $loadedName")
             }.onFailure { err ->
                 tvActiveModel.text = "Model Aktif: Gagal memuat $fileName"
+                tvLoadMode.text = "100% OFFLINE • SAF FD"
                 updateModelStatus("MODEL: BELUM DIMUAT")
-                val needAllFiles = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()
                 val errDetail = err.message ?: "Error tidak diketahui"
-                showBannerState(
-                    message = "Model '$fileName' ditemukan, namun gagal dimuat: $errDetail",
-                    offerAllFilesButton = needAllFiles
-                )
+                showBannerState("Model '$fileName' ditemukan, namun gagal dimuat: $errDetail")
                 setInputEnabled(true)
                 appendSystemLog("Gagal memuat model '$fileName': $errDetail")
             }
@@ -552,8 +625,8 @@ class AiChatActivity : AppCompatActivity() {
         if (prompt.isEmpty()) return
 
         if (!LlamaHelper.isModelLoaded()) {
-            showBannerState(MSG_MISSING_FOLDER, offerAllFilesButton = false)
-            appendSystemLog("Model belum dimuat. Pilih folder AI_Models di SSD Anda terlebih dahulu.")
+            showBannerState(MSG_MISSING_FOLDER)
+            appendSystemLog("Model belum dimuat. Pilih folder AI_Models atau file .gguf di SSD Anda terlebih dahulu.")
             return
         }
 
@@ -635,14 +708,12 @@ class AiChatActivity : AppCompatActivity() {
         }
     }
 
-    private fun showBannerState(message: String, offerAllFilesButton: Boolean) {
+    private fun showBannerState(message: String) {
         tvMissingFolderMessage.text = message
-        btnAllFilesAccess.visibility = if (offerAllFilesButton) View.VISIBLE else View.GONE
         layoutMissingFolder.visibility = View.VISIBLE
     }
 
     private fun hideBannerState() {
-        btnAllFilesAccess.visibility = View.GONE
         layoutMissingFolder.visibility = View.GONE
     }
 

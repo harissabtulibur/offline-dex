@@ -21,7 +21,7 @@
             android:layout_height="36dp"
             android:backgroundTint="#0D260F"
             android:fontFamily="monospace"
-            android:minWidth="64dp"
+            android:minWidth="60dp"
             android:paddingHorizontal="10dp"
             android:text="&lt; BACK"
             android:textColor="#00FF41"
@@ -57,6 +57,19 @@
         </LinearLayout>
 
         <Button
+            android:id="@+id/btnPickFile"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:layout_marginStart="6dp"
+            android:backgroundTint="#0D260F"
+            android:fontFamily="monospace"
+            android:paddingHorizontal="10dp"
+            android:text="PILIH .GGUF"
+            android:textColor="#00FF41"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+
+        <Button
             android:id="@+id/btnSelectFolder"
             android:layout_width="wrap_content"
             android:layout_height="36dp"
@@ -64,7 +77,7 @@
             android:backgroundTint="#0D260F"
             android:fontFamily="monospace"
             android:paddingHorizontal="10dp"
-            android:text="PILIH FOLDER AI_Models"
+            android:text="PILIH FOLDER"
             android:textColor="#00FF41"
             android:textSize="11sp"
             android:textStyle="bold" />
@@ -106,10 +119,11 @@
             android:textStyle="bold" />
 
         <TextView
+            android:id="@+id/tvLoadMode"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:fontFamily="monospace"
-            android:text="100% OFFLINE • MMAP"
+            android:text="100% OFFLINE • SAF FD"
             android:textColor="#479E59"
             android:textSize="11sp" />
     </LinearLayout>
@@ -137,18 +151,17 @@
             android:textSize="12sp" />
 
         <Button
-            android:id="@+id/btnAllFilesAccess"
+            android:id="@+id/btnPickFilePrompt"
             android:layout_width="wrap_content"
             android:layout_height="38dp"
             android:layout_marginStart="8dp"
-            android:backgroundTint="#1E293B"
+            android:backgroundTint="#0D260F"
             android:fontFamily="monospace"
             android:paddingHorizontal="10dp"
-            android:text="IZIN SSD"
+            android:text="PILIH .GGUF"
             android:textColor="#00FF41"
             android:textSize="11sp"
-            android:textStyle="bold"
-            android:visibility="gone" />
+            android:textStyle="bold" />
 
         <Button
             android:id="@+id/btnPickFolderPrompt"
@@ -160,7 +173,7 @@
             android:paddingHorizontal="12dp"
             android:text="PILIH FOLDER"
             android:textColor="#000000"
-            android:textSize="12sp"
+            android:textSize="11sp"
             android:textStyle="bold" />
     </LinearLayout>
 
