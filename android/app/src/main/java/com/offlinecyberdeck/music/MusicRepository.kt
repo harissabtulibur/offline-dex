@@ -57,14 +57,69 @@ class MusicRepository(
     }
 
     private fun isDirectFileReadable(file: File): Boolean {
-        if (!file.exists() || !file.isFile || !file.canRead()) return false
+        if (!file.exists() || !file.isFile || !file.canRead() || file.length() <= 0L) return false
         return runCatching {
             FileInputStream(file).use { fis ->
-                fis.read()
-                true
+                fis.read() >= 0
             }
         }.getOrDefault(false)
     }
+
+    private fun isLikelyInvalidAudioBytes(prefix: ByteArray, length: Int): Boolean {
+        if (length <= 0) return true
+        val head = String(prefix, 0, minOf(length, 32), Charsets.US_ASCII)
+            .trimStart()
+            .lowercase(Locale.US)
+        return head.startsWith("<!doctype") ||
+            head.startsWith("<html") ||
+            head.startsWith("<head") ||
+            head.startsWith("<?xml")
+    }
+
+    suspend fun diagnoseAudioFailure(track: MusicTrackEntity, candidates: List<Uri>): String? =
+        withContext(Dispatchers.IO) {
+            val probeUris = buildList {
+                addAll(candidates)
+                if (track.fileUri.isNotBlank()) {
+                    val u = if (track.fileUri.startsWith("content://") || track.fileUri.startsWith("file://")) {
+                        Uri.parse(track.fileUri)
+                    } else {
+                        Uri.fromFile(File(track.fileUri))
+                    }
+                    add(u)
+                }
+            }.distinct()
+
+            for (uri in probeUris) {
+                val info = runCatching {
+                    val buf = ByteArray(64)
+                    var read = -1
+                    var totalSize = -1L
+                    if (uri.scheme == "file" || uri.scheme.isNullOrBlank()) {
+                        val f = File(uri.path ?: uri.toString())
+                        if (!f.exists() || !f.canRead()) return@runCatching null
+                        totalSize = f.length()
+                        if (totalSize > 0L) {
+                            FileInputStream(f).use { read = it.read(buf) }
+                        }
+                    } else {
+                        totalSize = context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L
+                        context.contentResolver.openInputStream(uri)?.use { read = it.read(buf) }
+                    }
+                    Triple(totalSize, read, buf)
+                }.getOrNull() ?: continue
+
+                val (totalSize, read, buf) = info
+                if (totalSize == 0L || read <= 0) {
+                    return@withContext "File '${track.fileName}' berukuran 0 byte / kosong di kartu SD."
+                }
+                if (isLikelyInvalidAudioBytes(buf, read)) {
+                    return@withContext "File '${track.fileName}' berisi teks/HTML (unduhan rusak), bukan data audio MP3 valid."
+                }
+                return@withContext null
+            }
+            "File '${track.fileName}' tidak dapat diakses dari kartu SD. Tekan ikon Folder (SAF) lalu pilih folder musik di SD Card Anda."
+        }
 
     private fun findMediaStoreUriForTrack(track: MusicTrackEntity): Uri? {
         val candidates = buildList {
@@ -203,7 +258,18 @@ class MusicRepository(
             candidates += resolved
         }
 
-        // 3. Direct POSIX file candidate (primary for imported_music/, secondary fallback for /storage/...)
+        // 3. Configured SAF trees + persisted SAF folder permissions (try SAF content:// BEFORE raw /storage/ FUSE paths, matching OfflineTube!)
+        val trees = collectSafTreeStrings(deckDriveTreeUri, extraSafUris)
+        if (includeDeepSafSearch || candidates.isEmpty() || !raw.startsWith("content://")) {
+            for (treeStr in trees) {
+                val safUri = findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
+                if (safUri != null && (canOpenContentUriStreamOrAfd(safUri) || driveManager.isUriOrFileAccessible(safUri.toString()))) {
+                    candidates += safUri
+                }
+            }
+        }
+
+        // 4. Direct POSIX file candidate (primary for imported_music/, fallback for /storage/...)
         if (raw.isNotBlank() && !raw.startsWith("content://")) {
             val path = if (raw.startsWith("file://")) Uri.parse(raw).path.orEmpty() else raw
             val file = File(path)
@@ -214,17 +280,6 @@ class MusicRepository(
             driveManager.resolveDirectFileFromContentUri(Uri.parse(raw))
                 ?.takeIf { isDirectFileReadable(it) }
                 ?.let { candidates += Uri.fromFile(it) }
-        }
-
-        // 4. Configured SAF trees + persisted SAF folder permissions (only traverse 1500 dirs when needed)
-        if (includeDeepSafSearch || candidates.isEmpty()) {
-            val trees = collectSafTreeStrings(deckDriveTreeUri, extraSafUris)
-            for (treeStr in trees) {
-                val safUri = findSafUriInTree(Uri.parse(treeStr), track.fileName, track.sizeBytes)
-                if (safUri != null && (canOpenContentUriStreamOrAfd(safUri) || driveManager.isUriOrFileAccessible(safUri.toString()))) {
-                    candidates += safUri
-                }
-            }
         }
 
         candidates.toList()
@@ -256,7 +311,17 @@ class MusicRepository(
                 .lowercase(Locale.US)
                 .ifBlank { "mp3" }
             val outFile = File(cacheDir, "${track.id}.$ext")
-            if (!outFile.exists() || outFile.length() <= 0L) {
+            if (outFile.exists()) {
+                val validExisting = outFile.length() > 128L && runCatching {
+                    val hdr = ByteArray(64)
+                    val n = FileInputStream(outFile).use { it.read(hdr) }
+                    !isLikelyInvalidAudioBytes(hdr, n)
+                }.getOrDefault(false)
+                if (!validExisting) {
+                    runCatching { outFile.delete() }
+                }
+            }
+            if (!outFile.exists() || outFile.length() <= 128L) {
                 val existing = cacheDir.listFiles()?.sortedBy { it.lastModified() }.orEmpty()
                 if (existing.size >= 6) {
                     existing.take(existing.size - 5).forEach { runCatching { it.delete() } }
@@ -268,14 +333,20 @@ class MusicRepository(
                 } else {
                     val path = if (sourceUri.scheme == "file") sourceUri.path.orEmpty() else sourceUri.toString()
                     val f = File(path)
-                    if (f.exists() && f.isFile && f.canRead()) f.inputStream() else null
+                    if (f.exists() && f.isFile && f.canRead() && f.length() > 0L) f.inputStream() else null
                 } ?: return@runCatching null
 
                 inputStream.use { input ->
+                    val probe = ByteArray(64)
+                    val firstRead = input.read(probe)
+                    if (firstRead <= 0 || isLikelyInvalidAudioBytes(probe, firstRead)) {
+                        return@runCatching null
+                    }
                     FileOutputStream(tmpFile).use { output ->
-                        val copied = input.copyTo(output, bufferSize = 64 * 1024)
+                        output.write(probe, 0, firstRead)
+                        val rest = input.copyTo(output, bufferSize = 64 * 1024)
                         output.flush()
-                        if (copied <= 0L) {
+                        if (firstRead + rest <= 128L) {
                             runCatching { tmpFile.delete() }
                             return@runCatching null
                         }
@@ -287,7 +358,7 @@ class MusicRepository(
                     runCatching { tmpFile.delete() }
                 }
             }
-            if (outFile.exists() && outFile.length() > 0L) Uri.fromFile(outFile) else null
+            if (outFile.exists() && outFile.length() > 128L) Uri.fromFile(outFile) else null
         }.getOrNull()
     }
 
@@ -641,7 +712,7 @@ class MusicRepository(
                         if (ext !in audioExtensions) continue
 
                         val sizeBytes = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else 0L
-                        if (sizeBytes in 1..24_000L && ext != "mp3") continue // Skip tiny notification tones
+                        if (sizeBytes <= 0L || (sizeBytes <= 24_000L && ext != "mp3")) continue // Skip empty files & tiny notification tones
 
                         val directFile = filePath.takeIf { it.startsWith("/") }?.let { File(it) }
                         val canonicalUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
@@ -748,10 +819,11 @@ class MusicRepository(
                         queue.add(child to depth + 1)
                     }
                 } else if (child.isFile) {
+                    if (name.startsWith("._")) continue
                     val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
                     if (ext in audioExtensions) {
                         val sizeBytes = child.length().coerceAtLeast(0L)
-                        if (sizeBytes in 1..24_000L && ext != "mp3") continue
+                        if (sizeBytes <= 0L || (sizeBytes <= 24_000L && ext != "mp3")) continue
                         if (!isDirectFileReadable(child)) continue
                         val pathStr = child.absolutePath
                         val key = dedupKey(name, sizeBytes)
@@ -794,11 +866,12 @@ class MusicRepository(
                         queue.add(child)
                     }
                 } else if (child.isFile) {
+                    if (name.startsWith("._")) continue
                     val ext = name.substringAfterLast('.', "").lowercase(Locale.US)
                     if (ext in audioExtensions) {
                         val uriStr = child.uri.toString()
                         val sizeBytes = child.length().coerceAtLeast(0L)
-                        if (sizeBytes in 1..24_000L && ext != "mp3") continue
+                        if (sizeBytes <= 0L || (sizeBytes <= 24_000L && ext != "mp3")) continue
                         val key = dedupKey(name, sizeBytes)
                         val existingTrack = existingByKey[key]
                         if (seenUris.contains(uriStr)) {

@@ -36,7 +36,7 @@ jobs:
           SDK_MANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           if [ -x "$SDK_MANAGER" ]; then
             yes | "$SDK_MANAGER" --licenses > /dev/null || true
-            "$SDK_MANAGER" --install "platforms;android-37.0" "build-tools;37.0.0" || true
+            "$SDK_MANAGER" --install "platforms;android-37.0" "build-tools;37.0.0" "cmake;3.22.1" || true
           fi
           if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
             ln -s android-37.0 "$SDK_ROOT/platforms/android-37"

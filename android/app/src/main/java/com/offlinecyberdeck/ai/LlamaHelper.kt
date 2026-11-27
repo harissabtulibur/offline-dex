@@ -14,8 +14,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileInputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -24,8 +22,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Design guarantees (GitHub-friendly & Scoped Storage compliant):
  * - Zero MANAGE_EXTERNAL_STORAGE / All Files Access usage.
  * - Zero copying of .gguf files into internal storage or getExternalFilesDir().
- * - Opens content:// URI via ContentResolver.openFileDescriptor(uri, "r") and passes
- *   "/proc/self/fd/<fd>" to llama.cpp while keeping [activePfd] alive until unloadModel().
+ * - Opens content:// URI via ContentResolver.openFileDescriptor(uri, "r") and installs
+ *   [FdHookBridge] so native llama.cpp fopen()/open()/stat() calls on /proc/self/fd/<fd>
+ *   automatically use dup(fd) + fdopen()/fstat(), avoiding Android 14 SELinux denials.
+ * - Holds [activePfd] open until [unloadModel] is called.
  */
 object LlamaHelper {
 
@@ -60,7 +60,7 @@ object LlamaHelper {
 
     /**
      * Global ParcelFileDescriptor held open for the entire lifetime of the loaded model.
-     * Closing this while native llama.cpp still holds mmap/file pointers would invalidate /proc/self/fd/<fd>.
+     * Closing this while native llama.cpp still holds mmap/file pointers would invalidate the FD.
      */
     @Volatile
     private var activePfd: ParcelFileDescriptor? = null
@@ -76,7 +76,7 @@ object LlamaHelper {
     fun getActiveLoadMode(): String = currentLoadModeLabel
 
     /**
-     * Loads a GGUF model directly from an external SAF content:// URI using /proc/self/fd/<fd>.
+     * Loads a GGUF model directly from an external SAF content:// URI via dup(fd).
      * Never uses raw /storage/xxxx-xxxx/ paths and never copies the model to internal storage.
      */
     suspend fun loadModel(
@@ -97,7 +97,6 @@ object LlamaHelper {
                 val probePfd = runCatching { resolver.openFileDescriptor(modelUri, "r") }.getOrNull()
                     ?: error("Gagal membuka File Descriptor untuk '$fileName'. Pastikan izin SAF masih aktif dan SSD terhubung.")
 
-                // Validate FD readability and GGUF magic header ("GGUF") before handing to native llama.cpp
                 val validation = validateGgufFileDescriptor(probePfd)
                 runCatching { probePfd.close() }
 
@@ -105,8 +104,8 @@ object LlamaHelper {
                     error(validation.diagnosticMessage)
                 }
 
-                // Attempt mmap first for speed/low RAM, then fallback to useMmap = false for FUSE/OTG FDs
-                // where Android's kernel/FUSE proxy rejects mmap().
+                // Attempt mmap first for speed/low RAM, then fallback to useMmap = false
+                // if FUSE/ExternalStorageProvider rejects mmap() on the duplicated FD.
                 val profiles = listOf(
                     LoadProfile("FD-MMAP", useMmap = true, contextLength = TARGET_N_CTX, batchSize = 256),
                     LoadProfile("FD-RAM", useMmap = false, contextLength = TARGET_N_CTX, batchSize = 128),
@@ -115,6 +114,7 @@ object LlamaHelper {
 
                 var initOk = false
                 var succeededMode = ""
+                var hookSummary = "not-installed"
 
                 for (profile in profiles) {
                     closePfdQuietly()
@@ -123,8 +123,8 @@ object LlamaHelper {
                     activePfd = pfd
                     runCatching { Os.lseek(pfd.fileDescriptor, 0L, OsConstants.SEEK_SET) }
 
-                    val fdPath = "/proc/self/fd/${pfd.fd}"
-
+                    // Calling updateGenerateParams first ensures Llamatik's native .so is loaded
+                    // before FdHookBridge scans dl_iterate_phdr to patch GOT/PLT FD hooks.
                     LlamaBridge.updateGenerateParams(
                         temperature = 0.7f,
                         maxTokens = 512,
@@ -139,7 +139,16 @@ object LlamaHelper {
                         gpuLayers = 0
                     )
 
-                    if (LlamaBridge.initGenerateModel(fdPath)) {
+                    hookSummary = FdHookBridge.installHooks()
+                    val fdPath = "/proc/self/fd/${pfd.fd}"
+                    val initialized = try {
+                        FdHookBridge.setTargetFd(pfd.fd)
+                        LlamaBridge.initGenerateModel(fdPath)
+                    } finally {
+                        FdHookBridge.setTargetFd(-1)
+                    }
+
+                    if (initialized) {
                         initOk = true
                         succeededMode = profile.label
                         break
@@ -151,7 +160,7 @@ object LlamaHelper {
 
                 if (!initOk) {
                     closePfdQuietly()
-                    error(buildFailureDiagnostic(fileName, validation))
+                    error(buildFailureDiagnostic(fileName, validation, hookSummary))
                 }
 
                 loaded = true
@@ -160,6 +169,7 @@ object LlamaHelper {
                 currentLoadModeLabel = succeededMode
                 fileName
             }.onFailure {
+                FdHookBridge.setTargetFd(-1)
                 unloadInternal()
             }
         }
@@ -242,6 +252,7 @@ object LlamaHelper {
     }
 
     private fun unloadInternal() {
+        FdHookBridge.setTargetFd(-1)
         if (generatingFlag.get()) {
             runCatching { LlamaBridge.nativeCancelGenerate() }
             generatingFlag.set(false)
@@ -264,7 +275,6 @@ object LlamaHelper {
     private data class FdValidation(
         val isValidGguf: Boolean,
         val fileSizeBytes: Long,
-        val procSelfFdReadable: Boolean,
         val diagnosticMessage: String
     )
 
@@ -279,38 +289,28 @@ object LlamaHelper {
             return FdValidation(
                 isValidGguf = false,
                 fileSizeBytes = sizeBytes,
-                procSelfFdReadable = false,
                 diagnosticMessage = "File bukan format GGUF valid (header='$magic', size=$sizeBytes)."
             )
         }
 
-        // Check whether reopening /proc/self/fd/<fd> via POSIX open() succeeds under Android SELinux
-        val procSelfFdPath = "/proc/self/fd/${pfd.fd}"
-        val procReadable = runCatching {
-            FileInputStream(File(procSelfFdPath)).use { fis ->
-                fis.read() >= 0
-            }
-        }.getOrDefault(false)
-
         return FdValidation(
             isValidGguf = true,
             fileSizeBytes = sizeBytes,
-            procSelfFdReadable = procReadable,
             diagnosticMessage = "OK"
         )
     }
 
-    private fun buildFailureDiagnostic(fileName: String, validation: FdValidation): String {
+    private fun buildFailureDiagnostic(
+        fileName: String,
+        validation: FdValidation,
+        hookSummary: String
+    ): String {
         val sizeMb = if (validation.fileSizeBytes > 0L) {
             "${validation.fileSizeBytes / (1024 * 1024)} MB"
         } else {
             "unknown"
         }
-        return if (!validation.procSelfFdReadable) {
-            "FD SAF terbaca ($sizeMb GGUF), tetapi SELinux/FUSE Android menolak pembukaan ulang symlink /proc/self/fd oleh library native. Coba pilih ulang file .gguf lewat tombol 'PILIH FILE .GGUF'."
-        } else {
-            "llama.cpp gagal memuat '$fileName' ($sizeMb) via /proc/self/fd (MMAP & RAM fallback). Pastikan file GGUF tidak korup dan RAM tersedia cukup."
-        }
+        return "llama.cpp gagal memuat '$fileName' ($sizeMb GGUF, hook=$hookSummary) setelah mencoba mode FD-MMAP & FD-RAM. Pastikan file GGUF utuh dan RAM bebas mencukupi."
     }
 
     private fun buildCompactHistoryBlock(history: List<Pair<String, String>>): String {

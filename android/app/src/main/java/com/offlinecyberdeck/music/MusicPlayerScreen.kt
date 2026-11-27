@@ -119,6 +119,9 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.extractor.DefaultExtractorsFactory
+import androidx.media3.extractor.mp3.Mp3Extractor
 import com.offlinecyberdeck.CyberDeckApplication
 import com.offlinecyberdeck.core.database.entity.AppSettingsEntity
 import com.offlinecyberdeck.core.database.entity.MusicTrackEntity
@@ -218,7 +221,11 @@ fun MusicPlayerScreen(
     var usingFallbackPlayer by remember { mutableStateOf(false) }
 
     val exoPlayer = remember {
+        val extractorsFactory = DefaultExtractorsFactory()
+            .setConstantBitrateSeekingEnabled(true)
+            .setMp3ExtractorFlags(Mp3Extractor.FLAG_ENABLE_CONSTANT_BITRATE_SEEKING)
         ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(context, extractorsFactory))
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -518,7 +525,19 @@ fun MusicPlayerScreen(
 
                 fun reportPlayFailure() {
                     val detail = error.localizedMessage ?: error.errorCodeName
-                    onShowMessage("Gagal memutar audio ($srcTag / ${error.errorCodeName}): $detail. Coba Scan Folder SD / Refresh.")
+                    val fallbackMsg = "Gagal memutar audio ($srcTag / ${error.errorCodeName}): $detail. Coba Scan Folder SD / Refresh."
+                    val currentTrackSnap = track
+                    if (currentTrackSnap == null) {
+                        onShowMessage(fallbackMsg)
+                        return
+                    }
+                    scope.launch {
+                        val diagnosis = app.musicRepository.diagnoseAudioFailure(
+                            track = currentTrackSnap,
+                            candidates = candidateQueue
+                        )
+                        onShowMessage(diagnosis ?: fallbackMsg)
+                    }
                 }
 
                 if (track != null && nextCandidateIdx < candidateQueue.size) {
