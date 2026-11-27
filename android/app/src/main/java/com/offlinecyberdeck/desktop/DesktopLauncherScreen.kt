@@ -76,6 +76,7 @@ import androidx.compose.material.icons.filled.Eject
 import androidx.compose.material.icons.filled.FilterNone
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -224,6 +225,7 @@ enum class DesktopWindowKind(val defaultTitle: String) {
     OFFLINE_WIKI("Offline Wiki"),
     TERMINAL("PowerShell Terminal"),
     SETTINGS("Settings"),
+    GUIDE("Panduan Cyber Deck"),
     ARCHIVE_READER("Archive Reader"),
     PDF_READER("PDF Viewer"),
     TEXT_READER("Document Reader"),
@@ -745,7 +747,8 @@ fun DesktopLauncherScreen(
                     Triple(DesktopWindowKind.FILES, "File Explorer", Icons.Filled.Folder),
                     Triple(DesktopWindowKind.TASK_MANAGER, "Task Manager", Icons.Filled.Speed),
                     Triple(DesktopWindowKind.TERMINAL, "Terminal", Icons.Filled.Terminal),
-                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings)
+                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings),
+                    Triple(DesktopWindowKind.GUIDE, "Panduan", Icons.Filled.HelpOutline)
                 )
 
                 val pinnedInfos = remember(installedApps, pinnedPackages) {
@@ -1514,7 +1517,15 @@ fun DesktopLauncherScreen(
                                                     app = app,
                                                     onShowMessage = onShowMessage,
                                                     onOpenDexPermissions = onShowPermissionsDialog,
-                                                    onOpenTaskManager = { openOrFocusWindow(DesktopWindowKind.TASK_MANAGER) }
+                                                    onOpenTaskManager = { openOrFocusWindow(DesktopWindowKind.TASK_MANAGER) },
+                                                    onOpenGuide = { openOrFocusWindow(DesktopWindowKind.GUIDE) }
+                                                )
+                                            }
+                                            DesktopWindowKind.GUIDE -> {
+                                                GuideScreen(
+                                                    onOpenWindow = { targetKind -> openOrFocusWindow(targetKind) },
+                                                    onLaunchAiOffline = launchAiOfflineActivity,
+                                                    onOpenDexPermissions = onShowPermissionsDialog
                                                 )
                                             }
                                             DesktopWindowKind.ARCHIVE_READER -> {
@@ -1704,7 +1715,8 @@ fun DesktopLauncherScreen(
                                     Triple(DesktopWindowKind.TERMINAL, "Terminal PowerShell", Icons.Filled.Terminal),
                                     Triple(DesktopWindowKind.DOWNLOADS, "Unduhan", Icons.Filled.Download),
                                     Triple(DesktopWindowKind.BOOKMARKS, "Bookmarks", Icons.Filled.Bookmark),
-                                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings)
+                                    Triple(DesktopWindowKind.SETTINGS, "Settings", Icons.Filled.Settings),
+                                    Triple(DesktopWindowKind.GUIDE, "Panduan", Icons.Filled.HelpOutline)
                                 ).filter { (kind, label, _) ->
                                     appSearchQuery.isBlank() ||
                                         label.contains(appSearchQuery, true) ||
@@ -4123,6 +4135,7 @@ private fun windowIconForKind(kind: DesktopWindowKind): ImageVector = when (kind
     DesktopWindowKind.OFFLINE_WIKI -> Icons.Filled.CloudOff
     DesktopWindowKind.TERMINAL -> Icons.Filled.Terminal
     DesktopWindowKind.SETTINGS -> Icons.Filled.Settings
+    DesktopWindowKind.GUIDE -> Icons.Filled.HelpOutline
 }
 
 @Composable

@@ -151,6 +151,7 @@ fun PowerShellTerminalScreen(
         appendLine("  open taskmgr          -> Buka Task Manager")
         appendLine("  open downloads        -> Buka Tersimpan & Unduhan")
         appendLine("  open settings         -> Buka Pengaturan GUI")
+        appendLine("  open guide            -> Buka Panduan Penggunaan Cyber Deck")
         appendLine("Aplikasi Android Terinstall:", TerminalTone.WARN)
         appendLine("  apps [filter]         -> Lihat daftar aplikasi Android terinstall")
         appendLine("  launch <nama/pkg>     -> Jalankan aplikasi Android terinstall")
@@ -275,6 +276,11 @@ fun PowerShellTerminalScreen(
                 appendLine("Membuka AI Offline (Cyber Deck LLM)...", TerminalTone.SUCCESS)
             }
 
+            "guide", "panduan" -> {
+                onOpenWindow(DesktopWindowKind.GUIDE)
+                appendLine("Membuka Panduan Cyber Deck...", TerminalTone.SUCCESS)
+            }
+
             "open", "start-app" -> {
                 val targetKey = arg.lowercase(Locale.US).replace(" ", "")
                 if (targetKey in setOf("ai", "aioffline", "aichat", "llm", "qwen")) {
@@ -296,6 +302,7 @@ fun PowerShellTerminalScreen(
                     "history", "riwayat" -> DesktopWindowKind.HISTORY
                     "archives", "archive", "arsip" -> DesktopWindowKind.ARCHIVES
                     "settings", "setting", "pengaturan", "config" -> DesktopWindowKind.SETTINGS
+                    "guide", "panduan", "manual", "docs" -> DesktopWindowKind.GUIDE
                     else -> null
                 }
                 if (kind != null) {

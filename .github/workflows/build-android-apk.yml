@@ -22,13 +22,18 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v5
         with:
-          gradle-version: '8.9'
+          gradle-version: '9.6.0'
 
-      - name: Accept Android SDK Licenses
+      - name: Accept Android SDK Licenses & Install API 37
         run: |
-          SDK_MANAGER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          SDK_ROOT="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          SDK_MANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           if [ -x "$SDK_MANAGER" ]; then
             yes | "$SDK_MANAGER" --licenses > /dev/null || true
+            "$SDK_MANAGER" --install "platforms;android-37.0" "build-tools;37.0.0" || true
+          fi
+          if [ -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -e "$SDK_ROOT/platforms/android-37" ]; then
+            ln -s android-37.0 "$SDK_ROOT/platforms/android-37"
           fi
 
       - name: Build Debug APK

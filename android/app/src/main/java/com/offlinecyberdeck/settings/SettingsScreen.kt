@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.HelpOutline
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -99,7 +100,8 @@ fun SettingsScreen(
     app: CyberDeckApplication,
     onShowMessage: (String) -> Unit,
     onOpenDexPermissions: () -> Unit = {},
-    onOpenTaskManager: () -> Unit = {}
+    onOpenTaskManager: () -> Unit = {},
+    onOpenGuide: (() -> Unit)? = null
 ) {
     val settings by app.settingsRepository.settingsFlow
         .collectAsStateWithLifecycle(initialValue = AppSettingsEntity())
@@ -240,7 +242,20 @@ fun SettingsScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Text("Settings & Deck Drive", style = MaterialTheme.typography.titleLarge)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Settings & Deck Drive", style = MaterialTheme.typography.titleLarge)
+                if (onOpenGuide != null) {
+                    OutlinedButton(onClick = onOpenGuide) {
+                        Icon(Icons.Filled.HelpOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Panduan")
+                    }
+                }
+            }
         }
 
         // DECK DRIVE & STORAGE DASHBOARD
