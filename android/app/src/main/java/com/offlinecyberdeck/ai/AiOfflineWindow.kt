@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -87,7 +88,7 @@ private const val PREFERRED_MODEL_NAME = "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
 private const val MSG_MISSING_FOLDER =
     "Folder AI_Models tidak ditemukan. Pilih folder AI_Models atau file .gguf di SSD Anda."
 
-private enum class AiSenderRole {
+enum class AiSenderRole {
     USER, ASSISTANT, SYSTEM
 }
 
@@ -98,7 +99,7 @@ private data class AiRoleStyle(
     val tag: String
 )
 
-private data class AiChatMsg(
+data class AiChatMsg(
     val id: Long,
     val role: AiSenderRole,
     val text: String
